@@ -1,0 +1,7 @@
+ollama
+asyncio
+pathlib
+typing
+piexif
+pillow
+pydantic
