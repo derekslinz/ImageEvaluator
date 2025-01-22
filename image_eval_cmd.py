@@ -1,18 +1,20 @@
 import asyncio
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Dict
 
-import ollama
 import piexif
 import piexif.helper
 from PIL import Image
+from ollama import Client
 from pydantic import BaseModel, field_validator, ValidationError
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+client = Client(host='http://10.0.1.50:11434')
 
 
 class ImageScore(BaseModel):
@@ -31,9 +33,9 @@ class ImageScore(BaseModel):
 
 
 class ImageProcessor:
-    def __init__(self, model_name: str = 'llama3.2-vision', server_ip: str = '127.0.0.1'):
+    def __init__(self, model_name: str = 'llama3.2-vision'):
         self.model_name = model_name
-        self.server_ip = server_ip
+        self.ollama_host = os.getenv('OLLAMA_HOST', '127.0.0.1:11434')  # Provide a default if needed
 
     async def _embed_metadata(self, image_path: Path, scores: Dict) -> None:
         try:
@@ -141,7 +143,7 @@ class ImageProcessor:
         try:
             response = await loop.run_in_executor(
                 None,
-                lambda: ollama.chat(
+                lambda: client.chat(
                     model=self.model_name,
                     messages=[{
                         'role': 'user',
@@ -151,7 +153,7 @@ class ImageProcessor:
                             'num_gpu': 1
                         }
                     }],
-                    server_ip=self.server_ip
+
                 )
             )
             print(f"Raw response from Ollama: {response}")
@@ -169,8 +171,8 @@ class ImageProcessor:
             raise
 
 
-async def process_images_in_folder(folder_path: Path, server_ip: str):
-    processor = ImageProcessor(server_ip=server_ip)
+async def process_images_in_folder(folder_path: Path):
+    processor = ImageProcessor()
     for image_path in folder_path.glob('*.jpg'):  # Adjust the pattern for other image formats if needed
         try:
             logger.info(f"Processing image: {image_path}")
@@ -183,15 +185,14 @@ async def process_images_in_folder(folder_path: Path, server_ip: str):
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) != 3:
-        print("Usage: python script.py <folder_path> <server_ip>")
+    if len(sys.argv) != 2:
+        print("Usage: python script.py <folder_path>")
         sys.exit(1)
 
     folder_path = Path(sys.argv[1])
-    server_ip = sys.argv[2]
 
     if not folder_path.is_dir():
         print(f"The path {folder_path} is not a valid directory.")
         sys.exit(1)
 
-    asyncio.run(process_images_in_folder(folder_path, server_ip))
+    asyncio.run(process_images_in_folder(folder_path))
