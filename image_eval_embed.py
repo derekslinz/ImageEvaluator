@@ -1,11 +1,11 @@
 import argparse
 import base64
+import json  # Import json for parsing the response
 import logging
 import os
 from typing import Dict
 
 import piexif
-import piexif.helper
 import requests
 from PIL import Image
 from colorama import Fore
@@ -21,8 +21,57 @@ def sanitize_string(s: str) -> str:
     return s.replace('\x00', '').replace('\n', ' ').replace('\r', ' ')  # Remove null bytes and newlines
 
 
-# Updated to allow dynamic URL input
-def process_images_in_folder(folder_path, url):
+class Metadata(BaseModel):
+    total_score: int
+    technical_quality: int
+    creative_appeal: int
+    monetization_potential: int
+    maximum_potential_score: int
+    title: str
+    description: str
+    keywords: str
+
+    class Config:
+        extra = 'allow'  # Allow extra fields without raising an error
+
+    @field_validator('keywords')
+    def validate_keywords(cls, v):
+        keyword_list = v.split(',')
+        # Truncate to 12 keywords if there are more than 12
+        if len(keyword_list) > 12:
+            keyword_list = keyword_list[:12]
+        return ','.join(keyword_list).strip()  # Join back to a string and strip whitespace
+
+
+def embed_metadata(image_path: str, metadata: Dict):
+    try:
+        # Validate metadata
+        validated_metadata = Metadata(**metadata)
+
+        # Prepare Exif data with sanitized strings
+        exif_dict = {
+            piexif.ExifIFD.UserComment: sanitize_string(validated_metadata.model_dump_json()).encode('utf-8'),
+            piexif.ImageIFD.ImageDescription: sanitize_string(validated_metadata.description).encode('utf-8'),
+            piexif.ImageIFD.XPTitle: sanitize_string(validated_metadata.title).encode('utf-8'),
+            piexif.ImageIFD.XPKeywords: sanitize_string(validated_metadata.keywords).encode('utf-8')
+        }
+
+        exif_bytes = piexif.dump(exif_dict)
+
+        # Backup original image by appending .original suffix
+        backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
+        os.rename(image_path, backup_image_path)  # Rename original image to backup
+
+        # Open the backup image and save with new metadata
+        img = Image.open(backup_image_path)
+        img.save(image_path, exif=exif_bytes)
+        print(Fore.GREEN + f"Metadata successfully embedded in {image_path}" + Fore.RESET)
+
+    except (ValidationError, Exception) as e:
+        logger.error(f"Error embedding metadata in {image_path}: {e}")
+
+
+def process_images_in_folder(folder_path, ollama_host_url):
     headers = {'Content-Type': 'application/json'}
     results = []  # To store processing results
 
@@ -63,10 +112,17 @@ def process_images_in_folder(folder_path, url):
             }
 
             try:
-                response = requests.post(url, json=payload, headers=headers)
+                response = requests.post(ollama_host_url, json=payload, headers=headers)
                 if response.status_code == 200:
                     print(f"Response for {filename}: {response.text}")
-                    results.append((filename, response.json()))  # Store successful result
+                    response_data = response.json()  # Get the full response
+                    response_metadata = json.loads(response_data['response'])  # Extract and parse the 'response' field
+
+                    # Embed metadata after processing the image
+                    embed_metadata(image_path, response_metadata)
+
+                    results.append((filename, response_metadata))  # Store successful result
+
                 else:
                     print(f"Failed to process {filename}: {response.status_code}")
                     results.append((filename, None))  # Store failure result
@@ -77,55 +133,10 @@ def process_images_in_folder(folder_path, url):
     return results  # Return processing results
 
 
-class Metadata(BaseModel):
-    total_score: int
-    technical_quality: int
-    creative_appeal: int
-    monetization_potential: int
-    maximum_potential_score: int
-    title: str
-    description: str
-    keywords: str
-
-    @field_validator('keywords')
-    def validate_keywords(cls, v):
-        keyword_list = v.split(',')
-        if len(keyword_list) < 5 or len(keyword_list) > 20:
-            raise ValueError('Keywords must contain between 5 and 20 items, comma-separated.')
-        return v.strip()  # Optional: Strip whitespace from the keywords
-
-
-def embed_metadata(image_path: str, metadata: Dict):
-    try:
-        # Validate metadata
-        validated_metadata = Metadata(**metadata)
-
-        # Prepare Exif data with sanitized strings
-        exif_dict = {
-            piexif.ExifIFDName.UserComment: sanitize_string(validated_metadata.model_dump_json()).encode('utf-8'),
-            piexif.ExifIFDName.ImageDescription: sanitize_string(validated_metadata.description).encode('utf-8'),
-            piexif.ExifIFDName.ImageTitle: sanitize_string(validated_metadata.title).encode('utf-8'),
-            piexif.ExifIFDName.Keywords: sanitize_string(validated_metadata.keywords).encode('utf-8')
-        }
-        exif_bytes = piexif.dump(exif_dict)
-
-        # Backup original image by appending .original suffix
-        backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
-        os.rename(image_path, backup_image_path)  # Rename original image to backup
-
-        # Open the backup image and save with new metadata
-        img = Image.open(backup_image_path)
-        img.save(image_path, exif=exif_bytes)
-        print(Fore.GREEN + f"Metadata successfully embedded in {image_path}" + Fore.RESET)
-
-    except (ValidationError, Exception) as e:
-        logger.error(f"Error embedding metadata in {image_path}: {e}")
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process images in a specified folder.')
     parser.add_argument('folder_path', type=str, help='Path to the folder containing images')
-    parser.add_argument('ollama_host', type=str, help='URL of the API endpoint')  # Added URL argument
+    parser.add_argument('ollama_host_url', type=str, help='Full url of your ollama API endpoint ')  # Added URL argument
     args = parser.parse_args()
 
     # Validate folder path
@@ -139,7 +150,7 @@ if __name__ == "__main__":
         logger.error(f"No image files found in the directory '{args.folder_path}'.")
         exit(1)
 
-    results = process_images_in_folder(args.folder_path, args.url)  # Pass URL to function
+    results = process_images_in_folder(args.folder_path, args.ollama_host_url)  # Pass URL to function
 
     # Count successful and failed image processing
     success_count = sum(1 for _, result in results if result is not None)
