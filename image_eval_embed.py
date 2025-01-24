@@ -83,24 +83,25 @@ def embed_metadata(image_path: str, metadata: Dict):
         img.save(image_path, exif=exif_bytes)
         print(Fore.GREEN + f"Title metadata successfully embedded in {image_path}" + Fore.RESET)
 
+        #Description disabled as it was only embedding the first letter.
         # Open the image to access its EXIF data
-        img = Image.open(image_path)
-        exif_dict = piexif.load(img.info.get("exif", b""))
+        #img = Image.open(image_path)
+        #exif_dict = piexif.load(img.info.get("exif", b""))
 
-        description = metadata['description'].encode('utf-16le')  # Change to UCS2 (UTF-16LE) encoding
-        exif_dict["0th"][piexif.ImageIFD.ImageDescription] = description
-        print(f"Embedding Description: {description}")
+        #description = metadata['description'].encode('utf-16le')  # Change to UCS2 (UTF-16LE) encoding
+        #exif_dict["0th"][piexif.ImageIFD.ImageDescription] = description
+        #print(f"Embedding Description: {description}")
 
         # Backup original image by appending .original suffix
-        backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
-        os.rename(image_path, backup_image_path)  # Rename original image to backup
+        #backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
+        #os.rename(image_path, backup_image_path)  # Rename original image to backup
 
         # Prepare Exif data with sanitized strings
-        exif_bytes = piexif.dump(exif_dict)
+        #exif_bytes = piexif.dump(exif_dict)
 
         # Open the backup image and save with new metadata
-        img.save(image_path, exif=exif_bytes)
-        print(Fore.GREEN + f"Description metadata successfully embedded in {image_path}" + Fore.RESET)
+        #img.save(image_path, exif=exif_bytes)
+        #print(Fore.GREEN + f"Description metadata successfully embedded in {image_path}" + Fore.RESET)
 
         # Open the image to access its EXIF data
         img = Image.open(image_path)
