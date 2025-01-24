@@ -1,0 +1,77 @@
+# README
+
+## Image Metadata Embedding Tool
+
+This tool processes images in a specified folder, evaluates them using an external API, and embeds the resulting metadata into the images' EXIF data.
+
+### Features
+
+- Reads images from a specified directory.
+- Sends images to an external API for evaluation.
+- Embeds the returned metadata (score, title, description, keywords) into the image's EXIF data.
+- Supports JPEG and PNG formats.
+- Creates backups of original images before modifying them.
+
+### Requirements
+
+- Python 3.6 or higher
+- Required libraries:
+  - `Pillow`
+  - `requests`
+  - `piexif`
+  - `pydantic`
+  - `colorama`
+
+You can install the required libraries using pip:
+
+```bash
+pip install Pillow requests piexif pydantic colorama
+```
+
+### Usage
+
+1. **Clone the repository** or download the script file.
+2. **Run the script** from the command line with the following syntax:
+
+   ```bash
+   python script_name.py <folder_path> <ollama_host_url>
+   ```
+
+   - `<folder_path>`: Path to the folder containing images.
+   - `<ollama_host_url>`: Full URL of your Ollama API endpoint.
+
+### Example
+
+```bash
+python embed_metadata.py /path/to/images http://localhost:8000/api/evaluate
+```
+
+### Functionality
+
+- **sanitize_string(s: str)**: Cleans up strings by removing null bytes and newlines to ensure compatibility with EXIF data.
+
+- **Metadata Class**: Defines the structure of the metadata received from the API, including score, title, description, and keywords.
+
+- **embed_metadata(image_path: str, metadata: Dict)**: Embeds the provided metadata into the specified image's EXIF data. It handles user comments, title, description, and keywords, ensuring proper encoding.
+
+- **process_images_in_folder(folder_path, ollama_host_url)**: Processes each image in the specified folder, sending it to the API and embedding the returned metadata.
+
+### Logging
+
+The script uses Python's built-in logging module to log information and errors. Logs are printed to the console with timestamps and severity levels.
+
+### Error Handling
+
+The script includes error handling for:
+- Invalid folder paths.
+- Non-directory paths.
+- Absence of image files in the specified directory.
+- API request failures.
+
+### Backup
+
+Before embedding metadata, the script creates a backup of the original image by appending `.original` to the filename.
+
+### License
+
+This project is licensed under the MIT License. See the LICENSE file for details.
