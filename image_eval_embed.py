@@ -6,10 +6,11 @@ import os
 from typing import Dict
 
 import piexif
+import piexif.helper
 import requests
 from PIL import Image
 from colorama import Fore
-from pydantic import BaseModel, field_validator, ValidationError
+from pydantic import BaseModel, field_validator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,11 +23,7 @@ def sanitize_string(s: str) -> str:
 
 
 class Metadata(BaseModel):
-    total_score: int
-    technical_quality: int
-    creative_appeal: int
-    monetization_potential: int
-    maximum_potential_score: int
+    score: str
     title: str
     description: str
     keywords: str
@@ -45,29 +42,88 @@ class Metadata(BaseModel):
 
 def embed_metadata(image_path: str, metadata: Dict):
     try:
-        # Validate metadata
-        validated_metadata = Metadata(**metadata)
+        # Commenting out validation of metadata
+        # validated_metadata = Metadata(**metadata)
 
-        # Prepare Exif data with sanitized strings
-        exif_dict = {
-            piexif.ExifIFD.UserComment: sanitize_string(validated_metadata.model_dump_json()).encode('utf-8'),
-            piexif.ImageIFD.ImageDescription: sanitize_string(validated_metadata.description).encode('utf-8'),
-            piexif.ImageIFD.XPTitle: sanitize_string(validated_metadata.title).encode('utf-8'),
-            piexif.ImageIFD.XPKeywords: sanitize_string(validated_metadata.keywords).encode('utf-8')
-        }
+        # Open the image to access its EXIF data
+        img = Image.open(image_path)
+        exif_dict = piexif.load(img.info.get("exif", b""))
 
-        exif_bytes = piexif.dump(exif_dict)
+        user_comment = piexif.helper.UserComment.dump(metadata['score'])
+        exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment
+        print(f"Embedding score in User Comment: {user_comment}")
 
         # Backup original image by appending .original suffix
         backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
         os.rename(image_path, backup_image_path)  # Rename original image to backup
 
-        # Open the backup image and save with new metadata
-        img = Image.open(backup_image_path)
-        img.save(image_path, exif=exif_bytes)
-        print(Fore.GREEN + f"Metadata successfully embedded in {image_path}" + Fore.RESET)
+        # Prepare Exif data with sanitized strings
+        exif_bytes = piexif.dump(exif_dict)
 
-    except (ValidationError, Exception) as e:
+        # Open the backup image and save with new metadata
+        img.save(image_path, exif=exif_bytes)
+        print(Fore.GREEN + f"User Comment metadata successfully embedded in {image_path}" + Fore.RESET)
+
+        # Open the image to access its EXIF data
+        img = Image.open(image_path)
+        exif_dict = piexif.load(img.info.get("exif", b""))
+
+        title = metadata['title'].encode('utf-16le')  # Change to UCS2 (UTF-16LE) encoding
+        exif_dict["0th"][piexif.ImageIFD.XPTitle] = title
+        print(f"Embedding Title: {title}")
+
+        # Backup original image by appending .original suffix
+        backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
+        os.rename(image_path, backup_image_path)  # Rename original image to backup
+
+        # Prepare Exif data with sanitized strings
+        exif_bytes = piexif.dump(exif_dict)
+
+        # Open the backup image and save with new metadata
+        img.save(image_path, exif=exif_bytes)
+        print(Fore.GREEN + f"Title metadata successfully embedded in {image_path}" + Fore.RESET)
+
+        # Open the image to access its EXIF data
+        img = Image.open(image_path)
+        exif_dict = piexif.load(img.info.get("exif", b""))
+
+        description = metadata['description'].encode('utf-16le')  # Change to UCS2 (UTF-16LE) encoding
+        exif_dict["0th"][piexif.ImageIFD.ImageDescription] = description
+        print(f"Embedding Description: {description}")
+
+        # Backup original image by appending .original suffix
+        backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
+        os.rename(image_path, backup_image_path)  # Rename original image to backup
+
+        # Prepare Exif data with sanitized strings
+        exif_bytes = piexif.dump(exif_dict)
+
+        # Open the backup image and save with new metadata
+        img.save(image_path, exif=exif_bytes)
+        print(Fore.GREEN + f"Description metadata successfully embedded in {image_path}" + Fore.RESET)
+
+        # Open the image to access its EXIF data
+        img = Image.open(image_path)
+        exif_dict = piexif.load(img.info.get("exif", b""))
+
+        keywords = metadata['keywords'].encode('utf-16le')  # Change to UCS2 (UTF-16LE) encoding
+        exif_dict["0th"][piexif.ImageIFD.XPKeywords] = keywords
+        print(f"Embedding Keywords: {keywords}")
+
+        # Backup original image by appending .original suffix
+        backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
+        os.rename(image_path, backup_image_path)  # Rename original image to backup
+
+        # Prepare Exif data with sanitized strings
+        exif_bytes = piexif.dump(exif_dict)
+
+        # Open the backup image and save with new metadata
+        img.save(image_path, exif=exif_bytes)
+        print(Fore.GREEN + f"Keywords metadata successfully embedded in {image_path}" + Fore.RESET)
+
+
+
+    except Exception as e:
         logger.error(f"Error embedding metadata in {image_path}: {e}")
 
 
@@ -85,25 +141,17 @@ def process_images_in_folder(folder_path, ollama_host_url):
                 "model": "llama3.2-vision",
                 "stream": False,
                 "images": [encoded_image],
-                "prompt": "Evaluate this image and assign a numerical score between 1-100 composed of sub scores for technical quality, creative appeal, and monetization potential. For each image, return well-formatted JSON adhering to the following pattern:\n\"total_score\": 82,\n\"technical_quality\": 85,\n\"creative_appeal\": 80,\n\"monetization_potential\": 78,\n\"maximum_potential_score\": 90\nNormalize all scores to a 100-point scale and respond with the score values and score names. You will also return a descriptive title based on the image using no more than 140 characters, a description of the image using no more than 140 words and between 5 and 20 relevant keyword tags, comma separated, without hashtags",
+                "prompt": "Evaluate this image and assign a numerical score between 1-100 determined by an objective evaluation of the photograph's technical quality, aesthetic appeal and creativity, weighting aesthetic appeal double. For each image, return well-formatted JSON adhering to the following pattern:\n\"score\": <int>. You will also return a descriptive title based on the image using no more than 60 characters, a description of the image using no more than 200 characters and up to 12 relevant keyword tags, comma seperated, without hashtags",
                 "format": {
                     "type": "object",
                     "properties": {
-                        "total_score": {"type": "integer"},
-                        "technical_quality": {"type": "integer"},
-                        "creative_appeal": {"type": "integer"},
-                        "monetization_potential": {"type": "integer"},
-                        "maximum_potential_score": {"type": "integer"},
+                        "score": {"type": "string"},
                         "title": {"type": "string"},
                         "description": {"type": "string"},
                         "keywords": {"type": "string"}
                     },
                     "required": [
-                        "total_score",
-                        "technical_quality",
-                        "creative_appeal",
-                        "monetization_potential",
-                        "maximum_potential_score",
+                        "score",
                         "title",
                         "description",
                         "keywords"
@@ -116,12 +164,20 @@ def process_images_in_folder(folder_path, ollama_host_url):
                 if response.status_code == 200:
                     print(f"Response for {filename}: {response.text}")
                     response_data = response.json()  # Get the full response
-                    response_metadata = json.loads(response_data['response'])  # Extract and parse the 'response' field
 
-                    # Embed metadata after processing the image
-                    embed_metadata(image_path, response_metadata)
+                    # Extract and parse the 'response' field as JSON
+                    response_metadata = json.loads(response_data['response'])  # This should already be a dict
 
-                    results.append((filename, response_metadata))  # Store successful result
+                    # Print the metadata for debugging
+                    print(f"Metadata received for {filename}: {response_metadata}")
+
+                    # Proceed to embed metadata regardless of type checks
+                    try:
+                        embed_metadata(image_path, response_metadata)
+                        results.append((filename, response_metadata))  # Store successful result
+                    except Exception as e:
+                        logger.error(f"Error embedding metadata for {filename}: {e}")
+                        results.append((filename, None))  # Store failure result
 
                 else:
                     print(f"Failed to process {filename}: {response.status_code}")
