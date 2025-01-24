@@ -42,13 +42,10 @@ class Metadata(BaseModel):
 
 def embed_metadata(image_path: str, metadata: Dict):
     try:
-        # Commenting out validation of metadata
-        # validated_metadata = Metadata(**metadata)
-
         # Open the image to access its EXIF data
         img = Image.open(image_path)
         exif_dict = piexif.load(img.info.get("exif", b""))
-        user_comment = str(int(metadata['score']))
+
         user_comment = piexif.helper.UserComment.dump(metadata['score'])
         exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment
         print(f"Embedding score in User Comment: {user_comment}")
@@ -60,68 +57,37 @@ def embed_metadata(image_path: str, metadata: Dict):
         # Prepare Exif data with sanitized strings
         exif_bytes = piexif.dump(exif_dict)
 
-        # Open the backup image and save with new metadata
+        # Save with new metadata
         img.save(image_path, exif=exif_bytes)
         print(Fore.GREEN + f"User Comment metadata successfully embedded in {image_path}" + Fore.RESET)
 
-        # Open the image to access its EXIF data
-        img = Image.open(image_path)
+        # Access EXIF data again
         exif_dict = piexif.load(img.info.get("exif", b""))
 
         title = metadata['title'].encode('utf-16le')  # Change to UCS2 (UTF-16LE) encoding
         exif_dict["0th"][piexif.ImageIFD.XPTitle] = title
         print(f"Embedding Title: {title}")
 
-        # Backup original image by appending .original suffix
-        backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
-        os.rename(image_path, backup_image_path)  # Rename original image to backup
-
         # Prepare Exif data with sanitized strings
         exif_bytes = piexif.dump(exif_dict)
 
-        # Open the backup image and save with new metadata
+        # Save with new metadata
         img.save(image_path, exif=exif_bytes)
         print(Fore.GREEN + f"Title metadata successfully embedded in {image_path}" + Fore.RESET)
 
-        # # Open the image to access its EXIF data
-        # img = Image.open(image_path)
-        # exif_dict = piexif.load(img.info.get("exif", b""))
-        #
-        # description = metadata['description'].encode('utf-16le')  # Change to UCS2 (UTF-16LE) encoding
-        # exif_dict["0th"][piexif.ImageIFD.ImageDescription] = description
-        # print(f"Embedding Description: {description}")
-        #
-        # # Backup original image by appending .original suffix
-        # backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
-        # os.rename(image_path, backup_image_path)  # Rename original image to backup
-        #
-        # # Prepare Exif data with sanitized strings
-        # exif_bytes = piexif.dump(exif_dict)
-        #
-        # # Open the backup image and save with new metadata
-        # img.save(image_path, exif=exif_bytes)
-        # print(Fore.GREEN + f"Description metadata successfully embedded in {image_path}" + Fore.RESET)
-
-        # Open the image to access its EXIF data
-        img = Image.open(image_path)
+        # Access EXIF data again
         exif_dict = piexif.load(img.info.get("exif", b""))
 
         keywords = metadata['keywords'].encode('utf-16le')  # Change to UCS2 (UTF-16LE) encoding
         exif_dict["0th"][piexif.ImageIFD.XPKeywords] = keywords
         print(f"Embedding Keywords: {keywords}")
 
-        # Backup original image by appending .original suffix
-        backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
-        os.rename(image_path, backup_image_path)  # Rename original image to backup
-
         # Prepare Exif data with sanitized strings
         exif_bytes = piexif.dump(exif_dict)
 
-        # Open the backup image and save with new metadata
+        # Save with new metadata
         img.save(image_path, exif=exif_bytes)
         print(Fore.GREEN + f"Keywords metadata successfully embedded in {image_path}" + Fore.RESET)
-
-
 
     except Exception as e:
         logger.error(f"Error embedding metadata in {image_path}: {e}")
@@ -141,7 +107,7 @@ def process_images_in_folder(folder_path, ollama_host_url):
                 "model": "llama3.2-vision",
                 "stream": False,
                 "images": [encoded_image],
-                "prompt": "Evaluate this image and assign a numerical score between 1-100 determined by an objective evaluation of the photograph's technical quality, aesthetic appeal and creativity, weighting aesthetic appeal double. For each image, return well-formatted JSON adhering to the following pattern:\n\"score\": str. You will also return a descriptive title based on the image using no more than 60 characters, a description of the image using no more than 120 characters and up to 12 relevant keyword tags, comma seperated, without hashtags",
+                "prompt": "Evaluate this image and assign a numerical score between 1-100 determined by an objective evaluation of the photograph's technical quality, aesthetic appeal and creativity, weighting aesthetic appeal double. For each image, return well-formatted JSON adhering to the following pattern:\n\"score\": str. You will also return a descriptive title based on the image using no more than 60 characters, a description of the image using no more than 120 characters and up to 12 relevant keyword tags, comma separated, without hashtags",
                 "format": {
                     "type": "object",
                     "properties": {

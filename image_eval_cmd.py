@@ -18,7 +18,7 @@ client = Client(host='http://10.0.1.50:11434')
 
 
 class ImageScore(BaseModel):
-    total_score: int
+    total_score: str
     technical_quality: int
     creative_appeal: int
     monetization_potential: int
