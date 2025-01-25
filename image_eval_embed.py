@@ -40,11 +40,20 @@ class Metadata(BaseModel):
         return ','.join(keyword_list).strip()  # Join back to a string and strip whitespace
 
 
+def has_user_comment(image_path: str) -> bool:
+    """Check if the UserComment metadata exists and is not empty."""
+    try:
+        img = Image.open(image_path)
+        exif_dict = piexif.load(img.info.get("exif", b""))
+        user_comment = exif_dict["Exif"].get(piexif.ExifIFD.UserComment)
+        return user_comment is not None and user_comment != b''
+    except Exception as e:
+        logger.error(f"Error reading metadata for {image_path}: {e}")
+        return False
+
+
 def embed_metadata(image_path: str, metadata: Dict):
     try:
-        # Commenting out validation of metadata
-        # validated_metadata = Metadata(**metadata)
-
         # Open the image to access its EXIF data
         img = Image.open(image_path)
         exif_dict = piexif.load(img.info.get("exif", b""))
@@ -64,17 +73,10 @@ def embed_metadata(image_path: str, metadata: Dict):
         img.save(image_path, exif=exif_bytes)
         print(Fore.GREEN + f"User Comment metadata successfully embedded in {image_path}" + Fore.RESET)
 
-        # Open the image to access its EXIF data
-        img = Image.open(image_path)
-        exif_dict = piexif.load(img.info.get("exif", b""))
-
+        # Embedding Title
         title = metadata['title'].encode('utf-16le')  # Change to UCS2 (UTF-16LE) encoding
         exif_dict["0th"][piexif.ImageIFD.XPTitle] = title
         print(f"Embedding Title: {title}")
-
-        # Backup original image by appending .original suffix
-        backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
-        os.rename(image_path, backup_image_path)  # Rename original image to backup
 
         # Prepare Exif data with sanitized strings
         exif_bytes = piexif.dump(exif_dict)
@@ -83,37 +85,10 @@ def embed_metadata(image_path: str, metadata: Dict):
         img.save(image_path, exif=exif_bytes)
         print(Fore.GREEN + f"Title metadata successfully embedded in {image_path}" + Fore.RESET)
 
-        #Description disabled as it was only embedding the first letter.
-        # Open the image to access its EXIF data
-        #img = Image.open(image_path)
-        #exif_dict = piexif.load(img.info.get("exif", b""))
-
-        #description = metadata['description'].encode('utf-16le')  # Change to UCS2 (UTF-16LE) encoding
-        #exif_dict["0th"][piexif.ImageIFD.ImageDescription] = description
-        #print(f"Embedding Description: {description}")
-
-        # Backup original image by appending .original suffix
-        #backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
-        #os.rename(image_path, backup_image_path)  # Rename original image to backup
-
-        # Prepare Exif data with sanitized strings
-        #exif_bytes = piexif.dump(exif_dict)
-
-        # Open the backup image and save with new metadata
-        #img.save(image_path, exif=exif_bytes)
-        #print(Fore.GREEN + f"Description metadata successfully embedded in {image_path}" + Fore.RESET)
-
-        # Open the image to access its EXIF data
-        img = Image.open(image_path)
-        exif_dict = piexif.load(img.info.get("exif", b""))
-
+        # Embedding Keywords
         keywords = metadata['keywords'].encode('utf-16le')  # Change to UCS2 (UTF-16LE) encoding
         exif_dict["0th"][piexif.ImageIFD.XPKeywords] = keywords
         print(f"Embedding Keywords: {keywords}")
-
-        # Backup original image by appending .original suffix
-        backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
-        os.rename(image_path, backup_image_path)  # Rename original image to backup
 
         # Prepare Exif data with sanitized strings
         exif_bytes = piexif.dump(exif_dict)
@@ -121,8 +96,6 @@ def embed_metadata(image_path: str, metadata: Dict):
         # Open the backup image and save with new metadata
         img.save(image_path, exif=exif_bytes)
         print(Fore.GREEN + f"Keywords metadata successfully embedded in {image_path}" + Fore.RESET)
-
-
 
     except Exception as e:
         logger.error(f"Error embedding metadata in {image_path}: {e}")
@@ -133,8 +106,18 @@ def process_images_in_folder(folder_path, ollama_host_url):
     results = []  # To store processing results
 
     for filename in os.listdir(folder_path):
+        # Skip files with the '.original' suffix
+        if filename.endswith('.original'):
+            continue
+
         if filename.endswith(('.jpg', '.jpeg', '.png')):
             image_path = os.path.join(folder_path, filename)
+
+            # Check if UserComment exists
+            if has_user_comment(image_path):
+                print(f"Skipping {filename} due to existing UserComment.")
+                continue
+
             with open(image_path, 'rb') as image_file:
                 encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
 
@@ -142,7 +125,7 @@ def process_images_in_folder(folder_path, ollama_host_url):
                 "model": "llama3.2-vision",
                 "stream": False,
                 "images": [encoded_image],
-                "prompt": "Evaluate this image and assign a numerical score between 1-100 determined by an objective evaluation of the photograph's technical quality, aesthetic appeal and creativity, weighting aesthetic appeal double. For each image, return well-formatted JSON adhering to the following pattern:\n\"score\": <int>. You will also return a descriptive title based on the image using no more than 60 characters, a description of the image using no more than 200 characters and up to 12 relevant keyword tags, comma seperated, without hashtags",
+                "prompt": "You are a discerning photography critic. You specialize in assessing individual professional photographs. Your evaluation is objective and quantitative, focusing on technical quality, creativity, aesthetic appeal and monetization potential. You provide a numerical score on a scale of 1 to 100 for each image you see. Technical quality is evaluated based on exposure, focus, color balance, composition, crop and aspect ratio. Creativity is assessed considering the images unique perspective, mood, subject matter and emotional impact. Aesthetic appeal is assessed based on how appealing the image is in purely aesthetic terms to a general audience. You will weight aesthetic appeal double in your scoring. For each image, return well-formatted JSON adhering to the following pattern:\n\"score\": <int>. You will also return a descriptive title based on the image using no more than 60 characters, a description of the image using no more than 200 characters and up to 12 relevant keyword tags, comma separated, without hashtags",
                 "format": {
                     "type": "object",
                     "properties": {
