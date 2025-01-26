@@ -3,6 +3,7 @@ import base64
 import json  # Import json for parsing the response
 import logging
 import os
+import sys
 from typing import Dict
 
 import piexif
@@ -23,7 +24,7 @@ def sanitize_string(s: str) -> str:
 
 
 class Metadata(BaseModel):
-    score: str
+    score: int  # Changed from str to int
     title: str
     description: str
     keywords: str
@@ -34,7 +35,7 @@ class Metadata(BaseModel):
     @field_validator('keywords')
     def validate_keywords(cls, v):
         keyword_list = v.split(',')
-        # Truncate to 12 keywords if there are more than 12
+        # Allow up to and including 12 keywords
         if len(keyword_list) > 12:
             keyword_list = keyword_list[:12]
         return ','.join(keyword_list).strip()  # Join back to a string and strip whitespace
@@ -43,10 +44,14 @@ class Metadata(BaseModel):
 def has_user_comment(image_path: str) -> bool:
     """Check if the UserComment metadata exists and is not empty."""
     try:
-        img = Image.open(image_path)
-        exif_dict = piexif.load(img.info.get("exif", b""))
-        user_comment = exif_dict["Exif"].get(piexif.ExifIFD.UserComment)
-        return user_comment is not None and user_comment != b''
+        with Image.open(image_path) as img:
+            exif_data = img.info.get("exif", b"")
+            if not exif_data:  # Check if EXIF data is empty
+                return False
+
+            exif_dict = piexif.load(exif_data)
+            user_comment = exif_dict["Exif"].get(piexif.ExifIFD.UserComment)
+            return user_comment is not None and user_comment != b''
     except Exception as e:
         logger.error(f"Error reading metadata for {image_path}: {e}")
         return False
@@ -55,53 +60,44 @@ def has_user_comment(image_path: str) -> bool:
 def embed_metadata(image_path: str, metadata: Dict):
     try:
         # Open the image to access its EXIF data
-        img = Image.open(image_path)
-        exif_dict = piexif.load(img.info.get("exif", b""))
+        with Image.open(image_path) as img:
+            exif_data = img.info.get("exif", b"")
+            if exif_data:
+                exif_dict = piexif.load(exif_data)
+            else:
+                exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}  # Create a new EXIF structure
 
-        user_comment = piexif.helper.UserComment.dump(metadata['score'])
-        exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment
-        print(f"Embedding score in User Comment: {user_comment}")
+            user_comment = piexif.helper.UserComment.dump(metadata.get('score', ''))
+            exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment
+            print(f"Embedding score in User Comment: {user_comment}")
 
-        # Backup original image by appending .original suffix
-        backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
-        os.rename(image_path, backup_image_path)  # Rename original image to backup
+            # Embedding Title
+            title = metadata.get('title', '').encode('utf-16le')
+            exif_dict["0th"][piexif.ImageIFD.XPTitle] = title
+            print(f"Embedding Title: {title}")
 
-        # Prepare Exif data with sanitized strings
-        exif_bytes = piexif.dump(exif_dict)
+            # Embedding Keywords
+            keywords = metadata.get('keywords', '').encode('utf-16le')
+            exif_dict["0th"][piexif.ImageIFD.XPKeywords] = keywords
+            print(f"Embedding Keywords: {keywords}")
 
-        # Open the backup image and save with new metadata
-        img.save(image_path, exif=exif_bytes)
-        print(Fore.GREEN + f"User Comment metadata successfully embedded in {image_path}" + Fore.RESET)
+            # Prepare Exif data with sanitized strings
+            exif_bytes = piexif.dump(exif_dict)
 
-        # Embedding Title
-        title = metadata['title'].encode('utf-16le')  # Change to UCS2 (UTF-16LE) encoding
-        exif_dict["0th"][piexif.ImageIFD.XPTitle] = title
-        print(f"Embedding Title: {title}")
+            # Backup original image by appending .original suffix
+            backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
+            if os.path.exists(image_path):  # Ensure the file exists before renaming
+                os.rename(image_path, backup_image_path)
 
-        # Prepare Exif data with sanitized strings
-        exif_bytes = piexif.dump(exif_dict)
-
-        # Open the backup image and save with new metadata
-        img.save(image_path, exif=exif_bytes)
-        print(Fore.GREEN + f"Title metadata successfully embedded in {image_path}" + Fore.RESET)
-
-        # Embedding Keywords
-        keywords = metadata['keywords'].encode('utf-16le')  # Change to UCS2 (UTF-16LE) encoding
-        exif_dict["0th"][piexif.ImageIFD.XPKeywords] = keywords
-        print(f"Embedding Keywords: {keywords}")
-
-        # Prepare Exif data with sanitized strings
-        exif_bytes = piexif.dump(exif_dict)
-
-        # Open the backup image and save with new metadata
-        img.save(image_path, exif=exif_bytes)
-        print(Fore.GREEN + f"Keywords metadata successfully embedded in {image_path}" + Fore.RESET)
+            # Save with new metadata
+            img.save(image_path, exif=exif_bytes)
+            print(Fore.GREEN + f"Metadata successfully embedded in {image_path}" + Fore.RESET)
 
     except Exception as e:
         logger.error(f"Error embedding metadata in {image_path}: {e}")
 
 
-def process_images_in_folder(folder_path, ollama_host_url):
+def process_images_in_folder(folder_path: str, ollama_host_url: str) -> list[tuple[str, dict | None]]:
     headers = {'Content-Type': 'application/json'}
     results = []  # To store processing results
 
@@ -182,13 +178,13 @@ if __name__ == "__main__":
     # Validate folder path
     if not os.path.exists(args.folder_path):
         logger.error(f"The folder path '{args.folder_path}' does not exist.")
-        exit(1)
+        sys.exit(1)
     if not os.path.isdir(args.folder_path):
         logger.error(f"The path '{args.folder_path}' is not a directory.")
-        exit(1)
+        sys.exit(1)
     if not any(filename.endswith(('.jpg', '.jpeg', '.png')) for filename in os.listdir(args.folder_path)):
         logger.error(f"No image files found in the directory '{args.folder_path}'.")
-        exit(1)
+        sys.exit(1)
 
     results = process_images_in_folder(args.folder_path, args.ollama_host_url)  # Pass URL to function
 
