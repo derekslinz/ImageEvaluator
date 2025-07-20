@@ -4,7 +4,7 @@ import json  # Import json for parsing the response
 import logging
 import os
 import sys
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 import piexif
 import piexif.helper
@@ -76,6 +76,11 @@ def embed_metadata(image_path: str, metadata: Dict):
             exif_dict["0th"][piexif.ImageIFD.XPTitle] = title
             print(f"Embedding Title: {title}")
 
+            # Embedding Description
+            description = metadata.get('description', '').encode('utf-16le')
+            exif_dict["0th"][piexif.ImageIFD.XPComment] = description
+            print(f"Embedding Description: {description}")
+
             # Embedding Keywords
             keywords = metadata.get('keywords', '').encode('utf-16le')
             exif_dict["0th"][piexif.ImageIFD.XPKeywords] = keywords
@@ -97,7 +102,7 @@ def embed_metadata(image_path: str, metadata: Dict):
         logger.error(f"Error embedding metadata in {image_path}: {e}")
 
 
-def process_images_in_folder(folder_path: str, ollama_host_url: str) -> list[tuple[str, dict | None]]:
+def process_images_in_folder(folder_path: str, ollama_host_url: str) -> List[Tuple[str, Optional[Dict]]]:
     headers = {'Content-Type': 'application/json'}
     results = []  # To store processing results
 
