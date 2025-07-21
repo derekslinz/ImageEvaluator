@@ -30,12 +30,12 @@ pip install Pillow requests piexif pydantic colorama
 
 ### Usage
 
-1. **Clone the repository** or download image_eval_embedded.py.
-2. Star ollama with 'ollama server' and make sure you have the ollama3.2-vision model available.
+1. **Clone the repository** or download image_eval_embed.py.
+2. Start ollama with 'ollama server' and make sure you have the ollama3.2-vision model available.
 3. **Run the script** from the command line with the following syntax:
 
    ```bash
-   python image_eval_embedded.py <folder_path> <ollama_host_url>
+   python image_eval_embed.py <folder_path> <ollama_host_url>
    ```
 
    - `<folder_path>`: Path to the folder containing images.
@@ -45,7 +45,7 @@ pip install Pillow requests piexif pydantic colorama
 #### Example
 ### Example syntax
 ```bash
-python image_eval_embedded.py /path/to/images http://localhost:8000/api/evaluate](http://localhost:11434/api/generate
+python image_eval_embed.py /path/to/images http://localhost:8000/api/evaluate](http://localhost:11434/api/generate
 ```
 #### Exmaple Output
 ```bash
