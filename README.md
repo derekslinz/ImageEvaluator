@@ -98,6 +98,14 @@ The script includes error handling for:
 
 Before embedding metadata, the script creates a backup of the original image by appending `.original` to the filename.
 
+### Running Tests
+
+After installing the requirements, you can execute the unit tests using `pytest` from the repository root:
+
+```bash
+pytest
+```
+
 ### License
 
 This project is licensed under the MIT License. See the LICENSE file for details.
