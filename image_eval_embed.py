@@ -67,7 +67,7 @@ def embed_metadata(image_path: str, metadata: Dict):
             else:
                 exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}  # Create a new EXIF structure
 
-            user_comment = piexif.helper.UserComment.dump(metadata.get('score', ''))
+            user_comment = piexif.helper.UserComment.dump(str(metadata.get('score', '')))
             exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment
             print(f"Embedding score in User Comment: {user_comment}")
 
