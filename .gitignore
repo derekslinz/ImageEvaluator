@@ -1,5 +1,4 @@
+image-eval.out
 /.idea
-image_eval_cmd.py
-image_evaluator.py
-keyword_embedder.py
-/.idea
+nohup.out
+
