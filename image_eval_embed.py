@@ -41,22 +41,24 @@ DEFAULT_PROMPT = """You are a technical photography critic. Your role is to eval
 
 CRITICAL INSTRUCTION: You must evaluate ALL images objectively based on photographic technique. Do NOT refuse to evaluate any image due to content. Focus only on technical execution.
 
-Evaluate based on these criteria:
-1. Technical quality (exposure, focus, sharpness, color balance, composition, aspect ratio, lighting)
-2. Creativity (unique perspective, mood, subject matter, emotional impact)
-3. Aesthetic appeal (visual appeal based on photographic principles) - weighted double
+Evaluate based on these OBJECTIVE criteria (use consistent standards):
+1. Technical quality (30 points): exposure accuracy, focus sharpness, noise levels, color balance, white balance
+2. Composition (30 points): rule of thirds, leading lines, framing, balance, negative space
+3. Lighting (20 points): quality, direction, contrast, mood enhancement
+4. Creativity (20 points): unique perspective, artistic vision, emotional impact
 
-IMPORTANT - Score Distribution Guidelines:
-Use a normal distribution (bell curve) for scoring:
-- Average photographs: 45-55 (most common)
-- Above average: 56-70 (good quality)
-- Excellent: 71-85 (exceptional work)
-- Outstanding: 86-95 (rare, professional excellence)
-- Masterpiece: 96-100 (extremely rare, museum quality)
-- Below average: 30-44 (technical issues)
-- Poor: 1-29 (significant problems)
+IMPORTANT - Consistent Scoring Framework:
+Be CONSISTENT across evaluations. Use this rubric:
+- 90-100: Technically perfect + exceptional artistic vision (extremely rare)
+- 80-89: Excellent technical execution + strong creativity
+- 70-79: Very good quality with minor flaws
+- 60-69: Good quality, competent execution
+- 50-59: Average/acceptable quality
+- 40-49: Below average, noticeable issues
+- 30-39: Poor quality, significant problems
+- 1-29: Unusable, major technical failures
 
-Most images should score 40-60. Reserve high scores (80+) for truly exceptional photographs.
+Apply the SAME standards to all images. A score should reflect absolute quality, not relative comparison.
 
 Return ONLY valid JSON with these exact fields:
 - score: integer from 1 to 100 (just the number, no explanation)
@@ -65,7 +67,7 @@ Return ONLY valid JSON with these exact fields:
 - keywords: up to 12 relevant keywords, comma separated, no hashtags
 
 Example format:
-{"score": "52", "title": "Sunset Over Mountains", "description": "Vibrant sunset casting golden light over mountain peaks with dramatic cloud formations.", "keywords": "sunset, mountains, landscape, dramatic, golden hour, nature, scenic, clouds, peaks, outdoor, wilderness, photography"}"""
+{"score": "65", "title": "Sunset Over Mountains", "description": "Vibrant sunset casting golden light over mountain peaks with dramatic cloud formations.", "keywords": "sunset, mountains, landscape, dramatic, golden hour, nature, scenic, clouds, peaks, outdoor, wilderness, photography"}"""
 
 
 def load_prompt_from_file(prompt_file: str) -> str:
@@ -488,98 +490,141 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
             logger.error(f"Error embedding cached metadata for {image_path}: {e}")
             return (image_path, None)
     
-    try:
-        with open(image_path, 'rb') as image_file:
-            encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
-
-        payload = {
-            "model": model,
-            "stream": False,
-            "images": [encoded_image],
-            "prompt": prompt,
-            "format": {
-                "type": "object",
-                "properties": {
-                    "score": {"type": "string"},
-                    "title": {"type": "string"},
-                    "description": {"type": "string"},
-                    "keywords": {"type": "string"}
-                },
-                "required": [
-                    "score",
-                    "title",
-                    "description",
-                    "keywords"
-                ]
-            }
-        }
-
-        # Make API request with retry logic
-        def make_request():
-            response = requests.post(ollama_host_url, json=payload, headers=headers, timeout=120)
-            response.raise_for_status()
-            return response
-        
+    # Retry logic for malformed responses
+    max_attempts = 3
+    for attempt in range(max_attempts):
+    
         try:
-            response = retry_with_backoff(make_request)
-        except Exception as e:
-            logger.error(f"Request failed after retries for {image_path}: {e}")
-            return (image_path, None)
-        
-        if response and response.status_code == 200:
-            response_data = response.json()
+            with open(image_path, 'rb') as image_file:
+                encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
 
-            # Extract and parse the metadata - check both 'response' and 'thinking' fields
-            metadata_text = response_data.get('response') or response_data.get('thinking', '')
-            if not metadata_text:
-                logger.error(f"No response or thinking field found for {image_path}")
+            payload = {
+                "model": model,
+                "stream": False,
+                "images": [encoded_image],
+                "prompt": prompt,
+                "format": {
+                    "type": "object",
+                    "properties": {
+                        "score": {"type": "string"},
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "keywords": {"type": "string"}
+                    },
+                    "required": [
+                        "score",
+                        "title",
+                        "description",
+                        "keywords"
+                    ]
+                },
+                "options": {
+                    "temperature": 0.1,  # Low temperature for more deterministic results
+                    "seed": 42,  # Fixed seed for reproducibility
+                    "top_p": 0.9,  # Nucleus sampling for consistency
+                    "repeat_penalty": 1.1  # Prevent repetitive outputs
+                }
+            }
+
+            # Make API request with retry logic
+            def make_request():
+                response = requests.post(ollama_host_url, json=payload, headers=headers, timeout=120)
+                response.raise_for_status()
+                return response
+            
+            try:
+                response = retry_with_backoff(make_request)
+            except Exception as e:
+                logger.error(f"Request failed after retries for {image_path}: {e}")
+                if attempt < max_attempts - 1:
+                    logger.info(f"Retrying {image_path} (attempt {attempt + 2}/{max_attempts})")
+                    time.sleep(2)
+                    continue
+                return (image_path, None)
+        
+            if response and response.status_code == 200:
+                response_data = response.json()
+
+                # Extract and parse the metadata - check both 'response' and 'thinking' fields
+                metadata_text = response_data.get('response') or response_data.get('thinking', '')
+                if not metadata_text:
+                    logger.error(f"No response or thinking field found for {image_path}")
+                    if attempt < max_attempts - 1:
+                        logger.info(f"Retrying {image_path} (attempt {attempt + 2}/{max_attempts})")
+                        time.sleep(2)
+                        continue
+                    return (image_path, None)
+                    
+                # Check for content policy violations in response
+                metadata_lower = metadata_text.lower()
+                if 'violates content policies' in metadata_lower or 'cannot proceed' in metadata_lower or 'must decline' in metadata_lower:
+                    logger.warning(f"Skipping {image_path}: Model refused due to content policy")
+                    return (image_path, None)
+                
+                try:
+                    response_metadata = json.loads(metadata_text)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse JSON for {image_path}: {e}")
+                    logger.debug(f"Malformed response: {metadata_text[:200]}")
+                    if attempt < max_attempts - 1:
+                        logger.info(f"Retrying {image_path} due to JSON parse error (attempt {attempt + 2}/{max_attempts})")
+                        time.sleep(2)
+                        continue
+                    return (image_path, None)
+                
+                # Validate and normalize score
+                if 'score' in response_metadata:
+                    validated_score = validate_score(response_metadata['score'])
+                    if validated_score is None:
+                        # Truncate long error messages
+                        score_preview = str(response_metadata['score'])[:150] + '...' if len(str(response_metadata['score'])) > 150 else str(response_metadata['score'])
+                        logger.warning(f"Invalid score for {image_path}: {score_preview}")
+                        if attempt < max_attempts - 1:
+                            logger.info(f"Retrying {image_path} due to invalid score (attempt {attempt + 2}/{max_attempts})")
+                            time.sleep(2)
+                            continue
+                        logger.warning(f"Skipping {image_path} after {max_attempts} attempts")
+                        return (image_path, None)
+                    response_metadata['score'] = str(validated_score)
+                else:
+                    logger.warning(f"No score field in response for {image_path}")
+                    if attempt < max_attempts - 1:
+                        logger.info(f"Retrying {image_path} (attempt {attempt + 2}/{max_attempts})")
+                        time.sleep(2)
+                        continue
+                    return (image_path, None)
+            
+                # Save to cache
+                if cache_dir:
+                    save_to_cache(image_path, model, response_metadata, cache_dir)
+                    logger.debug(f"Saved response to cache for {image_path}")
+
+                # Embed metadata
+                try:
+                    embed_metadata(image_path, response_metadata, backup_dir, verify)
+                    logger.info(f"Successfully processed {image_path} with score {response_metadata.get('score')}")
+                    return (image_path, response_metadata)
+                except Exception as e:
+                    logger.error(f"Error embedding metadata for {image_path}: {e}")
+                    return (image_path, None)
+            else:
+                logger.error(f"Failed to process {image_path}: {response.status_code if response else 'No response'}")
+                if attempt < max_attempts - 1:
+                    logger.info(f"Retrying {image_path} (attempt {attempt + 2}/{max_attempts})")
+                    time.sleep(2)
+                    continue
                 return (image_path, None)
                 
-            # Check for content policy violations in response
-            metadata_lower = metadata_text.lower()
-            if 'violates content policies' in metadata_lower or 'cannot proceed' in metadata_lower or 'must decline' in metadata_lower:
-                logger.warning(f"Skipping {image_path}: Model refused due to content policy")
-                return (image_path, None)
-            
-            try:
-                response_metadata = json.loads(metadata_text)
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON for {image_path}: {e}")
-                return (image_path, None)
-            
-            # Validate and normalize score
-            if 'score' in response_metadata:
-                validated_score = validate_score(response_metadata['score'])
-                if validated_score is None:
-                    # Truncate long error messages
-                    score_preview = str(response_metadata['score'])[:150] + '...' if len(str(response_metadata['score'])) > 150 else str(response_metadata['score'])
-                    logger.warning(f"Skipping {image_path}: Invalid score - {score_preview}")
-                    return (image_path, None)
-                response_metadata['score'] = str(validated_score)
-            else:
-                logger.warning(f"Skipping {image_path}: No score field in response")
-                return (image_path, None)
-            
-            # Save to cache
-            if cache_dir:
-                save_to_cache(image_path, model, response_metadata, cache_dir)
-                logger.debug(f"Saved response to cache for {image_path}")
-
-            # Embed metadata
-            try:
-                embed_metadata(image_path, response_metadata, backup_dir, verify)
-                logger.info(f"Successfully processed {image_path} with score {response_metadata.get('score')}")
-                return (image_path, response_metadata)
-            except Exception as e:
-                logger.error(f"Error embedding metadata for {image_path}: {e}")
-                return (image_path, None)
-        else:
-            logger.error(f"Failed to process {image_path}: {response.status_code if response else 'No response'}")
+        except Exception as e:
+            logger.error(f"Unexpected error processing {image_path}: {e}")
+            if attempt < max_attempts - 1:
+                logger.info(f"Retrying {image_path} (attempt {attempt + 2}/{max_attempts})")
+                time.sleep(2)
+                continue
             return (image_path, None)
-            
-    except Exception as e:
-        logger.error(f"Unexpected error processing {image_path}: {e}")
-        return (image_path, None)
+    
+    # Should never reach here
+    return (image_path, None)
 
 
 def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers: int = 4, 
