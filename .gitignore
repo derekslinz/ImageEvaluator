@@ -1,7 +1,6 @@
 image-eval.out
 /.idea
 nohup.out
-
-image_evaluator_20251120_233058.log
-Lightroom SavedPhotos.csv
-.vscode/settings.json
+*.log
+*.csv
+.vscode

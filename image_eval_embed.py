@@ -20,7 +20,7 @@ import piexif
 import piexif.helper
 import requests
 from PIL import Image
-from colorama import Fore
+from colorama import Fore, Style
 from pydantic import BaseModel, ConfigDict, field_validator
 from tqdm import tqdm
 
@@ -341,19 +341,19 @@ def embed_metadata_exiftool(image_path: str, metadata: Dict, backup_dir: Optiona
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode == 0:
-            print(f"Embedding score: {metadata.get('score', '')}")
-            print(f"Embedding Title: {metadata.get('title', '')}")
-            print(f"Embedding Description: {metadata.get('description', '')}")
-            print(f"Embedding Keywords: {metadata.get('keywords', '')}")
+            print(f"{Fore.BLUE}Embedding score:{Fore.RESET} {Fore.GREEN}{metadata.get('score', '')}{Fore.RESET}")
+            print(f"{Fore.BLUE}Embedding Title:{Fore.RESET} {Fore.GREEN}{metadata.get('title', '')}{Fore.RESET}")
+            print(f"{Fore.BLUE}Embedding Description:{Fore.RESET} {Fore.GREEN}{metadata.get('description', '')}{Fore.RESET}")
+            print(f"{Fore.BLUE}Embedding Keywords:{Fore.RESET} {Fore.GREEN}{metadata.get('keywords', '')}{Fore.RESET}")
             
             # Verify if requested
             if verify:
                 if verify_metadata(image_path, metadata):
-                    print(Fore.GREEN + f"✓ Metadata verified in {image_path}" + Fore.RESET)
+                    print(Fore.GREEN + f"✓ Metadata verified in {Style.BRIGHT}{image_path}{Style.RESET_ALL}" + Fore.RESET)
                 else:
                     logger.warning(f"⚠ Metadata verification failed for {image_path}")
             else:
-                print(Fore.GREEN + f"Metadata successfully embedded in {image_path} using exiftool" + Fore.RESET)
+                print(Fore.GREEN + f"Metadata successfully embedded in {Style.BRIGHT}{image_path}{Style.RESET_ALL} using exiftool" + Fore.RESET)
             return True
         else:
             logger.error(f"exiftool failed for {image_path}: {result.stderr}")
@@ -385,22 +385,22 @@ def embed_metadata(image_path: str, metadata: Dict, backup_dir: Optional[str] = 
 
             user_comment = piexif.helper.UserComment.dump(str(metadata.get('score', '')))
             exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment
-            print(f"Embedding score in User Comment: {user_comment}")
+            print(f"{Fore.BLUE}Embedding score:{Fore.RESET} {Fore.GREEN}{metadata.get('score', '')}{Fore.RESET}")
 
             # Embedding Title (UTF-16LE with BOM for Windows compatibility)
             title = metadata.get('title', '').encode('utf-16le') + b'\x00\x00'
             exif_dict["0th"][piexif.ImageIFD.XPTitle] = title
-            print(f"Embedding Title: {metadata.get('title', '')}")
+            print(f"{Fore.BLUE}Embedding Title:{Fore.RESET} {Fore.GREEN}{metadata.get('title', '')}{Fore.RESET}")
 
             # Embedding Description
             description = metadata.get('description', '').encode('utf-16le') + b'\x00\x00'
             exif_dict["0th"][piexif.ImageIFD.XPComment] = description
-            print(f"Embedding Description: {metadata.get('description', '')}")
+            print(f"{Fore.BLUE}Embedding Description:{Fore.RESET} {Fore.GREEN}{metadata.get('description', '')}{Fore.RESET}")
 
             # Embedding Keywords
             keywords = metadata.get('keywords', '').encode('utf-16le') + b'\x00\x00'
             exif_dict["0th"][piexif.ImageIFD.XPKeywords] = keywords
-            print(f"Embedding Keywords: {metadata.get('keywords', '')}")
+            print(f"{Fore.BLUE}Embedding Keywords:{Fore.RESET} {Fore.GREEN}{metadata.get('keywords', '')}{Fore.RESET}")
 
             # Prepare Exif data with sanitized strings
             exif_bytes = piexif.dump(exif_dict)
@@ -417,11 +417,11 @@ def embed_metadata(image_path: str, metadata: Dict, backup_dir: Optional[str] = 
             # Verify if requested
             if verify:
                 if verify_metadata(image_path, metadata):
-                    print(Fore.GREEN + f"✓ Metadata verified in {image_path}" + Fore.RESET)
+                    print(Fore.GREEN + f"✓ Metadata verified in {Style.BRIGHT}{image_path}{Style.RESET_ALL}" + Fore.RESET)
                 else:
                     logger.warning(f"⚠ Metadata verification failed for {image_path}")
             else:
-                print(Fore.GREEN + f"Metadata successfully embedded in {image_path}" + Fore.RESET)
+                print(Fore.GREEN + f"Metadata successfully embedded in {Style.BRIGHT}{image_path}{Style.RESET_ALL}" + Fore.RESET)
             return True
 
     except Exception as e:
@@ -676,7 +676,18 @@ def get_cache_stats(cache_dir: str) -> Dict:
 def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
     """Calculate statistics from processing results."""
     scores = []
-    for _, metadata in results:
+    raw_count = 0
+    pil_count = 0
+    
+    for image_path, metadata in results:
+        # Track format types
+        if image_path:
+            file_ext = os.path.splitext(image_path)[1].lower()
+            if file_ext in ['.dng', '.nef', '.tif', '.tiff']:
+                raw_count += 1
+            elif file_ext in ['.jpg', '.jpeg', '.png']:
+                pil_count += 1
+        
         if metadata and 'score' in metadata:
             try:
                 # Try to extract numeric score from string
@@ -699,7 +710,9 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
             'avg_score': 0,
             'min_score': 0,
             'max_score': 0,
-            'score_distribution': {}
+            'score_distribution': {},
+            'raw_count': raw_count,
+            'pil_count': pil_count
         }
     
     # Calculate score distribution (bins of 10)
@@ -716,7 +729,9 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
         'avg_score': sum(scores) / len(scores) if scores else 0,
         'min_score': min(scores) if scores else 0,
         'max_score': max(scores) if scores else 0,
-        'score_distribution': distribution
+        'score_distribution': distribution,
+        'raw_count': raw_count,
+        'pil_count': pil_count
     }
 
 
@@ -728,6 +743,20 @@ def print_statistics(stats: Dict):
     print(f"Total images processed: {stats['total_processed']}")
     print(f"Successful: {stats['successful']}")
     print(f"Failed: {stats['failed']}")
+    print(f"RAW formats (exiftool): {stats.get('raw_count', 0)}")
+    print(f"Standard formats (PIL): {stats.get('pil_count', 0)}")
+    
+    # Add timing information
+    if 'elapsed_time' in stats:
+        elapsed = stats['elapsed_time']
+        print(f"\n{'='*60}")
+        print(f"TIMING STATISTICS")
+        print(f"{'='*60}")
+        print(f"Total processing time: {elapsed:.2f} seconds ({elapsed/60:.2f} minutes)")
+        if stats['total_processed'] > 0:
+            print(f"Time per image: {elapsed/stats['total_processed']:.2f} seconds")
+        if stats['successful'] > 0:
+            print(f"Time per successful image: {elapsed/stats['successful']:.2f} seconds")
     
     if stats['successful'] > 0:
         print(f"\n{'='*60}")
@@ -881,7 +910,7 @@ if __name__ == "__main__":
         file_types = [ext.strip() for ext in args.file_types.split(',')]
         print(f"Filtering for file types: {', '.join(file_types)}")
     
-    print(f"\nProcessing images from: {args.folder_path}")
+    print(f"\nProcessing images from: {Style.BRIGHT}{args.folder_path}{Style.RESET_ALL}")
     print(f"Model: {args.model}")
     print(f"Workers: {args.workers}")
     print(f"Skip existing: {args.skip_existing}")
@@ -910,6 +939,7 @@ if __name__ == "__main__":
     
     # Process images
     logger.info(f"Starting processing of images in {args.folder_path}")
+    start_time = time.time()
     results = process_images_in_folder(
         args.folder_path, 
         args.ollama_host_url, 
@@ -924,10 +954,12 @@ if __name__ == "__main__":
         verify=args.verify,
         cache_dir=cache_dir
     )
-    logger.info(f"Completed processing {len(results)} images")
+    elapsed_time = time.time() - start_time
+    logger.info(f"Completed processing {len(results)} images in {elapsed_time:.2f} seconds")
     
     # Calculate statistics
     stats = calculate_statistics(results)
+    stats['elapsed_time'] = elapsed_time
     
     # Print statistics
     print_statistics(stats)
