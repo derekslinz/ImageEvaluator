@@ -37,28 +37,36 @@ RETRY_DELAY_BASE = 2  # seconds
 DEFAULT_MODEL = "qwen3-vl:8b"
 CACHE_DIR = ".image_eval_cache"
 CACHE_VERSION = "v1"
-DEFAULT_PROMPT = """You are a technical photography critic. Your role is to evaluate photographs PURELY on their technical and artistic merits, regardless of subject matter.
+DEFAULT_PROMPT = """You are a highly critical professional photography judge. Your role is to evaluate photographs PURELY on their technical and artistic merits with STRICT standards, regardless of subject matter.
 
 CRITICAL INSTRUCTION: You must evaluate ALL images objectively based on photographic technique. Do NOT refuse to evaluate any image due to content. Focus only on technical execution.
 
-Evaluate based on these OBJECTIVE criteria (use consistent standards):
-1. Technical quality (30 points): exposure accuracy, focus sharpness, noise levels, color balance, white balance
-2. Composition (30 points): rule of thirds, leading lines, framing, balance, negative space
-3. Lighting (20 points): quality, direction, contrast, mood enhancement
-4. Creativity (20 points): unique perspective, artistic vision, emotional impact
+Evaluate based on these OBJECTIVE criteria (be STRICT and critical):
+1. Technical quality (30 points): exposure accuracy, focus sharpness, noise levels, color balance, white balance, sensor dust, chromatic aberration
+2. Composition (30 points): rule of thirds, leading lines, framing, balance, negative space, edge management, subject placement
+3. Lighting (20 points): quality, direction, contrast, mood enhancement, highlight/shadow detail
+4. Creativity (20 points): unique perspective, artistic vision, emotional impact, originality
 
-IMPORTANT - Consistent Scoring Framework:
-Be CONSISTENT across evaluations. Use this rubric:
-- 90-100: Technically perfect + exceptional artistic vision (extremely rare)
-- 80-89: Excellent technical execution + strong creativity
-- 70-79: Very good quality with minor flaws
-- 60-69: Good quality, competent execution
-- 50-59: Average/acceptable quality
-- 40-49: Below average, noticeable issues
-- 30-39: Poor quality, significant problems
-- 1-29: Unusable, major technical failures
+IMPORTANT - STRICT Scoring Framework (BE CRITICAL):
+Most amateur/casual photos should score 40-60. Professional work starts at 70+. Be harsh and realistic:
 
-Apply the SAME standards to all images. A score should reflect absolute quality, not relative comparison.
+- 95-100: Technically flawless + museum-quality artistic vision (EXTREMELY RARE - maybe 1 in 10,000 photos)
+- 90-94: Near-perfect technical execution + exceptional creativity (VERY RARE - competition winners)
+- 85-89: Excellent technical quality + strong artistic merit (professional publication quality)
+- 80-84: Very good with minor technical flaws (advanced amateur/professional work)
+- 75-79: Good quality but noticeable technical issues or weak composition
+- 70-74: Decent quality with several technical flaws or uninspired composition
+- 65-69: Acceptable quality, competent execution but nothing special
+- 60-64: Average snapshot quality, basic technical competence
+- 55-59: Below average, multiple technical issues
+- 50-54: Poor technical execution, significant flaws
+- 40-49: Major technical problems (poor exposure, focus, composition)
+- 30-39: Severe technical failures, barely usable
+- 1-29: Completely unusable
+
+BE CRITICAL. Look for flaws: soft focus, noise, poor exposure, weak composition, distracting elements, clipped highlights/shadows, chromatic aberration, poor white balance, lack of subject separation, boring perspective.
+
+Most typical photos have significant flaws and should score 50-65. Reserve 80+ for truly excellent work.
 
 Return ONLY valid JSON with these exact fields:
 - score: integer from 1 to 100 (just the number, no explanation)
@@ -67,7 +75,7 @@ Return ONLY valid JSON with these exact fields:
 - keywords: up to 12 relevant keywords, comma separated, no hashtags
 
 Example format:
-{"score": "65", "title": "Sunset Over Mountains", "description": "Vibrant sunset casting golden light over mountain peaks with dramatic cloud formations.", "keywords": "sunset, mountains, landscape, dramatic, golden hour, nature, scenic, clouds, peaks, outdoor, wilderness, photography"}"""
+{"score": "58", "title": "Sunset Over Mountains", "description": "Decent sunset composition but slightly overexposed highlights and soft focus on foreground.", "keywords": "sunset, mountains, landscape, dramatic, golden hour, nature, scenic, clouds, peaks, outdoor, wilderness, photography"}"""
 
 
 def load_prompt_from_file(prompt_file: str) -> str:
@@ -760,18 +768,39 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
             'pil_count': pil_count
         }
     
-    # Calculate score distribution (bins of 10)
+    # Calculate score distribution (bins of 5)
     distribution = {}
-    for i in range(0, 100, 10):
-        bin_label = f"{i}-{i+9}"
-        distribution[bin_label] = sum(1 for s in scores if i <= s < i+10)
-    distribution["90-100"] = sum(1 for s in scores if 90 <= s <= 100)
+    for i in range(0, 100, 5):
+        bin_label = f"{i}-{i+4}"
+        distribution[bin_label] = sum(1 for s in scores if i <= s < i+5)
+    distribution["95-100"] = sum(1 for s in scores if 95 <= s <= 100)
+    
+    # Calculate statistical measures
+    avg_score = sum(scores) / len(scores) if scores else 0
+    
+    # Standard deviation
+    if len(scores) > 1:
+        variance = sum((s - avg_score) ** 2 for s in scores) / len(scores)
+        std_dev = variance ** 0.5
+    else:
+        std_dev = 0
+    
+    # Median and quartiles
+    sorted_scores = sorted(scores)
+    n = len(sorted_scores)
+    median = sorted_scores[n // 2] if n % 2 == 1 else (sorted_scores[n // 2 - 1] + sorted_scores[n // 2]) / 2
+    q1 = sorted_scores[n // 4] if n >= 4 else sorted_scores[0]
+    q3 = sorted_scores[(3 * n) // 4] if n >= 4 else sorted_scores[-1]
     
     return {
         'total_processed': len(results),
         'successful': len(scores),
         'failed': len(results) - len(scores),
-        'avg_score': sum(scores) / len(scores) if scores else 0,
+        'avg_score': avg_score,
+        'median_score': median,
+        'std_dev': std_dev,
+        'q1': q1,
+        'q3': q3,
         'min_score': min(scores) if scores else 0,
         'max_score': max(scores) if scores else 0,
         'score_distribution': distribution,
@@ -807,9 +836,11 @@ def print_statistics(stats: Dict):
         print(f"\n{'='*60}")
         print(f"SCORE STATISTICS")
         print(f"{'='*60}")
-        print(f"Average score: {stats['avg_score']:.1f}")
-        print(f"Minimum score: {stats['min_score']}")
-        print(f"Maximum score: {stats['max_score']}")
+        print(f"Average score: {stats['avg_score']:.2f}")
+        print(f"Median score: {stats.get('median_score', 0):.2f}")
+        print(f"Standard deviation: {stats.get('std_dev', 0):.2f}")
+        print(f"Range: {stats['min_score']} - {stats['max_score']}")
+        print(f"Quartiles (Q1/Q3): {stats.get('q1', 0):.0f} / {stats.get('q3', 0):.0f}")
         
         print(f"\n{'='*60}")
         print(f"SCORE DISTRIBUTION")
