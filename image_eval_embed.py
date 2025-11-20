@@ -3,6 +3,7 @@ import base64
 import json  # Import json for parsing the response
 import logging
 import os
+import subprocess
 import sys
 from typing import Dict, List, Optional, Tuple
 
@@ -11,7 +12,7 @@ import piexif.helper
 import requests
 from PIL import Image
 from colorama import Fore
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,13 +25,12 @@ def sanitize_string(s: str) -> str:
 
 
 class Metadata(BaseModel):
+    model_config = ConfigDict(extra='allow')  # Allow extra fields without raising an error
+    
     score: int  # Changed from str to int
     title: str
     description: str
     keywords: str
-
-    class Config:
-        extra = 'allow'  # Allow extra fields without raising an error
 
     @field_validator('keywords')
     def validate_keywords(cls, v):
@@ -57,8 +57,61 @@ def has_user_comment(image_path: str) -> bool:
         return False
 
 
-def embed_metadata(image_path: str, metadata: Dict):
+def embed_metadata_exiftool(image_path: str, metadata: Dict) -> bool:
+    """
+    Embed metadata into RAW/TIFF files using exiftool.
+    Returns True if successful, False otherwise.
+    """
     try:
+        # Create backup first
+        backup_image_path = f"{os.path.splitext(image_path)[0]}.original{os.path.splitext(image_path)[1]}"
+        
+        # Build exiftool command
+        # UserComment for score, XPTitle, XPComment (description), XPKeywords
+        cmd = [
+            'exiftool',
+            '-overwrite_original',  # Don't create _original files
+            f'-UserComment={metadata.get("score", "")}',
+            f'-XPTitle={metadata.get("title", "")}',
+            f'-XPComment={metadata.get("description", "")}',
+            f'-XPKeywords={metadata.get("keywords", "")}',
+            image_path
+        ]
+        
+        # Create manual backup before modifying
+        if not os.path.exists(backup_image_path):
+            import shutil
+            shutil.copy2(image_path, backup_image_path)
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            print(f"Embedding score: {metadata.get('score', '')}")
+            print(f"Embedding Title: {metadata.get('title', '')}")
+            print(f"Embedding Description: {metadata.get('description', '')}")
+            print(f"Embedding Keywords: {metadata.get('keywords', '')}")
+            print(Fore.GREEN + f"Metadata successfully embedded in {image_path} using exiftool" + Fore.RESET)
+            return True
+        else:
+            logger.error(f"exiftool failed for {image_path}: {result.stderr}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error embedding metadata with exiftool in {image_path}: {e}")
+        return False
+
+
+def embed_metadata(image_path: str, metadata: Dict) -> bool:
+    """
+    Embed metadata into image file. Returns True if successful, False if skipped.
+    Uses exiftool for RAW/TIFF files, PIL for JPEG/PNG.
+    """
+    try:
+        # Check if file format is RAW/TIFF
+        file_ext = os.path.splitext(image_path)[1].lower()
+        if file_ext in ['.dng', '.nef', '.tif', '.tiff']:
+            return embed_metadata_exiftool(image_path, metadata)
+        
         # Open the image to access its EXIF data
         with Image.open(image_path) as img:
             exif_data = img.info.get("exif", b"")
@@ -71,20 +124,20 @@ def embed_metadata(image_path: str, metadata: Dict):
             exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment
             print(f"Embedding score in User Comment: {user_comment}")
 
-            # Embedding Title
-            title = metadata.get('title', '').encode('utf-16le')
+            # Embedding Title (UTF-16LE with BOM for Windows compatibility)
+            title = metadata.get('title', '').encode('utf-16le') + b'\x00\x00'
             exif_dict["0th"][piexif.ImageIFD.XPTitle] = title
-            print(f"Embedding Title: {title}")
+            print(f"Embedding Title: {metadata.get('title', '')}")
 
             # Embedding Description
-            description = metadata.get('description', '').encode('utf-16le')
+            description = metadata.get('description', '').encode('utf-16le') + b'\x00\x00'
             exif_dict["0th"][piexif.ImageIFD.XPComment] = description
-            print(f"Embedding Description: {description}")
+            print(f"Embedding Description: {metadata.get('description', '')}")
 
             # Embedding Keywords
-            keywords = metadata.get('keywords', '').encode('utf-16le')
+            keywords = metadata.get('keywords', '').encode('utf-16le') + b'\x00\x00'
             exif_dict["0th"][piexif.ImageIFD.XPKeywords] = keywords
-            print(f"Embedding Keywords: {keywords}")
+            print(f"Embedding Keywords: {metadata.get('keywords', '')}")
 
             # Prepare Exif data with sanitized strings
             exif_bytes = piexif.dump(exif_dict)
@@ -97,79 +150,90 @@ def embed_metadata(image_path: str, metadata: Dict):
             # Save with new metadata
             img.save(image_path, exif=exif_bytes)
             print(Fore.GREEN + f"Metadata successfully embedded in {image_path}" + Fore.RESET)
+            return True
 
     except Exception as e:
         logger.error(f"Error embedding metadata in {image_path}: {e}")
+        return False
 
 
 def process_images_in_folder(folder_path: str, ollama_host_url: str) -> List[Tuple[str, Optional[Dict]]]:
     headers = {'Content-Type': 'application/json'}
     results = []  # To store processing results
 
-    for filename in os.listdir(folder_path):
-        # Skip files with the '.original' suffix
-        if filename.endswith('.original'):
-            continue
-
-        if filename.endswith(('.jpg', '.jpeg', '.png')):
-            image_path = os.path.join(folder_path, filename)
-
-            # Check if UserComment exists
-            if has_user_comment(image_path):
-                print(f"Skipping {filename} due to existing UserComment.")
+    # Walk through all subdirectories recursively
+    for root, dirs, files in os.walk(folder_path):
+        for filename in files:
+            # Skip files with '.original' in the name (before the extension)
+            if '.original.' in filename:
                 continue
 
-            with open(image_path, 'rb') as image_file:
-                encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
+            if filename.endswith(('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG','NEF','nef','TIF','tif','TIFF','tiff','DNG','dng')):
+                image_path = os.path.join(root, filename)
 
-            payload = {
-                "model": "llama3.2-vision",
-                "stream": False,
-                "images": [encoded_image],
-                "prompt": "You are a discerning photography critic. You specialize in assessing individual professional photographs. Your evaluation is objective and quantitative, focusing on technical quality, creativity, aesthetic appeal and monetization potential. You provide a numerical score on a scale of 1 to 100 for each image you see. Technical quality is evaluated based on exposure, focus, color balance, composition, crop and aspect ratio. Creativity is assessed considering the images unique perspective, mood, subject matter and emotional impact. Aesthetic appeal is assessed based on how appealing the image is in purely aesthetic terms to a general audience. You will weight aesthetic appeal double in your scoring. For each image, return well-formatted JSON adhering to the following pattern:\n\"score\": <int>. You will also return a descriptive title based on the image using no more than 60 characters, a description of the image using no more than 200 characters and up to 12 relevant keyword tags, comma separated, without hashtags",
-                "format": {
-                    "type": "object",
-                    "properties": {
-                        "score": {"type": "string"},
-                        "title": {"type": "string"},
-                        "description": {"type": "string"},
-                        "keywords": {"type": "string"}
-                    },
-                    "required": [
-                        "score",
-                        "title",
-                        "description",
-                        "keywords"
-                    ]
+                # Check if UserComment exists
+                if has_user_comment(image_path):
+                    print(f"Skipping {image_path} due to existing UserComment.")
+                    continue
+
+                with open(image_path, 'rb') as image_file:
+                    encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
+
+                payload = {
+                    "model": "qwen3-vl:8b",
+                    "stream": False,
+                    "images": [encoded_image],
+                    "prompt": "You are a discerning photography critic. Evaluate this photograph and provide a numerical score from 1-100 based on:\n\n1. Technical quality (exposure, focus, color balance, composition, aspect ratio)\n2. Creativity (unique perspective, mood, subject matter, emotional impact)\n3. Aesthetic appeal (visual appeal to general audience) - weighted double\n\nReturn ONLY valid JSON with these exact fields:\n- score: integer from 1 to 100 (just the number, no explanation)\n- title: descriptive title, maximum 60 characters\n- description: image description, maximum 200 characters\n- keywords: up to 12 relevant keywords, comma separated, no hashtags\n\nExample format:\n{\"score\": \"75\", \"title\": \"Sunset Over Mountains\", \"description\": \"Vibrant sunset casting golden light over mountain peaks with dramatic cloud formations.\", \"keywords\": \"sunset, mountains, landscape, dramatic, golden hour, nature, scenic, clouds, peaks, outdoor, wilderness, photography\"}",
+                    "format": {
+                        "type": "object",
+                        "properties": {
+                            "score": {"type": "string"},
+                            "title": {"type": "string"},
+                            "description": {"type": "string"},
+                            "keywords": {"type": "string"}
+                        },
+                        "required": [
+                            "score",
+                            "title",
+                            "description",
+                            "keywords"
+                        ]
+                    }
                 }
-            }
 
-            try:
-                response = requests.post(ollama_host_url, json=payload, headers=headers)
-                if response.status_code == 200:
-                    print(f"Response for {filename}: {response.text}")
-                    response_data = response.json()  # Get the full response
+                try:
+                    response = requests.post(ollama_host_url, json=payload, headers=headers)
+                    if response.status_code == 200:
+                        print(f"Response for {image_path}: {response.text}")
+                        response_data = response.json()  # Get the full response
 
-                    # Extract and parse the 'response' field as JSON
-                    response_metadata = json.loads(response_data['response'])  # This should already be a dict
+                        # Extract and parse the metadata - check both 'response' and 'thinking' fields
+                        metadata_text = response_data.get('response') or response_data.get('thinking', '')
+                        if not metadata_text:
+                            logger.error(f"No response or thinking field found for {image_path}")
+                            results.append((image_path, None))
+                            continue
+                            
+                        response_metadata = json.loads(metadata_text)  # Parse the JSON string
 
-                    # Print the metadata for debugging
-                    print(f"Metadata received for {filename}: {response_metadata}")
+                        # Print the metadata for debugging
+                        print(f"Metadata received for {image_path}: {response_metadata}")
 
-                    # Proceed to embed metadata regardless of type checks
-                    try:
-                        embed_metadata(image_path, response_metadata)
-                        results.append((filename, response_metadata))  # Store successful result
-                    except Exception as e:
-                        logger.error(f"Error embedding metadata for {filename}: {e}")
-                        results.append((filename, None))  # Store failure result
+                        # Proceed to embed metadata
+                        try:
+                            embedded = embed_metadata(image_path, response_metadata)
+                            # Store result even if embedding was skipped (for RAW files)
+                            results.append((image_path, response_metadata))  # Store successful result
+                        except Exception as e:
+                            logger.error(f"Error embedding metadata for {image_path}: {e}")
+                            results.append((image_path, None))  # Store failure result
 
-                else:
-                    print(f"Failed to process {filename}: {response.status_code}")
-                    results.append((filename, None))  # Store failure result
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request failed for {filename}: {e}")
-                results.append((filename, None))  # Store failure result
+                    else:
+                        print(f"Failed to process {image_path}: {response.status_code}")
+                        results.append((image_path, None))  # Store failure result
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Request failed for {image_path}: {e}")
+                    results.append((image_path, None))  # Store failure result
 
     return results  # Return processing results
 
@@ -187,8 +251,16 @@ if __name__ == "__main__":
     if not os.path.isdir(args.folder_path):
         logger.error(f"The path '{args.folder_path}' is not a directory.")
         sys.exit(1)
-    if not any(filename.endswith(('.jpg', '.jpeg', '.png')) for filename in os.listdir(args.folder_path)):
-        logger.error(f"No image files found in the directory '{args.folder_path}'.")
+    
+    # Check recursively for image files
+    has_images = False
+    for root, dirs, files in os.walk(args.folder_path):
+        if any(f.endswith(('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG','NEF','nef','TIF','tif','TIFF','tiff','DNG','dng')) for f in files):
+            has_images = True
+            break
+    
+    if not has_images:
+        logger.error(f"No image files found in the directory '{args.folder_path}' or its subdirectories.")
         sys.exit(1)
 
     results = process_images_in_folder(args.folder_path, args.ollama_host_url)  # Pass URL to function
@@ -197,5 +269,9 @@ if __name__ == "__main__":
     success_count = sum(1 for _, result in results if result is not None)
     failure_count = len(results) - success_count
 
-    print(f"Successfully processed images: {success_count}")
+    print(f"\n{'='*60}")
+    print(f"Processing Summary:")
+    print(f"Successfully processed (scored) images: {success_count}")
     print(f"Failed to process images: {failure_count}")
+    print(f"Note: JPEG/PNG use PIL, RAW/TIFF use exiftool for metadata embedding")
+    print(f"{'='*60}")
