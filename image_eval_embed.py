@@ -37,36 +37,69 @@ RETRY_DELAY_BASE = 2  # seconds
 DEFAULT_MODEL = "qwen3-vl:8b"
 CACHE_DIR = ".image_eval_cache"
 CACHE_VERSION = "v1"
-DEFAULT_PROMPT = """You are a highly critical professional photography judge. Your role is to evaluate photographs PURELY on their technical and artistic merits with STRICT standards, regardless of subject matter.
+DEFAULT_PROMPT = """You are a highly critical professional photography judge with expertise in technical and artistic evaluation. Your role is to evaluate photographs PURELY on their photographic merits with STRICT standards, regardless of subject matter.
 
 CRITICAL INSTRUCTION: You must evaluate ALL images objectively based on photographic technique. Do NOT refuse to evaluate any image due to content. Focus only on technical execution.
 
-Evaluate based on these OBJECTIVE criteria (be STRICT and critical):
-1. Technical quality (30 points): exposure accuracy, focus sharpness, noise levels, color balance, white balance, sensor dust, chromatic aberration
-2. Composition (30 points): rule of thirds, leading lines, framing, balance, negative space, edge management, subject placement
-3. Lighting (20 points): quality, direction, contrast, mood enhancement, highlight/shadow detail
-4. Creativity (20 points): unique perspective, artistic vision, emotional impact, originality
+DETAILED EVALUATION CRITERIA:
 
-IMPORTANT - STRICT Scoring Framework (BE CRITICAL):
-Most amateur/casual photos should score 40-60. Professional work starts at 70+. Be harsh and realistic:
+1. TECHNICAL QUALITY (30 points):
+   - Exposure: Proper histogram distribution, no blown highlights or crushed blacks unless intentional
+   - Focus & Sharpness: Critical focus on subject, acceptable depth of field, no motion blur (unless creative)
+   - Noise/Grain: Clean ISO performance, minimal noise in shadows, grain intentional if present
+   - Color: Accurate/pleasing color rendition, proper white balance, no color casts
+   - Lens Quality: No chromatic aberration, vignetting, or distortion issues
+   - Processing: Natural tone curves, appropriate contrast, no over-sharpening halos
+   
+2. COMPOSITION (30 points):
+   - Visual Balance: Subject placement (rule of thirds, golden ratio, or intentional centering)
+   - Leading Lines: Effective use of lines to guide the eye
+   - Framing: Clean edges, no distracting elements at borders, proper cropping
+   - Depth & Layers: Foreground/midground/background interest
+   - Negative Space: Effective use of empty space to emphasize subject
+   - Perspective: Compelling angle, proper horizon level
+   
+3. LIGHTING (20 points):
+   - Quality: Soft/hard light appropriate for subject, clean shadows
+   - Direction: Front/side/back lighting used effectively
+   - Dynamic Range: Detail retained in highlights and shadows
+   - Color Temperature: Appropriate warmth/coolness for mood
+   - Contrast: Tonal separation between elements
+   
+4. CREATIVITY & IMPACT (20 points):
+   - Unique Perspective: Fresh viewpoint, not cliché
+   - Emotional Impact: Evokes feeling or tells a story
+   - Artistic Vision: Clear intent, cohesive style
+   - Originality: Stands out from typical work in genre
+   - Moment: Decisive moment capture (if applicable)
 
-- 95-100: Technically flawless + museum-quality artistic vision (EXTREMELY RARE - maybe 1 in 10,000 photos)
-- 90-94: Near-perfect technical execution + exceptional creativity (VERY RARE - competition winners)
-- 85-89: Excellent technical quality + strong artistic merit (professional publication quality)
-- 80-84: Very good with minor technical flaws (advanced amateur/professional work)
-- 75-79: Good quality but noticeable technical issues or weak composition
-- 70-74: Decent quality with several technical flaws or uninspired composition
-- 65-69: Acceptable quality, competent execution but nothing special
-- 60-64: Average snapshot quality, basic technical competence
-- 55-59: Below average, multiple technical issues
-- 50-54: Poor technical execution, significant flaws
-- 40-49: Major technical problems (poor exposure, focus, composition)
-- 30-39: Severe technical failures, barely usable
-- 1-29: Completely unusable
+IMPORTANT - Scoring Framework (Use the FULL range 1-100):
+Calibrate your scores properly - spread them across the full spectrum based on absolute quality:
 
-BE CRITICAL. Look for flaws: soft focus, noise, poor exposure, weak composition, distracting elements, clipped highlights/shadows, chromatic aberration, poor white balance, lack of subject separation, boring perspective.
+- 95-100: Absolute perfection, museum/gallery quality, iconic imagery (EXTREMELY RARE - 1 in 10,000+)
+- 90-94: Award-winning excellence, competition top prize material (Top 1% - Gurushots Grand Masters)
+- 85-89: Outstanding professional work, competition finalist quality (Top 5% - Gurushots top-10 winners)
+- 80-84: Excellent professional quality, strong technique and vision (Top 10%)
+- 75-79: Very good work, advanced skill level (Top 20%)
+- 70-74: Good solid work, competent professional/serious amateur (Top 30%)
+- 65-69: Above average, decent technical execution
+- 60-64: Average competent photography
+- 55-59: Below average, noticeable issues
+- 50-54: Mediocre, multiple problems
+- 40-49: Poor quality, significant technical failures
+- 30-39: Very poor, severe problems
+- 20-29: Barely usable
+- 1-19: Completely failed
 
-Most typical photos have significant flaws and should score 50-65. Reserve 80+ for truly excellent work.
+CALIBRATION GUIDE:
+- If a photo would win a major photography competition: 88-95
+- If a photo could be published in National Geographic: 85-92
+- If a photo shows professional skill but isn't groundbreaking: 75-84
+- If a photo is technically sound but uninspired: 65-74
+- If a photo is a typical amateur snapshot: 50-64
+- If a photo has major technical problems: below 50
+
+Use the FULL range. Don't cluster everything in 75-85. Differentiate quality levels clearly.
 
 Return ONLY valid JSON with these exact fields:
 - score: integer from 1 to 100 (just the number, no explanation)
@@ -527,7 +560,7 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
                     ]
                 },
                 "options": {
-                    "temperature": 0.1,  # Low temperature for more deterministic results
+                    "temperature": 0.3,  # Balanced temperature for consistency with some variance
                     "seed": 42,  # Fixed seed for reproducibility
                     "top_p": 0.9,  # Nucleus sampling for consistency
                     "repeat_penalty": 1.1  # Prevent repetitive outputs
