@@ -1,51 +1,145 @@
-# README
+# Image Evaluator
 
-## Image Metadata Embedding Tool
+## AI-Powered Image Metadata Embedding Tool
 
-This tool processes images in a specified folder, evaluates them using an external API, and embeds the resulting metadata into the images' EXIF data.
+This tool processes images in folders, evaluates them using AI vision models (via Ollama), and embeds the resulting metadata into the images' EXIF data.
 
 ### Features
 
-- Reads images from a specified directory.
-- Sends images to an external API for evaluation.
-- Embeds the returned metadata (score, title, keywords) into the image's EXIF data.
-- Supports JPEG and PNG formats.
-- Creates backups of original images before modifying them.
+#### Core Functionality
+- 🖼️ **Multi-format support**: JPEG, PNG, DNG, NEF, TIF/TIFF
+- 🤖 **AI evaluation**: Uses Ollama vision models for intelligent scoring
+- 📝 **Metadata embedding**: Score, title, description, and keywords
+- 🔄 **Recursive processing**: Processes all subdirectories
+- 💾 **Smart backups**: Creates backups before modifying files
+
+#### Performance
+- ⚡ **Parallel processing**: Process multiple images concurrently (configurable workers)
+- 📊 **Progress tracking**: Real-time progress bar with tqdm
+- 📈 **Statistics**: Avg/min/max scores, distribution histogram
+- 📄 **CSV export**: Timestamped reports for all processed images
+
+#### Quality & Safety
+- ✅ **Score validation**: Ensures scores are 1-100, extracts numbers from malformed responses
+- 🔁 **Auto-retry**: Exponential backoff for failed API calls (up to 3 attempts)
+- 🔍 **Image validation**: Detects and skips corrupted files
+- ✓ **Verification**: Optional metadata verification after embedding
+- 🗂️ **Backup directory**: Store backups separately from originals
+- ↩️ **Rollback**: Restore from backups if needed
+
+#### Flexibility
+- 🎛️ **Configurable model**: Use any Ollama vision model
+- 📝 **Custom prompts**: Load evaluation criteria from files
+- 🎯 **Selective processing**: Filter by file type, min score, skip existing
+- 👁️ **Dry-run mode**: Preview what would be processed without changes
 
 ### Requirements
 
-- Python 3.6 or higher
-- Required libraries:
-  - `Pillow`
-  - `requests`
-  - `piexif`
-  - `pydantic`
-  - `colorama`
+- Python 3.8 or higher
+- Ollama server with vision model (e.g., `qwen3-vl:8b`, `llama3.2-vision`)
+- `exiftool` for RAW file metadata embedding
+- Required Python libraries (see `requirements.txt`):
+  - `Pillow` - Image processing
+  - `requests` - API calls
+  - `piexif` - EXIF manipulation
+  - `pydantic` - Data validation
+  - `colorama` - Colored output
+  - `tqdm` - Progress bars
 
-You can install the required libraries using pip:
-
+Install dependencies:
 ```bash
-pip install Pillow requests piexif pydantic colorama
+pip install -r requirements.txt
 ```
+
+### Quick Start
+
+1. **Start Ollama server:**
+   ```bash
+   ollama serve
+   ollama pull qwen3-vl:8b
+   ```
+
+2. **Process images:**
+   ```bash
+   python image_eval_embed.py process /path/to/images http://localhost:11434/api/generate
+   ```
+
+3. **View results:**
+   - Check console for statistics and distribution
+   - CSV report saved automatically with timestamp
 
 ### Usage
 
-1. **Clone the repository** or download image_eval_embed.py.
-2. Start ollama with 'ollama server' and make sure you have the ollama3.2-vision model available.
-3. **Run the script** from the command line with the following syntax:
+#### Process Command
 
-   ```bash
-   python image_eval_embed.py <folder_path> <ollama_host_url>
-   ```
-
-   - `<folder_path>`: Path to the folder containing images.
-   - `<ollama_host_url>`: Full URL of your Ollama API endpoint in this format: http://localhost:11434/api/generate
-  
-
-#### Example
-### Example syntax
+Basic syntax:
 ```bash
-python image_eval_embed.py /path/to/images http://localhost:8000/api/evaluate](http://localhost:11434/api/generate
+python image_eval_embed.py process <folder_path> <ollama_url> [OPTIONS]
+```
+
+**Arguments:**
+- `folder_path`: Directory containing images (processes recursively)
+- `ollama_url`: Full Ollama API endpoint (e.g., `http://localhost:11434/api/generate`)
+
+**Options:**
+```bash
+--workers N              # Parallel workers (default: 4)
+--model NAME             # Ollama model (default: qwen3-vl:8b)
+--csv PATH               # Custom CSV output path
+--prompt-file FILE       # Custom prompt template file
+--skip-existing          # Skip images with metadata (default: True)
+--no-skip-existing       # Process all images
+--min-score N            # Only save results >= N
+--file-types EXT,EXT     # Filter by extensions (e.g., jpg,png)
+--dry-run                # Preview without changes
+--backup-dir DIR         # Store backups separately
+--verify                 # Verify metadata after embedding
+```
+
+**Examples:**
+```bash
+# Basic usage (4 workers, default model)
+python image_eval_embed.py process /photos http://localhost:11434/api/generate
+
+# High-performance setup
+python image_eval_embed.py process /photos http://localhost:11434/api/generate \
+  --workers 8 \
+  --backup-dir /backups/photos
+
+# Only top-quality JPEGs
+python image_eval_embed.py process /photos http://localhost:11434/api/generate \
+  --file-types jpg,jpeg \
+  --min-score 80
+
+# Custom model and prompt
+python image_eval_embed.py process /photos http://localhost:11434/api/generate \
+  --model llama3.2-vision \
+  --prompt-file custom_critic.txt
+
+# Preview without changes
+python image_eval_embed.py process /photos http://localhost:11434/api/generate \
+  --dry-run
+
+# Reprocess everything with verification
+python image_eval_embed.py process /photos http://localhost:11434/api/generate \
+  --no-skip-existing \
+  --verify
+```
+
+#### Rollback Command
+
+Restore images from backups:
+```bash
+python image_eval_embed.py rollback <folder_path> [--backup-dir DIR]
+```
+
+**Examples:**
+```bash
+# Restore from default backups (same directory)
+python image_eval_embed.py rollback /photos
+
+# Restore from separate backup directory
+python image_eval_embed.py rollback /photos --backup-dir /backups/photos
 ```
 #### Example Output
 ```bash
