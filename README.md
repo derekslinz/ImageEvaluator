@@ -7,31 +7,31 @@ This tool processes images in folders, evaluates them using AI vision models (vi
 ### Features
 
 #### Core Functionality
-- 🖼️ **Multi-format support**: JPEG, PNG, DNG, NEF, TIF/TIFF
-- 🤖 **AI evaluation**: Uses Ollama vision models for intelligent scoring
-- 📝 **Metadata embedding**: Score, title, description, and keywords
-- 🔄 **Recursive processing**: Processes all subdirectories
-- 💾 **Smart backups**: Creates backups before modifying files
+- **Multi-format support**: JPEG, PNG, DNG, NEF, TIF/TIFF
+- **AI evaluation**: Uses Ollama vision models for intelligent scoring
+- **Metadata embedding**: Score, title, description, and keywords
+- **Recursive processing**: Processes all subdirectories
+- **Smart backups**: Creates backups before modifying files
 
 #### Performance
-- ⚡ **Parallel processing**: Process multiple images concurrently (configurable workers)
-- 📊 **Progress tracking**: Real-time progress bar with tqdm
-- 📈 **Statistics**: Avg/min/max scores, distribution histogram
-- 📄 **CSV export**: Timestamped reports for all processed images
+- **Parallel processing**: Process multiple images concurrently (configurable workers)
+- **Progress tracking**: Real-time progress bar with tqdm
+- **Statistics**: Avg/min/max scores, distribution histogram
+- **CSV export**: Timestamped reports for all processed images
 
 #### Quality & Safety
-- ✅ **Score validation**: Ensures scores are 1-100, extracts numbers from malformed responses
-- 🔁 **Auto-retry**: Exponential backoff for failed API calls (up to 3 attempts)
-- 🔍 **Image validation**: Detects and skips corrupted files
-- ✓ **Verification**: Optional metadata verification after embedding
-- 🗂️ **Backup directory**: Store backups separately from originals
-- ↩️ **Rollback**: Restore from backups if needed
+- **Score validation**: Ensures scores are 1-100, extracts numbers from malformed responses
+- **Auto-retry**: Exponential backoff for failed API calls (up to 3 attempts)
+- **Image validation**: Detects and skips corrupted files
+- **Verification**: Optional metadata verification after embedding
+- **Backup directory**: Store backups separately from originals
+- **Rollback**: Restore from backups if needed
 
 #### Flexibility
-- 🎛️ **Configurable model**: Use any Ollama vision model
-- 📝 **Custom prompts**: Load evaluation criteria from files
-- 🎯 **Selective processing**: Filter by file type, min score, skip existing
-- 👁️ **Dry-run mode**: Preview what would be processed without changes
+- **Configurable model**: Use any Ollama vision model
+- **Custom prompts**: Load evaluation criteria from files
+- **Selective processing**: Filter by file type, min score, skip existing
+- **Dry-run mode**: Preview what would be processed without changes
 
 ### Requirements
 
@@ -152,26 +152,103 @@ python image_eval_embed.py rollback /photos
 # Restore from separate backup directory
 python image_eval_embed.py rollback /photos --backup-dir /backups/photos
 ```
-#### Example Output
+#### Example Output: model qwen3-vl:8b running on ollama on an Applke M4 Max with --ensemble=3 (3 passes per image). Each image is ~50 megapixels. Running on gemma3:4b was faster, but the results were all clustered around the same score. It's notably faster on a RTX 3090, but still time consuming with 3 passes. Smaller images process faster, obviously
 ```bash
-python /Users/lderek/ImageEvaluator/image_eval_embed.py ~/Pictures/Lightroom\ Saved\ Photos/embed http://10.0.1.50:11434/api/generate 
-Response for tongue.jpg: {"model":"llama3.2-vision","created_at":"2025-01-24T15:55:58.61357571Z","response":"{\"score\": \"\u003e92\", \"title\": \"Woman with Tongue Out\", \"description\": \"A woman is holding on to a wooden pole while sticking her tongue out.\", \"keywords\": \"woman, blonde, pole, stick, tongue, mouth, hand, fingers, green eyes, red lips, white tank top\"}","done":true,"done_reason":"stop","context":[128006,882,128007,271,58,1931,12,15,60,128256,271,83445,420,2217,323,9993,264,35876,5573,1990,220,16,12,1041,11075,555,459,16945,16865,315,279,10512,596,11156,4367,11,37637,14638,323,28697,11,90039,37637,14638,2033,13,1789,1855,2217,11,471,1664,8627,12400,4823,36051,287,311,279,2768,5497,512,1,12618,794,366,396,14611,1472,690,1101,471,264,53944,2316,3196,389,279,2217,1701,912,810,1109,220,1399,5885,11,264,4096,315,279,2217,1701,912,810,1109,220,1049,5885,323,709,311,220,717,9959,16570,9681,11,32783,49454,660,11,2085,82961,128009,128006,78191,128007,271,5018,12618,794,30057,6083,498,330,2150,794,330,96149,449,51491,361,4470,498,330,4789,794,330,32,5333,374,10168,389,311,264,23162,26078,1418,38072,1077,25466,704,10684,330,30095,794,330,22803,11,27117,11,26078,11,9396,11,25466,11,11013,11,1450,11,19779,11,6307,6548,11,2579,23726,11,4251,13192,1948,9388],"total_duration":1853019841,"load_duration":92021277,"prompt_eval_count":116,"prompt_eval_duration":166000000,"eval_count":67,"eval_duration":929000000}
-Metadata received for tongue.jpg: {'score': '>92', 'title': 'Woman with Tongue Out', 'description': 'A woman is holding on to a wooden pole while sticking her tongue out.', 'keywords': 'woman, blonde, pole, stick, tongue, mouth, hand, fingers, green eyes, red lips, white tank top'}
-Embedding score in User Comment: b'ASCII\x00\x00\x00>92'
-User Comment metadata successfully embedded in /Users/lderek/Pictures/Lightroom Saved Photos/embed/tongue.jpg
-Embedding Title: b'W\x00o\x00m\x00a\x00n\x00 \x00w\x00i\x00t\x00h\x00 \x00T\x00o\x00n\x00g\x00u\x00e\x00 \x00O\x00u\x00t\x00'
-Title metadata successfully embedded in /Users/lderek/Pictures/Lightroom Saved Photos/embed/tongue.jpg
-Embedding Description: b'A\x00 \x00w\x00o\x00m\x00a\x00n\x00 \x00i\x00s\x00 \x00h\x00o\x00l\x00d\x00i\x00n\x00g\x00 \x00o\x00n\x00 \x00t\x00o\x00 \x00a\x00 \x00w\x00o\x00o\x00d\x00e\x00n\x00 \x00p\x00o\x00l\x00e\x00 \x00w\x00h\x00i\x00l\x00e\x00 \x00s\x00t\x00i\x00c\x00k\x00i\x00n\x00g\x00 \x00h\x00e\x00r\x00 \x00t\x00o\x00n\x00g\x00u\x00e\x00 \x00o\x00u\x00t\x00.\x00'
-Description metadata successfully embedded in /Users/lderek/Pictures/Lightroom Saved Photos/embed/tongue.jpg
-Embedding Keywords: b'w\x00o\x00m\x00a\x00n\x00,\x00 \x00b\x00l\x00o\x00n\x00d\x00e\x00,\x00 \x00p\x00o\x00l\x00e\x00,\x00 \x00s\x00t\x00i\x00c\x00k\x00,\x00 \x00t\x00o\x00n\x00g\x00u\x00e\x00,\x00 \x00m\x00o\x00u\x00t\x00h\x00,\x00 \x00h\x00a\x00n\x00d\x00,\x00 \x00f\x00i\x00n\x00g\x00e\x00r\x00s\x00,\x00 \x00g\x00r\x00e\x00e\x00n\x00 \x00e\x00y\x00e\x00s\x00,\x00 \x00r\x00e\x00d\x00 \x00l\x00i\x00p\x00s\x00,\x00 \x00w\x00h\x00i\x00t\x00e\x00 \x00t\x00a\x00n\x00k\x00 \x00t\x00o\x00p\x00'
-Keywords metadata successfully embedded in /Users/lderek/Pictures/Lightroom Saved Photos/embed/tongue.jpg
+ $ python image_eval_embed.py process /Volumes/NVMe/Lightroom Test Export/   http://localhost:11434/api/generate --no-skip-existing --csv "Lightroom Test Export.csv"   --model qwen3-vl:8b --ensemble 3 --workers 8
+2025-11-21 03:27:27,264 - INFO - Logging to file: image_evaluator_20251121_032727.log
+2025-11-21 03:27:27,264 - INFO - Starting image evaluation - log file: image_evaluator_20251121_032727.log
+
+Processing images from: /Volumes/NVMe/Lightroom Test Export/
+Model: qwen3-vl:8b
+Workers: 8
+Skip existing: False
+Ensemble mode: 3 evaluation passes per image
+
+2025-11-21 03:27:27,264 - INFO - Processing configuration: workers=8, model=qwen3-vl:8b, cache=disabled
+2025-11-21 03:27:27,264 - INFO - Starting processing of images in /Volumes/NVMe/Lightroom Test Export/
+Processing images:   0%|                                                                                                                                                                                                      | 0/245 [00:00<?, ?img/s]2025-11-21 03:28:01,304 - INFO - Performing 3-pass ensemble evaluation for /Volumes/NVMe/Lightroom Test Export/DSC_8869.jpg
+2025-11-21 03:28:01,560 - INFO - Performing 3-pass ensemble evaluation for /Volumes/NVMe/Lightroom Test Export/Fireworks- December 31, 2019 -787.jpg
+2025-11-21 03:28:01,607 - INFO - Performing 3-pass ensemble evaluation for /Volumes/NVMe/Lightroom Test Export/Copenhagen .Next 2019-255-HDR.jpg
+2025-11-21 03:28:01,701 - INFO - Performing 3-pass ensemble evaluation for /Volumes/NVMe/Lightroom Test Export/Reflectie- March 13, 2020 -08-Pano.jpg
+2025-11-21 03:28:01,704 - INFO - Performing 3-pass ensemble evaluation for /Volumes/NVMe/Lightroom Test Export/Montreux with Aisiri-74-HDR-2.jpg
+2025-11-21 03:28:01,757 - INFO - Performing 3-pass ensemble evaluation for /Volumes/NVMe/Lightroom Test Export/_DSC5524.jpg
+2025-11-21 03:28:01,818 - INFO - Performing 3-pass ensemble evaluation for /Volumes/NVMe/Lightroom Test Export/Venice Afternoon-7241-HDR.jpg
+2025-11-21 03:28:01,979 - INFO - Performing 3-pass ensemble evaluation for /Volumes/NVMe/Lightroom Test Export/DSC_2163-Enhanced-NR.jpg
+2025-11-21 03:31:10,544 - INFO - Ensemble std dev for /Volumes/NVMe/Lightroom Test Export/DSC_8869.jpg: 1.25 (scores: [89, 88, 91])
+Embedding score: 89
+Embedding Title: Spiral Staircase Perspective
+Embedding Description: Masterful black-and-white spiral staircase shot with precise exposure and sharp focus.
+Embedding Keywords: spiral staircase, architectural photography, black and white, perspective, symmetry, geometry, monochrome, interior, stairwell, design, composition, photography
+Metadata successfully embedded in /Volumes/NVMe/Lightroom Test Export/DSC_8869.jpg
+2025-11-21 03:31:10,671 - INFO - Successfully processed /Volumes/NVMe/Lightroom Test Export/DSC_8869.jpg with score 89
+Processing images:   0%|▊                                                                                                                                                                                         | 1/245 [03:09<12:51:05, 189.61s/img]2025-11-21 03:31:11,759 - INFO - Performing 3-pass ensemble evaluation for /Volumes/NVMe/Lightroom Test Export/DSC_8667.jpg
+...snip 244 more images...
+2025-11-21 03:31:22,071 - INFO - Ensemble std dev for /Volumes/NVMe/Lightroom Test Export/Copenhagen .Next 2019-255-HDR.jpg: 0.00 (scores: [80, 80, 80]) 245/245 [2:30:37<00:00, 36.89s/img]
+2025-11-21 05:58:38,593 - INFO - Completed processing 245 images in 9071.33 seconds
+
+============================================================
+PROCESSING SUMMARY
+============================================================
+Total images processed: 245
+Successful: 245
+Failed: 0
+RAW formats (exiftool): 0
+Standard formats (PIL): 245
+
+============================================================
+TIMING STATISTICS
+============================================================
+Total processing time: 9071.33 seconds (151.19 minutes)
+Time per image: 37.03 seconds
+Time per successful image: 37.03 seconds
+
+============================================================
+SCORE STATISTICS
+============================================================
+Average score: 80.20
+Median score: 81.00
+Standard deviation: 5.36
+Range: 58 - 91
+Quartiles (Q1/Q3): 77 / 83
+
+============================================================
+SCORE DISTRIBUTION
+============================================================
+     0-4:  (0)
+   10-14:  (0)
+   15-19:  (0)
+   20-24:  (0)
+   25-29:  (0)
+   30-34:  (0)
+   35-39:  (0)
+   40-44:  (0)
+   45-49:  (0)
+     5-9:  (0)
+   50-54:  (0)
+   55-59: █ (1)
+   60-64: █ (1)
+   65-69: ████████ (8)
+   70-74: ██████████████████████████ (26)
+   75-79: ████████████████████████████████████████ (40)
+   80-84: ██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████ (138)
+   85-89: █████████████████████████ (25)
+   90-94: ██████ (6)
+  95-100:  (0)
+   95-99:  (0)
+
+============================================================
+Note: JPEG/PNG use PIL, RAW/TIFF use exiftool for metadata embedding
+============================================================
+
+2025-11-21 05:58:38,600 - INFO - Results saved to CSV: Lightroom Test Export.csv
+Log file: image_evaluator_20251121_032727.log
 ```
 #### Example Results
 ```bash
- exiftool -XPTitle -XPKeywords -UserComment tongue.jpg
-XP Title                        : Woman with Tongue Out and Pool Cue
-XP Keywords                     : woman tongue out, blonde hair, pool cue, white tank top, braided ponytail, eyes closed, tongue out
-User Comment                    : 95
+XP Title                        : Intimate Portrait with Wooden Pole
+XP Keywords                     : portrait, close-up, shallow depth of field, warm lighting, wooden pole, tongue, blonde hair, braid, skin texture, studio photography, candid, expressive
+Image Description               : A woman is sticking her tongue out at the camera while holding up a pool cue stick.
+User Comment                    : 80
 ```
 #### Example Image
 ![tongue](https://github.com/user-attachments/assets/53457193-a2f0-4f88-aead-d44483da4c28)
