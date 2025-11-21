@@ -1,6 +1,5 @@
-image-eval.out
-/.idea
-nohup.out
+*.out
 *.log
 *.csv
 .vscode
+__pycache__
