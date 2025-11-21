@@ -2,7 +2,7 @@
 
 ## AI-Powered Image Evaluation Suite
 
-A comprehensive toolkit for evaluating images using AI vision models (via Ollama) with two specialized tools:
+A toolkit for evaluating images using AI vision models (via Ollama) with two specialized tools:
 1. **Image Evaluator** - Artistic merit evaluation with EXIF metadata embedding
 2. **Stock Photo Evaluator** - Commercial stock photography suitability assessment
 

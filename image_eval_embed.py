@@ -343,12 +343,11 @@ def analyze_image_technical(image_path: str) -> Dict:
                 elif g_mean > r_mean and g_mean > b_mean:
                     metrics['color_cast'] = 'green'
         
-        # Use OpenCV for sharpness detection (Laplacian variance)
-        img_cv = cv2.imread(image_path)
-        if img_cv is not None:
-            gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-            metrics['sharpness'] = laplacian_var
+        # Use OpenCV on the already-loaded image for sharpness (Laplacian variance)
+        img_gray = img.convert('L')
+        gray_array = np.array(img_gray)
+        laplacian_var = cv2.Laplacian(gray_array, cv2.CV_64F).var()
+        metrics['sharpness'] = laplacian_var
     
     except Exception as e:
         logger.debug(f"Could not analyze technical metrics for {image_path}: {e}")
