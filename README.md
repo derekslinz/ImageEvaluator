@@ -77,13 +77,24 @@ Basic syntax:
 python image_eval_embed.py process <folder_path> <ollama_url> [OPTIONS]
 ```
 
+Quick start with defaults:
+```bash
+python image_eval_embed.py
+```
+Running without arguments now assumes the `process` command, uses your current working directory (or `IMAGE_EVAL_DEFAULT_FOLDER`) as the image source, and talks to `http://localhost:11434/api/generate` (or `IMAGE_EVAL_OLLAMA_URL`).
+
+**Environment overrides for defaults:**
+- `IMAGE_EVAL_DEFAULT_FOLDER` – absolute path to use when a folder isn’t provided
+- `IMAGE_EVAL_OLLAMA_URL` – Ollama endpoint to use when omitted
+- `IMAGE_EVAL_WORKERS` – worker count used when `--workers` isn’t supplied
+
 **Arguments:**
-- `folder_path`: Directory containing images (processes recursively)
-- `ollama_url`: Full Ollama API endpoint (e.g., `http://localhost:11434/api/generate`)
+- `folder_path`: Directory containing images (processes recursively); defaults to current working directory or `IMAGE_EVAL_DEFAULT_FOLDER` when omitted
+- `ollama_url`: Full Ollama API endpoint (e.g., `http://localhost:11434/api/generate`); defaults to `IMAGE_EVAL_OLLAMA_URL` or `http://localhost:11434/api/generate`
 
 **Options:**
 ```bash
---workers N              # Parallel workers (default: 4)
+--workers N              # Parallel workers (default: IMAGE_EVAL_WORKERS or 4)
 --model NAME             # Ollama model (default: qwen3-vl:8b)
 --csv PATH               # Custom CSV output path
 --prompt-file FILE       # Custom prompt template file

@@ -140,7 +140,7 @@ class StockEvaluation:
     release_concerns: int
     rejection_risks: int
     overall_stock_score: int
-    recommendation: str  # EXCELLENT/GOOD/MARGINAL/REJECT
+    recommendation: str  # EXCELLENT/GOOD/MARGINAL/MARGINAL-FIXABLE/REJECT
     primary_category: str
     suggested_keywords: str
     issues: str
@@ -149,6 +149,7 @@ class StockEvaluation:
     dimensions: str
     file_size_mb: float
     technical_notes: str
+    fixable_issues: str = ""  # Issues that can be easily corrected
     status: str = "success"
     error_message: str = ""
 
@@ -234,8 +235,11 @@ def analyze_technical_quality(image_path: str) -> Dict:
             notes.append(f"⚠️ Shadow clipping: {shadow_clip*100:.1f}%")
         
         # DPI check
+        fixable_issues = []
         if dpi_value < MIN_DPI:
             notes.append(f"⚠️ LOW DPI: {dpi_value} (recommend {MIN_DPI})")
+            if dpi_value >= 240:  # 240 DPI is easily fixable
+                fixable_issues.append(f"DPI: {dpi_value} → {MIN_DPI} (metadata correction)")
         
         # Aspect ratio check
         aspect_ratio = width / height
@@ -255,7 +259,8 @@ def analyze_technical_quality(image_path: str) -> Dict:
             'shadow_clip': shadow_clip,
             'dpi': dpi_value,
             'aspect_ratio': aspect_ratio,
-            'notes': notes
+            'notes': ' | '.join(notes),
+            'fixable_issues': fixable_issues
         }
         
     except Exception as e:
@@ -389,6 +394,28 @@ def evaluate_image_for_stock(
             # Build technical notes string
             technical_notes = "; ".join(technical_data.get('notes', []))
             
+            # Analyze fixable issues and adjust recommendation
+            fixable_list = technical_data.get('fixable_issues', [])
+            fixable_issues_str = '; '.join(fixable_list) if fixable_list else 'None'
+            
+            recommendation = scores.get('recommendation', 'UNKNOWN')
+            overall_stock_score = scores.get('overall_stock_score', 0)
+            issues = scores.get('issues', '')
+            
+            # If recommendation is MARGINAL and there are only fixable issues, upgrade to MARGINAL-FIXABLE
+            if recommendation == "MARGINAL" and fixable_list:
+                # Check if main issues are fixable (DPI, minor metadata)
+                issues_lower = issues.lower()
+                has_only_fixable = (
+                    fixable_list and  # Has fixable issues
+                    overall_stock_score >= 45 and  # Reasonable base score
+                    'resolution' not in issues_lower and  # No resolution problems
+                    'extreme' not in issues_lower and  # No extreme quality issues
+                    'severe' not in issues_lower
+                )
+                if has_only_fixable:
+                    recommendation = "MARGINAL-FIXABLE"
+            
             return StockEvaluation(
                 file_path=image_path,
                 commercial_viability=scores.get('commercial_viability', 0),
@@ -397,16 +424,17 @@ def evaluate_image_for_stock(
                 keyword_potential=scores.get('keyword_potential', 0),
                 release_concerns=scores.get('release_concerns', 0),
                 rejection_risks=scores.get('rejection_risks', 0),
-                overall_stock_score=scores.get('overall_stock_score', 0),
-                recommendation=scores.get('recommendation', 'UNKNOWN'),
+                overall_stock_score=overall_stock_score,
+                recommendation=recommendation,
                 primary_category=scores.get('primary_category', 'Unknown'),
                 suggested_keywords=scores.get('suggested_keywords', ''),
-                issues=scores.get('issues', ''),
+                issues=issues,
                 strengths=scores.get('strengths', ''),
                 resolution_mp=technical_data.get('megapixels', 0),
                 dimensions=technical_data.get('dimensions', 'unknown'),
                 file_size_mb=file_size_mb,
                 technical_notes=technical_notes,
+                fixable_issues=fixable_issues_str,
                 status="success"
             )
         
@@ -430,6 +458,7 @@ def evaluate_image_for_stock(
             dimensions="",
             file_size_mb=0,
             technical_notes="",
+            fixable_issues="None",
             status="error",
             error_message=str(e)
         )
@@ -460,7 +489,7 @@ def save_results_to_csv(results: List[StockEvaluation], output_path: str):
         'commercial_viability', 'technical_quality', 'composition_clarity',
         'keyword_potential', 'release_concerns', 'rejection_risks',
         'primary_category', 'resolution_mp', 'dimensions', 'file_size_mb',
-        'suggested_keywords', 'strengths', 'issues', 'technical_notes', 'status'
+        'suggested_keywords', 'strengths', 'issues', 'technical_notes', 'status', 'error_message'
     ]
     
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
@@ -489,6 +518,7 @@ def print_summary(results: List[StockEvaluation]):
         excellent = sum(1 for r in successful if r.recommendation == "EXCELLENT")
         good = sum(1 for r in successful if r.recommendation == "GOOD")
         marginal = sum(1 for r in successful if r.recommendation == "MARGINAL")
+        marginal_fixable = sum(1 for r in successful if r.recommendation == "MARGINAL-FIXABLE")
         reject = sum(1 for r in successful if r.recommendation == "REJECT")
         
         # Resolution check
@@ -507,6 +537,7 @@ def print_summary(results: List[StockEvaluation]):
         print(f"\n{Style.BRIGHT}RECOMMENDATIONS:{Style.RESET_ALL}")
         print(f"  {Fore.GREEN}EXCELLENT: {excellent}{Style.RESET_ALL} ({excellent/len(successful)*100:.1f}%)")
         print(f"  {Fore.BLUE}GOOD: {good}{Style.RESET_ALL} ({good/len(successful)*100:.1f}%)")
+        print(f"  {Fore.CYAN}MARGINAL-FIXABLE: {marginal_fixable}{Style.RESET_ALL} ({marginal_fixable/len(successful)*100:.1f}%) - Easy fixes available")
         print(f"  {Fore.YELLOW}MARGINAL: {marginal}{Style.RESET_ALL} ({marginal/len(successful)*100:.1f}%)")
         print(f"  {Fore.RED}REJECT: {reject}{Style.RESET_ALL} ({reject/len(successful)*100:.1f}%)")
         

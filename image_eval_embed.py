@@ -33,7 +33,21 @@ Image.MAX_IMAGE_PIXELS = None  # Remove limit entirely (or set to a higher value
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def _get_int_env(var_name: str, fallback: int) -> int:
+    """Read an integer environment variable, falling back if unset/invalid."""
+    value = os.environ.get(var_name)
+    if value is None:
+        return fallback
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning(f"Ignoring invalid value for {var_name}: {value!r}. Using {fallback}.")
+        return fallback
+
 # Configuration constants
+DEFAULT_IMAGE_FOLDER = os.environ.get("IMAGE_EVAL_DEFAULT_FOLDER", str(Path.cwd()))
+DEFAULT_OLLAMA_URL = os.environ.get("IMAGE_EVAL_OLLAMA_URL", "http://localhost:11434/api/generate")
+DEFAULT_WORKER_COUNT = _get_int_env("IMAGE_EVAL_WORKERS", 4)
 MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2  # seconds
 DEFAULT_MODEL = "qwen3-vl:8b"
@@ -1151,15 +1165,49 @@ def rollback_images(folder_path: str, backup_dir: Optional[str] = None):
     print(f"\nRollback complete: {restored_count} restored, {failed_count} failed")
 
 
+def prepare_cli_args(cli_args: List[str]) -> Tuple[List[str], Optional[str]]:
+    """
+    Normalize CLI arguments so the process command can run with sensible defaults.
+    
+    Returns the argument list to parse and a string describing whether the command
+    was inferred ('implicit' for no args, 'inferred' when the user omitted the
+    command but provided other arguments).
+    """
+    if not cli_args:
+        return ['process'], 'implicit'
+    if cli_args[0] in ('-h', '--help'):
+        return cli_args, None
+    if cli_args[0] in {'process', 'rollback'}:
+        return cli_args, None
+    return ['process'] + cli_args, 'inferred'
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process and evaluate images with AI.')
     subparsers = parser.add_subparsers(dest='command', help='Command to execute')
     
     # Process command
     process_parser = subparsers.add_parser('process', help='Process and evaluate images')
-    process_parser.add_argument('folder_path', type=str, help='Path to the folder containing images')
-    process_parser.add_argument('ollama_host_url', type=str, help='Full url of your ollama API endpoint')
-    process_parser.add_argument('--workers', type=int, default=4, help='Number of parallel workers (default: 4)')
+    process_parser.add_argument(
+        'folder_path',
+        type=str,
+        nargs='?',
+        default=None,
+        help='Path to the folder containing images (default: current working directory or IMAGE_EVAL_DEFAULT_FOLDER)'
+    )
+    process_parser.add_argument(
+        'ollama_host_url',
+        type=str,
+        nargs='?',
+        default=None,
+        help=f'Full url of your Ollama API endpoint (default: {DEFAULT_OLLAMA_URL})'
+    )
+    process_parser.add_argument(
+        '--workers',
+        type=int,
+        default=DEFAULT_WORKER_COUNT,
+        help=f'Number of parallel workers (default: IMAGE_EVAL_WORKERS or {DEFAULT_WORKER_COUNT})'
+    )
     process_parser.add_argument('--csv', type=str, default=None, help='Path to save CSV report (default: auto-generated)')
     process_parser.add_argument('--model', type=str, default=DEFAULT_MODEL, help=f'Ollama model to use (default: {DEFAULT_MODEL})')
     process_parser.add_argument('--prompt-file', type=str, default=None, help='Path to custom prompt file (overrides default prompt)')
@@ -1183,7 +1231,14 @@ if __name__ == "__main__":
     rollback_parser.add_argument('folder_path', type=str, help='Path to the folder containing images')
     rollback_parser.add_argument('--backup-dir', type=str, default=None, help='Directory where backups are stored')
     
-    args = parser.parse_args()
+    raw_cli_args = sys.argv[1:]
+    normalized_args, inferred_command = prepare_cli_args(raw_cli_args)
+    args = parser.parse_args(normalized_args)
+    
+    if inferred_command == 'implicit':
+        print("No command supplied. Defaulting to 'process'.")
+    elif inferred_command == 'inferred':
+        print("Command not specified. Assuming 'process' for provided arguments.")
     
     # Handle rollback command
     if args.command == 'rollback':
@@ -1193,11 +1248,21 @@ if __name__ == "__main__":
         rollback_images(args.folder_path, getattr(args, 'backup_dir', None))
         sys.exit(0)
     
-    # Default to process if no command specified (backwards compatibility)
-    if args.command is None:
-        print("Error: Please specify a command (process or rollback)")
-        parser.print_help()
-        sys.exit(1)
+    # Fill in defaults for positional arguments when omitted
+    if args.command == 'process':
+        folder_defaulted = False
+        host_defaulted = False
+        if not args.folder_path:
+            args.folder_path = DEFAULT_IMAGE_FOLDER
+            folder_defaulted = True
+        if not args.ollama_host_url:
+            args.ollama_host_url = DEFAULT_OLLAMA_URL
+            host_defaulted = True
+        
+        if folder_defaulted:
+            print(f"Using default image folder: {args.folder_path}")
+        if host_defaulted:
+            print(f"Using default Ollama endpoint: {args.ollama_host_url}")
     
     # Setup logging
     log_file = None
