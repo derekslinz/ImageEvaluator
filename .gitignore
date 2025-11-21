@@ -4,3 +4,4 @@
 .vscode
 *.jpg
 __pycache__
+stock-parse.sh
