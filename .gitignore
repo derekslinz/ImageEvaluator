@@ -3,3 +3,4 @@
 *.csv
 .vscode
 __pycache__
+*.jpg
