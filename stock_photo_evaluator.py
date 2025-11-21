@@ -436,6 +436,10 @@ def find_images(directory: str, extensions: List[str] = None) -> List[str]:
     images = []
     for root, dirs, files in os.walk(directory):
         for file in files:
+            # Skip files with 'original' in the name
+            if 'original' in file.lower():
+                continue
+            
             if any(file.lower().endswith(ext) for ext in extensions):
                 images.append(os.path.join(root, file))
     
