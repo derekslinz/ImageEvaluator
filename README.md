@@ -1,49 +1,94 @@
 # Image Evaluator
 
-## AI-Powered Image Metadata Embedding Tool
+## AI-Powered Image Evaluation Suite
 
-This tool processes images in folders, evaluates them using AI vision models (via Ollama), and embeds the resulting metadata into the images' EXIF data.
+A comprehensive toolkit for evaluating images using AI vision models (via Ollama) with two specialized tools:
+1. **Image Evaluator** - Artistic merit evaluation with EXIF metadata embedding
+2. **Stock Photo Evaluator** - Commercial stock photography suitability assessment
 
 ### Features
 
-#### Core Functionality
-- **Multi-format support**: JPEG, PNG, DNG, NEF, TIF/TIFF
-- **AI evaluation**: Uses Ollama vision models for intelligent scoring
-- **Metadata embedding**: Score, title, description, and keywords
-- **Recursive processing**: Processes all subdirectories
-- **Smart backups**: Creates backups before modifying files
+#### Image Evaluator (image_eval_embed.py)
 
-#### Performance
-- **Parallel processing**: Process multiple images concurrently (configurable workers)
-- **Progress tracking**: Real-time progress bar with tqdm
-- **Statistics**: Avg/min/max scores, distribution histogram
-- **CSV export**: Timestamped reports for all processed images
+**Core Functionality:**
+- Multi-format support: JPEG, PNG, DNG, NEF, TIF/TIFF
+- AI evaluation with intelligent scoring
+- EXIF metadata embedding: score, title, description, keywords
+- Recursive directory processing
+- Automatic backups before modification
 
-#### Quality & Safety
-- **Score validation**: Ensures scores are 1-100, extracts numbers from malformed responses
-- **Auto-retry**: Exponential backoff for failed API calls (up to 3 attempts)
-- **Image validation**: Detects and skips corrupted files
-- **Verification**: Optional metadata verification after embedding
-- **Backup directory**: Store backups separately from originals
-- **Rollback**: Restore from backups if needed
+**Advanced Features:**
+- Multi-criteria scoring: technical, composition, lighting, creativity
+- Ensemble scoring: multiple passes with median aggregation for consistency
+- EXIF metadata extraction: ISO, aperture, shutter speed, focal length
+- Technical analysis: histogram, color cast detection, sharpness measurement
+- Caching system: MD5-based caching for repeat evaluations
 
-#### Flexibility
-- **Configurable model**: Use any Ollama vision model
-- **Custom prompts**: Load evaluation criteria from files
-- **Selective processing**: Filter by file type, min score, skip existing
-- **Dry-run mode**: Preview what would be processed without changes
+**Performance:**
+- Parallel processing with configurable workers
+- Real-time progress tracking
+- Comprehensive statistics and score distribution
+- CSV export with detailed breakdowns
+
+**Quality & Safety:**
+- Score validation and extraction from malformed responses
+- Exponential backoff retry logic
+- Image validation and corruption detection
+- Optional metadata verification
+- Backup directory support
+- Full rollback capability
+
+**Flexibility:**
+- Configurable models (default: qwen3-vl:8b)
+- Custom evaluation prompts
+- Selective processing by file type, score, metadata
+- Dry-run mode for previewing
+
+#### Stock Photo Evaluator (stock_photo_evaluator.py)
+
+**Evaluation Criteria:**
+- Commercial viability and market demand
+- Technical quality standards (resolution, sharpness, noise, DPI)
+- Composition clarity and copy space
+- Keyword potential and searchability
+- Model/property release requirements
+- Common rejection risk assessment
+
+**Technical Analysis:**
+- Resolution validation (4MP minimum, 12MP recommended)
+- DPI checking (300 DPI standard)
+- Sharpness measurement via Laplacian variance
+- Noise estimation
+- Histogram clipping detection
+- Aspect ratio validation
+
+**Recommendations:**
+- EXCELLENT: Ready for immediate submission
+- GOOD: Strong candidate with minor considerations
+- MARGINAL-FIXABLE: Needs easy corrections (e.g., DPI metadata)
+- MARGINAL: Needs improvement before submission
+- REJECT: Does not meet stock standards
+
+**Output:**
+- Detailed CSV with all scores and analysis
+- Suggested keywords for stock submission
+- Issues identification with fixable vs. critical problems
+- Strengths highlighting
+- Category recommendations
 
 ### Requirements
 
 - Python 3.8 or higher
-- Ollama server with vision model (e.g., `qwen3-vl:8b`, `llama3.2-vision`)
+- Ollama server with vision model (recommended: `qwen3-vl:8b`, also supports `llama3.2-vision`)
 - `exiftool` for RAW file metadata embedding
 - Required Python libraries (see `requirements.txt`):
   - `Pillow` - Image processing
+  - `numpy` - Numerical operations
+  - `opencv-python` - Technical analysis
   - `requests` - API calls
   - `piexif` - EXIF manipulation
   - `pydantic` - Data validation
-  - `colorama` - Colored output
+  - `colorama` - Colored terminal output
   - `tqdm` - Progress bars
 
 Install dependencies:
@@ -53,20 +98,35 @@ pip install -r requirements.txt
 
 ### Quick Start
 
+#### Image Evaluator (Artistic Merit)
+
 1. **Start Ollama server:**
    ```bash
    ollama serve
    ollama pull qwen3-vl:8b
    ```
 
-2. **Process images:**
+2. **Evaluate images:**
    ```bash
    python image_eval_embed.py process /path/to/images http://localhost:11434/api/generate
    ```
 
 3. **View results:**
-   - Check console for statistics and distribution
-   - CSV report saved automatically with timestamp
+   - Console displays statistics and score distribution
+   - CSV report saved with timestamp
+   - Metadata embedded in image EXIF
+
+#### Stock Photo Evaluator
+
+1. **Evaluate for stock suitability:**
+   ```bash
+   python stock_photo_evaluator.py /path/to/images http://localhost:11434/api/generate --model qwen3-vl:8b --workers 4 --csv stock_results.csv
+   ```
+
+2. **Review results:**
+   - Summary shows recommendation breakdown
+   - CSV contains detailed scores and issues
+   - Fixable issues identified separately
 
 ### Usage
 
@@ -96,6 +156,7 @@ Running without arguments now assumes the `process` command, uses your current w
 ```bash
 --workers N              # Parallel workers (default: IMAGE_EVAL_WORKERS or 4)
 --model NAME             # Ollama model (default: qwen3-vl:8b)
+--ensemble N             # Evaluation passes for consistency (default: 1)
 --csv PATH               # Custom CSV output path
 --prompt-file FILE       # Custom prompt template file
 --skip-existing          # Skip images with metadata (default: True)
@@ -105,6 +166,7 @@ Running without arguments now assumes the `process` command, uses your current w
 --dry-run                # Preview without changes
 --backup-dir DIR         # Store backups separately
 --verify                 # Verify metadata after embedding
+--cache-dir DIR          # Enable caching for repeat evaluations
 ```
 
 **Examples:**
@@ -112,9 +174,10 @@ Running without arguments now assumes the `process` command, uses your current w
 # Basic usage (4 workers, default model)
 python image_eval_embed.py process /photos http://localhost:11434/api/generate
 
-# High-performance setup
+# High-performance setup with ensemble scoring
 python image_eval_embed.py process /photos http://localhost:11434/api/generate \
   --workers 8 \
+  --ensemble 3 \
   --backup-dir /backups/photos
 
 # Only top-quality JPEGs
@@ -152,7 +215,46 @@ python image_eval_embed.py rollback /photos
 # Restore from separate backup directory
 python image_eval_embed.py rollback /photos --backup-dir /backups/photos
 ```
-#### Example Output: model qwen3-vl:8b running on ollama on an Applke M4 Max with --ensemble=3 (3 passes per image). Each image is ~50 megapixels. Running on gemma3:4b was faster, but the results were all clustered around the same score. It's notably faster on a RTX 3090, but still time consuming with 3 passes. Smaller images process faster, obviously
+
+#### Stock Photo Evaluator Command
+
+Basic syntax:
+```bash
+python stock_photo_evaluator.py <directory> <api_url> [OPTIONS]
+```
+
+**Arguments:**
+- `directory`: Directory containing images to evaluate
+- `api_url`: Ollama API endpoint (e.g., `http://localhost:11434/api/generate`)
+
+**Options:**
+```bash
+--model NAME             # Ollama model (default: qwen3-vl:8b)
+--workers N              # Parallel workers (default: 4)
+--csv PATH               # Output CSV file (default: auto-generated)
+--min-score N            # Only show results with score >= N
+--extensions EXT EXT     # File extensions to process (default: jpg jpeg png)
+-v, --verbose            # Verbose output
+```
+
+**Examples:**
+```bash
+# Basic evaluation
+python stock_photo_evaluator.py /photos http://localhost:11434/api/generate
+
+# Custom output with filtering
+python stock_photo_evaluator.py /photos http://localhost:11434/api/generate \
+  --csv my_stock_eval.csv \
+  --min-score 60
+
+# High-performance with specific model
+python stock_photo_evaluator.py /photos http://localhost:11434/api/generate \
+  --model qwen3-vl:8b \
+  --workers 8 \
+  --verbose
+```
+
+#### Example Output: model qwen3-vl:8b running on ollama on an Apple M4 Max with --ensemble=3 (3 passes per image). Each image is ~50 megapixels. Running on gemma3:4b was faster, but the results were all clustered around the same score. It's notably faster on a RTX 3090, but still time consuming with 3 passes. Smaller images process faster, obviously
 ```bash
  $ python image_eval_embed.py process /Volumes/NVMe/Lightroom Test Export/   http://localhost:11434/api/generate --no-skip-existing --csv "Lightroom Test Export.csv"   --model qwen3-vl:8b --ensemble 3 --workers 8
 2025-11-21 03:27:27,264 - INFO - Logging to file: image_evaluator_20251121_032727.log
@@ -254,31 +356,66 @@ User Comment                    : 80
 ![tongue](https://github.com/user-attachments/assets/53457193-a2f0-4f88-aead-d44483da4c28)
 
 
-### Functionality
+### Key Features by Tool
 
-- **sanitize_string(s: str)**: Cleans up strings by removing null bytes and newlines to ensure compatibility with EXIF data.
+#### Image Evaluator (image_eval_embed.py)
 
-- **Metadata Class**: Defines the structure of the metadata received from the API, including score, title, description, and keywords.
+- **Multi-criteria evaluation**: Technical quality, composition, lighting, creativity scores
+- **Ensemble scoring**: Multiple evaluation passes with median aggregation for consistency
+- **EXIF extraction**: Reads camera settings (ISO, aperture, shutter, focal length)
+- **Technical analysis**: Histogram analysis, color cast detection, sharpness measurement
+- **Metadata embedding**: Embeds score, title, description, keywords into EXIF
+- **Caching**: MD5-based caching system for repeat evaluations
+- **Format support**: JPEG, PNG, RAW (DNG, NEF), TIFF via PIL and exiftool
 
-- **embed_metadata(image_path: str, metadata: Dict)**: Embeds the provided metadata into the specified image's EXIF data. It handles user comments, title, description, and keywords, ensuring proper encoding.
+#### Stock Photo Evaluator (stock_photo_evaluator.py)
 
-- **process_images_in_folder(folder_path, ollama_host_url)**: Processes each image in the specified folder, sending it to the API and embedding the returned metadata.
+- **Commercial assessment**: Evaluates market viability and searchability
+- **Technical validation**: Resolution (4MP min, 12MP rec), DPI (300 standard), sharpness, noise
+- **7-score system**: Commercial viability, technical quality, composition clarity, keyword potential, release concerns, rejection risks, overall score
+- **Fixable issues detection**: Identifies easy corrections (DPI metadata) vs. critical problems
+- **Category recommendations**: EXCELLENT, GOOD, MARGINAL-FIXABLE, MARGINAL, REJECT
+- **Detailed reporting**: CSV with all scores, issues, strengths, suggested keywords
 
-### Logging
+### Model Recommendations
 
-The script uses Python's built-in logging module to log information and errors. Logs are printed to the console with timestamps and severity levels.
+**Recommended: qwen3-vl:8b**
+- Excellent score distribution and consistency
+- Average artistic scores: 80-86 for high-quality images
+- Standard deviation: 5.4 (good differentiation)
+- Ensemble mode: 1.44 point average difference between runs
+- 79% of scores within +/- 2 points across runs
 
-### Error Handling
+**Alternative Models Tested:**
+- `gemma3:4b`: Faster but scores cluster too low (avg 70 for competition winners)
+- `gemma3:12b`: Extreme clustering with minimal differentiation (std dev 2.0)
+- `llama3.2-vision`: Compatible but not extensively tested
 
-The script includes error handling for:
-- Invalid folder paths.
-- Non-directory paths.
-- Absence of image files in the specified directory.
-- API request failures.
+### Implementation Details
 
-### Backup
+**Scoring Consistency:**
+Both tools use `temperature=0.3`, `seed=42`, and `top_p=0.9` for deterministic, reproducible results while maintaining nuanced evaluation.
 
-Before embedding metadata, the script creates a backup of the original image by appending `.original` to the filename.
+**Ensemble Mode:**
+The image evaluator supports multiple evaluation passes per image with median aggregation to reduce variance. Recommended for critical evaluations where consistency is paramount.
+
+**Technical Analysis:**
+- Sharpness: Laplacian variance method via OpenCV
+- Noise: Standard deviation estimation in flat areas
+- Clipping: Histogram analysis of highlight/shadow regions
+- DPI: Extracted from image metadata when available
+
+**Logging:**
+Both tools use Python's logging module with file and console handlers. Log files are timestamped and include DEBUG/INFO/WARNING/ERROR levels.
+
+**Error Handling:**
+- Invalid paths and missing directories
+- Corrupted or unreadable images
+- API timeouts with automatic retry (stock evaluator: 300s timeout)
+- Malformed JSON responses with score extraction fallback
+
+**Backup System:**
+Images are backed up before metadata modification by appending `.original` to the filename. The rollback command restores from these backups.
 
 ### Running Tests
 
