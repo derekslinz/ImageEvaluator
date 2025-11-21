@@ -237,6 +237,8 @@ python stock_photo_evaluator.py <directory> <api_url> [OPTIONS]
 -v, --verbose            # Verbose output
 ```
 
+By default, the stock evaluator enforces 300 DPI by calling `exiftool -overwrite_original -XResolution=300 -YResolution=300 -ResolutionUnit=inches` before analyzing each image, so `exiftool` must be installed and on your `PATH`.
+
 **Examples:**
 ```bash
 # Basic evaluation

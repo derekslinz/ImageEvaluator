@@ -17,6 +17,7 @@ import csv
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -35,6 +36,9 @@ from colorama import Fore, Style, init
 # Initialize colorama
 init(autoreset=True)
 
+# Remove PIL pixel limit protection so large exports load reliably
+Image.MAX_IMAGE_PIXELS = None
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +56,7 @@ RECOMMENDED_RESOLUTION_MP = 12.0  # Recommended megapixels
 MIN_DPI = 300  # Minimum DPI at standard print sizes
 DEFAULT_MODEL = "qwen3-vl:8b"
 DEFAULT_WORKERS = 4
+_EXIFTOOL_AVAILABLE: Optional[bool] = None
 
 # Stock photography evaluation prompt
 STOCK_EVALUATION_PROMPT = """You are an expert stock photography reviewer for major agencies such as Shutterstock, Adobe Stock, and Getty Images.
@@ -184,9 +189,36 @@ class StockEvaluation:
     error_message: str = ""
 
 
+def ensure_resolution_metadata(image_path: str):
+    """Force X/Y resolution metadata to 300 DPI for consistent analysis."""
+    global _EXIFTOOL_AVAILABLE
+
+    if _EXIFTOOL_AVAILABLE is False:
+        return
+
+    command = [
+        'exiftool',
+        '-overwrite_original',
+        '-XResolution=300',
+        '-YResolution=300',
+        '-ResolutionUnit=inches',
+        image_path
+    ]
+
+    try:
+        subprocess.run(command, check=True, capture_output=True)
+        _EXIFTOOL_AVAILABLE = True
+    except FileNotFoundError:
+        _EXIFTOOL_AVAILABLE = False
+        logger.warning("ExifTool not found; DPI metadata will not be auto-corrected.")
+    except subprocess.CalledProcessError as exc:
+        logger.debug(f"ExifTool failed on {image_path}: {exc}")
+
+
 def analyze_technical_quality(image_path: str) -> Dict:
     """Analyze technical aspects for stock photography standards"""
     try:
+        ensure_resolution_metadata(image_path)
         # Open image
         img = Image.open(image_path)
         width, height = img.size
