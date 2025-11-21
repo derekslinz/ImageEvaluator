@@ -16,10 +16,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+import cv2
 import piexif
 import piexif.helper
 import requests
-from PIL import Image
+from PIL import Image, ImageStat
 from colorama import Fore, Style
 from pydantic import BaseModel, ConfigDict, field_validator
 from tqdm import tqdm
@@ -37,6 +39,7 @@ RETRY_DELAY_BASE = 2  # seconds
 DEFAULT_MODEL = "qwen3-vl:8b"
 CACHE_DIR = ".image_eval_cache"
 CACHE_VERSION = "v1"
+DEFAULT_ENSEMBLE_PASSES = 1  # Number of evaluation passes for ensemble scoring
 DEFAULT_PROMPT = """You are a highly critical professional photography judge with expertise in technical and artistic evaluation. Your role is to evaluate photographs PURELY on their photographic merits with STRICT standards, regardless of subject matter.
 
 CRITICAL INSTRUCTION: You must evaluate ALL images objectively based on photographic technique. Do NOT refuse to evaluate any image due to content. Focus only on technical execution.
@@ -102,13 +105,17 @@ CALIBRATION GUIDE:
 Use the FULL range. Don't cluster everything in 75-85. Differentiate quality levels clearly.
 
 Return ONLY valid JSON with these exact fields:
-- score: integer from 1 to 100 (just the number, no explanation)
+- technical_score: integer 1-100 for technical quality (30% weight)
+- composition_score: integer 1-100 for composition (30% weight)
+- lighting_score: integer 1-100 for lighting (20% weight)
+- creativity_score: integer 1-100 for creativity & impact (20% weight)
+- overall_score: integer 1-100 overall score (weighted average or your judgment)
 - title: descriptive title, maximum 60 characters
 - description: image description, maximum 200 characters
 - keywords: up to 12 relevant keywords, comma separated, no hashtags
 
 Example format:
-{"score": "58", "title": "Sunset Over Mountains", "description": "Decent sunset composition but slightly overexposed highlights and soft focus on foreground.", "keywords": "sunset, mountains, landscape, dramatic, golden hour, nature, scenic, clouds, peaks, outdoor, wilderness, photography"}"""
+{"technical_score": "55", "composition_score": "62", "lighting_score": "58", "creativity_score": "60", "overall_score": "58", "title": "Sunset Over Mountains", "description": "Decent sunset composition but slightly overexposed highlights and soft focus on foreground.", "keywords": "sunset, mountains, landscape, dramatic, golden hour, nature, scenic, clouds, peaks, outdoor, wilderness, photography"}"""
 
 
 def load_prompt_from_file(prompt_file: str) -> str:
@@ -178,6 +185,169 @@ def retry_with_backoff(func, max_retries=MAX_RETRIES, base_delay=RETRY_DELAY_BAS
             logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}")
             time.sleep(delay)
     return None
+
+
+def extract_exif_metadata(image_path: str) -> Dict:
+    """Extract technical metadata from EXIF data."""
+    metadata = {
+        'iso': None,
+        'aperture': None,
+        'shutter_speed': None,
+        'focal_length': None,
+        'camera_make': None,
+        'camera_model': None,
+        'lens_model': None
+    }
+    
+    try:
+        with Image.open(image_path) as img:
+            exif_data = img.info.get("exif")
+            if exif_data:
+                exif_dict = piexif.load(exif_data)
+                
+                # Extract ISO
+                if piexif.ExifIFD.ISOSpeedRatings in exif_dict.get("Exif", {}):
+                    metadata['iso'] = exif_dict["Exif"][piexif.ExifIFD.ISOSpeedRatings]
+                
+                # Extract Aperture (FNumber)
+                if piexif.ExifIFD.FNumber in exif_dict.get("Exif", {}):
+                    f_num = exif_dict["Exif"][piexif.ExifIFD.FNumber]
+                    if isinstance(f_num, tuple):
+                        metadata['aperture'] = f"f/{f_num[0]/f_num[1]:.1f}"
+                
+                # Extract Shutter Speed (ExposureTime)
+                if piexif.ExifIFD.ExposureTime in exif_dict.get("Exif", {}):
+                    exp_time = exif_dict["Exif"][piexif.ExifIFD.ExposureTime]
+                    if isinstance(exp_time, tuple):
+                        metadata['shutter_speed'] = f"{exp_time[0]}/{exp_time[1]}s"
+                
+                # Extract Focal Length
+                if piexif.ExifIFD.FocalLength in exif_dict.get("Exif", {}):
+                    focal = exif_dict["Exif"][piexif.ExifIFD.FocalLength]
+                    if isinstance(focal, tuple):
+                        metadata['focal_length'] = f"{focal[0]/focal[1]:.0f}mm"
+                
+                # Extract Camera Make/Model
+                if piexif.ImageIFD.Make in exif_dict.get("0th", {}):
+                    metadata['camera_make'] = exif_dict["0th"][piexif.ImageIFD.Make].decode('utf-8', errors='ignore').strip()
+                
+                if piexif.ImageIFD.Model in exif_dict.get("0th", {}):
+                    metadata['camera_model'] = exif_dict["0th"][piexif.ImageIFD.Model].decode('utf-8', errors='ignore').strip()
+                
+                # Extract Lens Model
+                if piexif.ExifIFD.LensModel in exif_dict.get("Exif", {}):
+                    metadata['lens_model'] = exif_dict["Exif"][piexif.ExifIFD.LensModel].decode('utf-8', errors='ignore').strip()
+    
+    except Exception as e:
+        logger.debug(f"Could not extract EXIF metadata from {image_path}: {e}")
+    
+    return metadata
+
+
+def analyze_image_technical(image_path: str) -> Dict:
+    """Analyze image for technical quality metrics."""
+    metrics = {
+        'sharpness': 0,
+        'brightness': 0,
+        'contrast': 0,
+        'histogram_clipping_highlights': 0,
+        'histogram_clipping_shadows': 0,
+        'color_cast': 'neutral'
+    }
+    
+    try:
+        # Read image with PIL for basic stats
+        with Image.open(image_path) as img:
+            # Convert to RGB if needed
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Get basic statistics
+            stat = ImageStat.Stat(img)
+            metrics['brightness'] = sum(stat.mean) / len(stat.mean)  # Average brightness
+            metrics['contrast'] = sum(stat.stddev) / len(stat.stddev)  # Average std dev as contrast
+            
+            # Histogram analysis
+            histogram = img.histogram()
+            total_pixels = img.size[0] * img.size[1]
+            
+            # Check for clipping (top 5% of values)
+            for channel_idx in range(3):  # R, G, B
+                channel_hist = histogram[channel_idx * 256:(channel_idx + 1) * 256]
+                # Highlight clipping (values 250-255)
+                highlight_pixels = sum(channel_hist[250:256])
+                metrics['histogram_clipping_highlights'] += (highlight_pixels / total_pixels) * 100
+                
+                # Shadow clipping (values 0-5)
+                shadow_pixels = sum(channel_hist[0:6])
+                metrics['histogram_clipping_shadows'] += (shadow_pixels / total_pixels) * 100
+            
+            # Average across channels
+            metrics['histogram_clipping_highlights'] /= 3
+            metrics['histogram_clipping_shadows'] /= 3
+            
+            # Color cast detection (simple method)
+            r_mean, g_mean, b_mean = stat.mean[:3]
+            max_diff = max(abs(r_mean - g_mean), abs(g_mean - b_mean), abs(r_mean - b_mean))
+            if max_diff > 15:
+                if r_mean > g_mean and r_mean > b_mean:
+                    metrics['color_cast'] = 'warm/red'
+                elif b_mean > r_mean and b_mean > g_mean:
+                    metrics['color_cast'] = 'cool/blue'
+                elif g_mean > r_mean and g_mean > b_mean:
+                    metrics['color_cast'] = 'green'
+        
+        # Use OpenCV for sharpness detection (Laplacian variance)
+        img_cv = cv2.imread(image_path)
+        if img_cv is not None:
+            gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            metrics['sharpness'] = laplacian_var
+    
+    except Exception as e:
+        logger.debug(f"Could not analyze technical metrics for {image_path}: {e}")
+    
+    return metrics
+
+
+def create_enhanced_prompt(base_prompt: str, exif_data: Dict, technical_metrics: Dict) -> str:
+    """Enhance prompt with technical context from image analysis."""
+    context_parts = []
+    
+    # Add EXIF context
+    if exif_data.get('iso'):
+        iso_val = exif_data['iso']
+        if iso_val > 3200:
+            context_parts.append(f"High ISO ({iso_val}) - check for noise")
+        elif iso_val > 800:
+            context_parts.append(f"Moderate ISO ({iso_val})")
+    
+    if exif_data.get('aperture'):
+        context_parts.append(f"Aperture: {exif_data['aperture']}")
+    
+    if exif_data.get('shutter_speed'):
+        context_parts.append(f"Shutter: {exif_data['shutter_speed']}")
+    
+    # Add technical analysis context
+    if technical_metrics.get('histogram_clipping_highlights', 0) > 2:
+        context_parts.append(f"⚠ Highlight clipping detected ({technical_metrics['histogram_clipping_highlights']:.1f}%)")
+    
+    if technical_metrics.get('histogram_clipping_shadows', 0) > 2:
+        context_parts.append(f"⚠ Shadow clipping detected ({technical_metrics['histogram_clipping_shadows']:.1f}%)")
+    
+    if technical_metrics.get('sharpness', 0) < 100:
+        context_parts.append("⚠ Possible soft focus or motion blur")
+    
+    if technical_metrics.get('color_cast') != 'neutral':
+        context_parts.append(f"Color cast: {technical_metrics['color_cast']}")
+    
+    # Build enhanced prompt
+    if context_parts:
+        technical_context = "\n\nTECHNICAL CONTEXT:\n" + "\n".join(f"- {part}" for part in context_parts)
+        technical_context += "\n\nConsider these technical factors in your evaluation."
+        return base_prompt + technical_context
+    
+    return base_prompt
 
 
 def setup_logging(log_file: Optional[str] = None, verbose: bool = False):
@@ -507,9 +677,144 @@ def collect_images(folder_path: str, file_types: Optional[List[str]] = None, ski
     return image_paths
 
 
+def make_single_evaluation(image_path: str, encoded_image: str, ollama_host_url: str, model: str, 
+                          prompt: str, headers: Dict) -> Optional[Dict]:
+    """Make a single evaluation API call."""
+    payload = {
+        "model": model,
+        "stream": False,
+        "images": [encoded_image],
+        "prompt": prompt,
+        "format": {
+            "type": "object",
+            "properties": {
+                "technical_score": {"type": "string"},
+                "composition_score": {"type": "string"},
+                "lighting_score": {"type": "string"},
+                "creativity_score": {"type": "string"},
+                "overall_score": {"type": "string"},
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+                "keywords": {"type": "string"}
+            },
+            "required": [
+                "technical_score",
+                "composition_score",
+                "lighting_score",
+                "creativity_score",
+                "overall_score",
+                "title",
+                "description",
+                "keywords"
+            ]
+        },
+        "options": {
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1
+        }
+    }
+
+    def make_request():
+        response = requests.post(ollama_host_url, json=payload, headers=headers, timeout=120)
+        response.raise_for_status()
+        return response
+    
+    try:
+        response = retry_with_backoff(make_request)
+    except Exception as e:
+        logger.error(f"Request failed after retries for {image_path}: {e}")
+        return None
+    
+    if response and response.status_code == 200:
+        response_data = response.json()
+        metadata_text = response_data.get('response') or response_data.get('thinking', '')
+        
+        if not metadata_text:
+            logger.error(f"No response or thinking field found for {image_path}")
+            return None
+        
+        # Check for content policy violations
+        metadata_lower = metadata_text.lower()
+        if 'violates content policies' in metadata_lower or 'cannot proceed' in metadata_lower:
+            logger.warning(f"Model refused due to content policy: {image_path}")
+            return None
+        
+        try:
+            response_metadata = json.loads(metadata_text)
+            
+            # Validate all score fields
+            score_fields = ['technical_score', 'composition_score', 'lighting_score', 'creativity_score', 'overall_score']
+            for field in score_fields:
+                if field in response_metadata:
+                    validated = validate_score(response_metadata[field])
+                    if validated is None:
+                        logger.warning(f"Invalid {field} for {image_path}")
+                        return None
+                    response_metadata[field] = str(validated)
+                else:
+                    logger.warning(f"Missing {field} in response for {image_path}")
+                    return None
+            
+            return response_metadata
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON for {image_path}: {e}")
+            return None
+    
+    return None
+
+
+def ensemble_evaluate(image_path: str, encoded_image: str, ollama_host_url: str, model: str,
+                     prompt: str, headers: Dict, num_passes: int = 3) -> Optional[Dict]:
+    """Perform ensemble evaluation with multiple passes and aggregate results."""
+    if num_passes == 1:
+        return make_single_evaluation(image_path, encoded_image, ollama_host_url, model, prompt, headers)
+    
+    logger.info(f"Performing {num_passes}-pass ensemble evaluation for {image_path}")
+    evaluations = []
+    
+    for pass_num in range(num_passes):
+        logger.debug(f"Ensemble pass {pass_num + 1}/{num_passes} for {image_path}")
+        result = make_single_evaluation(image_path, encoded_image, ollama_host_url, model, prompt, headers)
+        if result:
+            evaluations.append(result)
+        time.sleep(0.5)  # Small delay between passes
+    
+    if not evaluations:
+        logger.error(f"All ensemble passes failed for {image_path}")
+        return None
+    
+    # Aggregate scores (median for robustness)
+    score_fields = ['technical_score', 'composition_score', 'lighting_score', 'creativity_score', 'overall_score']
+    aggregated = {}
+    
+    for field in score_fields:
+        scores = [int(e[field]) for e in evaluations if field in e]
+        if scores:
+            # Use median for robust aggregation
+            scores.sort()
+            median_idx = len(scores) // 2
+            aggregated[field] = str(scores[median_idx] if len(scores) % 2 == 1 else (scores[median_idx - 1] + scores[median_idx]) // 2)
+    
+    # Use first evaluation's text fields
+    aggregated['title'] = evaluations[0].get('title', '')
+    aggregated['description'] = evaluations[0].get('description', '')
+    aggregated['keywords'] = evaluations[0].get('keywords', '')
+    
+    # Calculate score variance for logging
+    overall_scores = [int(e['overall_score']) for e in evaluations if 'overall_score' in e]
+    if len(overall_scores) > 1:
+        variance = sum((s - sum(overall_scores)/len(overall_scores))**2 for s in overall_scores) / len(overall_scores)
+        std_dev = variance ** 0.5
+        logger.info(f"Ensemble std dev for {image_path}: {std_dev:.2f} (scores: {overall_scores})")
+    
+    return aggregated
+
+
 def process_single_image(image_path: str, ollama_host_url: str, model: str, prompt: str, 
                         dry_run: bool = False, backup_dir: Optional[str] = None, verify: bool = False,
-                        cache_dir: Optional[str] = None) -> Tuple[str, Optional[Dict]]:
+                        cache_dir: Optional[str] = None, ensemble_passes: int = 1) -> Tuple[str, Optional[Dict]]:
     """Process a single image and return result."""
     logger.debug(f"Processing image: {image_path}")
     headers = {'Content-Type': 'application/json'}
@@ -531,129 +836,47 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
             logger.error(f"Error embedding cached metadata for {image_path}: {e}")
             return (image_path, None)
     
+    # Extract EXIF and technical metrics
+    exif_data = extract_exif_metadata(image_path)
+    technical_metrics = analyze_image_technical(image_path)
+    
+    # Enhance prompt with technical context
+    enhanced_prompt = create_enhanced_prompt(prompt, exif_data, technical_metrics)
+    
     # Retry logic for malformed responses
     max_attempts = 3
     for attempt in range(max_attempts):
-    
         try:
             with open(image_path, 'rb') as image_file:
                 encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
-
-            payload = {
-                "model": model,
-                "stream": False,
-                "images": [encoded_image],
-                "prompt": prompt,
-                "format": {
-                    "type": "object",
-                    "properties": {
-                        "score": {"type": "string"},
-                        "title": {"type": "string"},
-                        "description": {"type": "string"},
-                        "keywords": {"type": "string"}
-                    },
-                    "required": [
-                        "score",
-                        "title",
-                        "description",
-                        "keywords"
-                    ]
-                },
-                "options": {
-                    "temperature": 0.3,  # Balanced temperature for consistency with some variance
-                    "seed": 42,  # Fixed seed for reproducibility
-                    "top_p": 0.9,  # Nucleus sampling for consistency
-                    "repeat_penalty": 1.1  # Prevent repetitive outputs
-                }
-            }
-
-            # Make API request with retry logic
-            def make_request():
-                response = requests.post(ollama_host_url, json=payload, headers=headers, timeout=120)
-                response.raise_for_status()
-                return response
             
-            try:
-                response = retry_with_backoff(make_request)
-            except Exception as e:
-                logger.error(f"Request failed after retries for {image_path}: {e}")
+            # Perform ensemble evaluation
+            response_metadata = ensemble_evaluate(image_path, encoded_image, ollama_host_url, 
+                                                 model, enhanced_prompt, headers, ensemble_passes)
+            
+            if response_metadata is None:
                 if attempt < max_attempts - 1:
                     logger.info(f"Retrying {image_path} (attempt {attempt + 2}/{max_attempts})")
                     time.sleep(2)
                     continue
                 return (image_path, None)
-        
-            if response and response.status_code == 200:
-                response_data = response.json()
-
-                # Extract and parse the metadata - check both 'response' and 'thinking' fields
-                metadata_text = response_data.get('response') or response_data.get('thinking', '')
-                if not metadata_text:
-                    logger.error(f"No response or thinking field found for {image_path}")
-                    if attempt < max_attempts - 1:
-                        logger.info(f"Retrying {image_path} (attempt {attempt + 2}/{max_attempts})")
-                        time.sleep(2)
-                        continue
-                    return (image_path, None)
-                    
-                # Check for content policy violations in response
-                metadata_lower = metadata_text.lower()
-                if 'violates content policies' in metadata_lower or 'cannot proceed' in metadata_lower or 'must decline' in metadata_lower:
-                    logger.warning(f"Skipping {image_path}: Model refused due to content policy")
-                    return (image_path, None)
-                
-                try:
-                    response_metadata = json.loads(metadata_text)
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse JSON for {image_path}: {e}")
-                    logger.debug(f"Malformed response: {metadata_text[:200]}")
-                    if attempt < max_attempts - 1:
-                        logger.info(f"Retrying {image_path} due to JSON parse error (attempt {attempt + 2}/{max_attempts})")
-                        time.sleep(2)
-                        continue
-                    return (image_path, None)
-                
-                # Validate and normalize score
-                if 'score' in response_metadata:
-                    validated_score = validate_score(response_metadata['score'])
-                    if validated_score is None:
-                        # Truncate long error messages
-                        score_preview = str(response_metadata['score'])[:150] + '...' if len(str(response_metadata['score'])) > 150 else str(response_metadata['score'])
-                        logger.warning(f"Invalid score for {image_path}: {score_preview}")
-                        if attempt < max_attempts - 1:
-                            logger.info(f"Retrying {image_path} due to invalid score (attempt {attempt + 2}/{max_attempts})")
-                            time.sleep(2)
-                            continue
-                        logger.warning(f"Skipping {image_path} after {max_attempts} attempts")
-                        return (image_path, None)
-                    response_metadata['score'] = str(validated_score)
-                else:
-                    logger.warning(f"No score field in response for {image_path}")
-                    if attempt < max_attempts - 1:
-                        logger.info(f"Retrying {image_path} (attempt {attempt + 2}/{max_attempts})")
-                        time.sleep(2)
-                        continue
-                    return (image_path, None)
             
-                # Save to cache
-                if cache_dir:
-                    save_to_cache(image_path, model, response_metadata, cache_dir)
-                    logger.debug(f"Saved response to cache for {image_path}")
+            # Add 'score' field for backwards compatibility (use overall_score)
+            if 'overall_score' in response_metadata:
+                response_metadata['score'] = response_metadata['overall_score']
+            
+            # Save to cache
+            if cache_dir:
+                save_to_cache(image_path, model, response_metadata, cache_dir)
+                logger.debug(f"Saved response to cache for {image_path}")
 
-                # Embed metadata
-                try:
-                    embed_metadata(image_path, response_metadata, backup_dir, verify)
-                    logger.info(f"Successfully processed {image_path} with score {response_metadata.get('score')}")
-                    return (image_path, response_metadata)
-                except Exception as e:
-                    logger.error(f"Error embedding metadata for {image_path}: {e}")
-                    return (image_path, None)
-            else:
-                logger.error(f"Failed to process {image_path}: {response.status_code if response else 'No response'}")
-                if attempt < max_attempts - 1:
-                    logger.info(f"Retrying {image_path} (attempt {attempt + 2}/{max_attempts})")
-                    time.sleep(2)
-                    continue
+            # Embed metadata
+            try:
+                embed_metadata(image_path, response_metadata, backup_dir, verify)
+                logger.info(f"Successfully processed {image_path} with score {response_metadata.get('score')}")
+                return (image_path, response_metadata)
+            except Exception as e:
+                logger.error(f"Error embedding metadata for {image_path}: {e}")
                 return (image_path, None)
                 
         except Exception as e:
@@ -673,7 +896,7 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
                             file_types: Optional[List[str]] = None, skip_existing: bool = True,
                             dry_run: bool = False, min_score: Optional[int] = None,
                             backup_dir: Optional[str] = None, verify: bool = False,
-                            cache_dir: Optional[str] = None) -> List[Tuple[str, Optional[Dict]]]:
+                            cache_dir: Optional[str] = None, ensemble_passes: int = 1) -> List[Tuple[str, Optional[Dict]]]:
     """Process images with parallel execution and progress bar."""
     # Collect all images to process
     image_paths = collect_images(folder_path, file_types=file_types, skip_existing=skip_existing)
@@ -688,7 +911,7 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
         future_to_path = {
-            executor.submit(process_single_image, path, ollama_host_url, model, prompt, dry_run, backup_dir, verify, cache_dir): path 
+            executor.submit(process_single_image, path, ollama_host_url, model, prompt, dry_run, backup_dir, verify, cache_dir, ensemble_passes): path 
             for path in image_paths
         }
         
@@ -716,7 +939,8 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
 def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: str):
     """Save processing results to CSV file."""
     with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['file_path', 'score', 'title', 'description', 'keywords', 'status']
+        fieldnames = ['file_path', 'overall_score', 'technical_score', 'composition_score', 
+                     'lighting_score', 'creativity_score', 'title', 'description', 'keywords', 'status']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         writer.writeheader()
@@ -724,7 +948,11 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
             if metadata:
                 writer.writerow({
                     'file_path': file_path,
-                    'score': metadata.get('score', ''),
+                    'overall_score': metadata.get('overall_score', metadata.get('score', '')),
+                    'technical_score': metadata.get('technical_score', ''),
+                    'composition_score': metadata.get('composition_score', ''),
+                    'lighting_score': metadata.get('lighting_score', ''),
+                    'creativity_score': metadata.get('creativity_score', ''),
                     'title': metadata.get('title', ''),
                     'description': metadata.get('description', ''),
                     'keywords': metadata.get('keywords', ''),
@@ -733,9 +961,14 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
             else:
                 writer.writerow({
                     'file_path': file_path,
-                    'score': '',
+                    'overall_score': '',
+                    'technical_score': '',
+                    'composition_score': '',
+                    'lighting_score': '',
+                    'creativity_score': '',
                     'title': '',
                     'description': '',
+                    'keywords': '',
                     'keywords': '',
                     'status': 'failed'
                 })
@@ -942,6 +1175,8 @@ if __name__ == "__main__":
     process_parser.add_argument('--cache', action='store_true', help='Enable API response caching')
     process_parser.add_argument('--cache-dir', type=str, default=CACHE_DIR, help=f'Cache directory (default: {CACHE_DIR})')
     process_parser.add_argument('--clear-cache', action='store_true', help='Clear cache before processing')
+    process_parser.add_argument('--ensemble', type=int, default=DEFAULT_ENSEMBLE_PASSES, 
+                              help=f'Number of evaluation passes for ensemble scoring (default: {DEFAULT_ENSEMBLE_PASSES})')
     
     # Rollback command
     rollback_parser = subparsers.add_parser('rollback', help='Restore images from backups')
@@ -1023,6 +1258,8 @@ if __name__ == "__main__":
     print(f"Model: {args.model}")
     print(f"Workers: {args.workers}")
     print(f"Skip existing: {args.skip_existing}")
+    if args.ensemble > 1:
+        print(f"{Fore.CYAN}Ensemble mode: {args.ensemble} evaluation passes per image{Fore.RESET}")
     if args.min_score:
         print(f"Minimum score filter: {args.min_score}")
     if args.dry_run:
@@ -1061,7 +1298,8 @@ if __name__ == "__main__":
         min_score=args.min_score,
         backup_dir=args.backup_dir,
         verify=args.verify,
-        cache_dir=cache_dir
+        cache_dir=cache_dir,
+        ensemble_passes=args.ensemble
     )
     elapsed_time = time.time() - start_time
     logger.info(f"Completed processing {len(results)} images in {elapsed_time:.2f} seconds")
