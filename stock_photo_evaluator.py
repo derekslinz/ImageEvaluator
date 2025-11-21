@@ -54,79 +54,109 @@ DEFAULT_MODEL = "qwen3-vl:8b"
 DEFAULT_WORKERS = 4
 
 # Stock photography evaluation prompt
-STOCK_EVALUATION_PROMPT = """You are an expert stock photography reviewer for major agencies like Shutterstock, Adobe Stock, and Getty Images.
+STOCK_EVALUATION_PROMPT = """You are an expert stock photography reviewer for major agencies such as Shutterstock, Adobe Stock, and Getty Images.
 
-Evaluate this image for stock photography suitability using strict professional standards.
+Your task: Evaluate a single image for stock photography suitability using strict professional standards. First, inspect the image itself. Then, incorporate the technical analysis provided.
 
 TECHNICAL ANALYSIS PROVIDED:
 {technical_context}
 
-Evaluate the following criteria and provide scores (0-100):
+Evaluate the following criteria and provide scores from 0-100 (integers). Use the full range where appropriate, and be slightly conservative: most amateur images should fall below 70 on several dimensions.
 
-1. COMMERCIAL_VIABILITY (0-100):
-   - Market demand and searchability
-   - Versatility for multiple uses
-   - Relevance to current trends
-   - Universal appeal vs niche
-   Score: Higher for images with broad commercial applications
+1. COMMERCIAL_VIABILITY (0-100)
+Consider:
+- Market demand and searchability
+- Versatility for multiple uses (e.g., ads, blogs, corporate, editorial)
+- Relevance to current and enduring themes
+- Universal appeal vs very narrow niche
+Interpretation:
+- Higher = broader, clearer commercial applications and strong demand potential.
+- Lower = niche, unclear concept, or weak market demand.
 
-2. TECHNICAL_QUALITY (0-100):
-   - Sharpness and focus accuracy
-   - Proper exposure and dynamic range
-   - Color accuracy and white balance
-   - Noise levels and artifacts
-   - Edge quality and compression
-   Score: Professional technical standards required
+2. TECHNICAL_QUALITY (0-100)
+Consider only technical aspects:
+- Sharpness and focus accuracy on the main subject
+- Exposure and usable dynamic range
+- Color accuracy and white balance
+- Noise levels, banding, halos, chromatic aberration
+- Edge quality, artifacts, and compression issues
+Interpretation:
+- Higher = meets or exceeds professional stock standards at large sizes.
+- Lower = clearly below professional standards or likely technical rejection.
 
-3. COMPOSITION_CLARITY (0-100):
-   - Clear subject with copy space
-   - Simple, uncluttered background
-   - Professional framing
-   - Rule of thirds / leading lines
-   - Negative space for text overlay
-   Score: Clean, purposeful composition
+3. COMPOSITION_CLARITY (0-100)
+Consider:
+- Clear, readable subject
+- Simple, uncluttered and non-distracting background
+- Professional framing (rule of thirds, leading lines, balance)
+- Negative space / copy space suitable for text overlays
+- Visual hierarchy and conceptual clarity
+Interpretation:
+- Higher = clean, purposeful composition ideal for designers.
+- Lower = cluttered, confusing, or poorly framed.
 
-4. KEYWORD_POTENTIAL (0-100):
-   - Descriptive and searchable
-   - Multiple keyword opportunities
-   - Clear subject identification
-   - Conceptual vs literal content
-   - Seasonal/evergreen appeal
-   Score: More searchable keywords = higher score
+4. KEYWORD_POTENTIAL (0-100)
+Consider:
+- How many distinct, truthful, and commercially relevant concepts/keywords the image naturally supports
+- Clarity of subject and context (easy to describe with keywords)
+- Mix of literal and conceptual tags (e.g., "mountain, hiking, adventure, freedom")
+- Seasonal vs evergreen appeal
+Interpretation:
+- Higher = many accurate, high-demand keywords and concepts.
+- Lower = ambiguous, hard to describe, or few useful concepts.
 
-5. RELEASE_CONCERNS (0-100):
-   - Identifiable people requiring model release
-   - Recognizable property/trademarks requiring release
-   - Branded products visible
-   - Copyrighted artwork/architecture
-   Score: 100 = no releases needed, 0 = multiple releases required
+5. RELEASE_CONCERNS (0-100) - "Release safety"
+Consider:
+- Identifiable people requiring model releases
+- Recognizable private property, interiors, trademarks, logos
+- Copyrighted artwork/architecture and design elements
+- Any other legal/IP exposure based on typical stock agency policies
+Interpretation (IMPORTANT):
+- 100 = no releases needed and no recognizable people/property/logos.
+- 50 = some potential release issues or ambiguity.
+- 0 = multiple serious release problems (likely legal rejection).
+If the presence of releases is unknown, assume they are NOT available unless explicitly stated in {technical_context}, and reflect that in the score and ISSUES.
 
-6. REJECTION_RISKS (0-100):
-   - Common technical flaws (noise, blur, artifacts)
-   - Clichéd or overdone concepts
-   - Poor lighting or awkward poses
-   - Distracting elements
-   - Dated or trendy elements
-   Score: 100 = no risks, 0 = likely rejection
+6. REJECTION_RISKS (0-100) - "Rejection safety"
+Consider:
+- Likely technical flags (noise, blur, artifacts, over-processing)
+- Clichéd or over-supplied concepts
+- Poor or flat lighting, awkward poses, distracting elements
+- Dated styling or short-lived trends
+- Any mismatch between image content and stock agency guidelines
+Interpretation (IMPORTANT):
+- 100 = very low rejection probability across major agencies.
+- 50 = borderline; likely to be rejected by at least one major agency.
+- 0 = very likely rejection.
 
-7. OVERALL_STOCK_SCORE (0-100):
-   Overall suitability for stock photography submission
+7. OVERALL_STOCK_SCORE (0-100)
+Overall suitability for stock photography submission. Base this primarily on:
+- COMMERCIAL_VIABILITY and TECHNICAL_QUALITY as the core factors,
+- Then adjust up or down (up to +/- 10 points) based on COMPOSITION_CLARITY, KEYWORD_POTENTIAL, RELEASE_CONCERNS, and REJECTION_RISKS.
+Use the full 0-100 range and do not cluster most images between 70-90.
 
-Provide your response in this EXACT format:
-COMMERCIAL_VIABILITY: [score]
-TECHNICAL_QUALITY: [score]
-COMPOSITION_CLARITY: [score]
-KEYWORD_POTENTIAL: [score]
-RELEASE_CONCERNS: [score]
-REJECTION_RISKS: [score]
-OVERALL_STOCK_SCORE: [score]
+Map OVERALL_STOCK_SCORE to a categorical recommendation:
+- EXCELLENT: >= 85
+- GOOD: 70-84
+- MARGINAL: 50-69
+- REJECT: < 50
+
+OUTPUT FORMAT (STRICT - NO EXTRA TEXT BEFORE OR AFTER):
+
+COMMERCIAL_VIABILITY: [0-100 integer]
+TECHNICAL_QUALITY: [0-100 integer]
+COMPOSITION_CLARITY: [0-100 integer]
+KEYWORD_POTENTIAL: [0-100 integer]
+RELEASE_CONCERNS: [0-100 integer]
+REJECTION_RISKS: [0-100 integer]
+OVERALL_STOCK_SCORE: [0-100 integer]
 RECOMMENDATION: [EXCELLENT/GOOD/MARGINAL/REJECT]
-PRIMARY_CATEGORY: [e.g., Business, Nature, Lifestyle, Technology, etc.]
-SUGGESTED_KEYWORDS: [comma-separated list of 10-15 keywords]
-ISSUES: [brief list of problems to fix, or "None" if excellent]
-STRENGTHS: [key selling points]
+PRIMARY_CATEGORY: [one broad category such as Business, Nature, Lifestyle, Technology, Food, Travel, etc.]
+SUGGESTED_KEYWORDS: [comma-separated list of 10-15 lowercase English keywords or short phrases, no hashtags, no quotes]
+ISSUES: [brief bullet-style text listing the main problems or risks; write "None" only if the image is genuinely strong on all criteria]
+STRENGTHS: [brief bullet-style text summarizing the main selling points and best use cases]
 
-Be honest and critical - stock agencies reject 70-90% of submissions."""
+Be honest and critical. Remember that major stock agencies routinely reject 70-90% of submissions; err slightly on the side of lower scores and stricter standards rather than generosity."""
 
 
 @dataclass
@@ -172,12 +202,14 @@ def analyze_technical_quality(image_path: str) -> Dict:
         else:
             gray = img_array
         
+        gray = np.array(gray)
+        
         # Sharpness (Laplacian variance)
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         sharpness_score = min(100, laplacian_var / 10)
         
         # Noise estimation (standard deviation in flat areas)
-        noise_estimate = np.std(gray)
+        noise_estimate = float(np.std(gray.astype(np.float64)))
         
         # Brightness and contrast
         stats = ImageStat.Stat(img)
@@ -437,6 +469,31 @@ def evaluate_image_for_stock(
                 fixable_issues=fixable_issues_str,
                 status="success"
             )
+        else:
+            # Handle unsuccessful response
+            error_msg = f"API request failed with status code {response.status_code if response else 'unknown'}"
+            return StockEvaluation(
+                file_path=image_path,
+                commercial_viability=0,
+                technical_quality=0,
+                composition_clarity=0,
+                keyword_potential=0,
+                release_concerns=0,
+                rejection_risks=0,
+                overall_stock_score=0,
+                recommendation="ERROR",
+                primary_category="",
+                suggested_keywords="",
+                issues=error_msg,
+                strengths="",
+                resolution_mp=technical_data.get('megapixels', 0),
+                dimensions=technical_data.get('dimensions', 'unknown'),
+                file_size_mb=file_size_mb,
+                technical_notes="; ".join(technical_data.get('notes', [])),
+                fixable_issues="None",
+                status="error",
+                error_message=error_msg
+            )
         
     except Exception as e:
         logger.error(f"Error evaluating {image_path}: {e}")
@@ -464,7 +521,7 @@ def evaluate_image_for_stock(
         )
 
 
-def find_images(directory: str, extensions: List[str] = None) -> List[str]:
+def find_images(directory: str, extensions: Optional[List[str]] = None) -> List[str]:
     """Find all images in directory recursively"""
     if extensions is None:
         extensions = ['.jpg', '.jpeg', '.png']
