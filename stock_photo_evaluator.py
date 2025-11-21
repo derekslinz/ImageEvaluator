@@ -311,7 +311,7 @@ def evaluate_image_for_stock(
     api_url: str,
     model: str,
     prompt: str,
-    timeout: int = 120
+    timeout: int = 300
 ) -> StockEvaluation:
     """Evaluate a single image for stock photography suitability"""
     
@@ -345,63 +345,70 @@ def evaluate_image_for_stock(
         }
         
         logger.debug(f"Sending request to {api_url}")
-        response = requests.post(api_url, json=payload, timeout=timeout)
-        response.raise_for_status()
+        try:
+            response = requests.post(api_url, json=payload, timeout=timeout)
+            response.raise_for_status()
+        except requests.exceptions.Timeout:
+            logger.warning(f"Request timeout for {image_path}, retrying...")
+            time.sleep(2)
+            response = requests.post(api_url, json=payload, timeout=timeout)
+            response.raise_for_status()
         
-        result = response.json()
-        response_text = result.get('response', '')
-        
-        # Parse response
-        scores = {}
-        for line in response_text.split('\n'):
-            line = line.strip()
-            if ':' in line:
-                key, value = line.split(':', 1)
-                key = key.strip().upper().replace(' ', '_')
-                value = value.strip()
-                
-                # Extract scores
-                if key in ['COMMERCIAL_VIABILITY', 'TECHNICAL_QUALITY', 'COMPOSITION_CLARITY',
-                          'KEYWORD_POTENTIAL', 'RELEASE_CONCERNS', 'REJECTION_RISKS', 
-                          'OVERALL_STOCK_SCORE']:
-                    try:
-                        scores[key.lower()] = int(value)
-                    except ValueError:
-                        scores[key.lower()] = 0
-                elif key == 'RECOMMENDATION':
-                    scores['recommendation'] = value
-                elif key == 'PRIMARY_CATEGORY':
-                    scores['primary_category'] = value
-                elif key == 'SUGGESTED_KEYWORDS':
-                    scores['suggested_keywords'] = value
-                elif key == 'ISSUES':
-                    scores['issues'] = value
-                elif key == 'STRENGTHS':
-                    scores['strengths'] = value
-        
-        # Build technical notes string
-        technical_notes = "; ".join(technical_data.get('notes', []))
-        
-        return StockEvaluation(
-            file_path=image_path,
-            commercial_viability=scores.get('commercial_viability', 0),
-            technical_quality=scores.get('technical_quality', 0),
-            composition_clarity=scores.get('composition_clarity', 0),
-            keyword_potential=scores.get('keyword_potential', 0),
-            release_concerns=scores.get('release_concerns', 0),
-            rejection_risks=scores.get('rejection_risks', 0),
-            overall_stock_score=scores.get('overall_stock_score', 0),
-            recommendation=scores.get('recommendation', 'UNKNOWN'),
-            primary_category=scores.get('primary_category', 'Unknown'),
-            suggested_keywords=scores.get('suggested_keywords', ''),
-            issues=scores.get('issues', ''),
-            strengths=scores.get('strengths', ''),
-            resolution_mp=technical_data.get('megapixels', 0),
-            dimensions=technical_data.get('dimensions', 'unknown'),
-            file_size_mb=file_size_mb,
-            technical_notes=technical_notes,
-            status="success"
-        )
+        if response and response.status_code == 200:
+            result = response.json()
+            response_text = result.get('response', '')
+            
+            # Parse response
+            scores = {}
+            for line in response_text.split('\n'):
+                line = line.strip()
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    key = key.strip().upper().replace(' ', '_')
+                    value = value.strip()
+                    
+                    # Extract scores
+                    if key in ['COMMERCIAL_VIABILITY', 'TECHNICAL_QUALITY', 'COMPOSITION_CLARITY',
+                              'KEYWORD_POTENTIAL', 'RELEASE_CONCERNS', 'REJECTION_RISKS', 
+                              'OVERALL_STOCK_SCORE']:
+                        try:
+                            scores[key.lower()] = int(value)
+                        except ValueError:
+                            scores[key.lower()] = 0
+                    elif key == 'RECOMMENDATION':
+                        scores['recommendation'] = value
+                    elif key == 'PRIMARY_CATEGORY':
+                        scores['primary_category'] = value
+                    elif key == 'SUGGESTED_KEYWORDS':
+                        scores['suggested_keywords'] = value
+                    elif key == 'ISSUES':
+                        scores['issues'] = value
+                    elif key == 'STRENGTHS':
+                        scores['strengths'] = value
+            
+            # Build technical notes string
+            technical_notes = "; ".join(technical_data.get('notes', []))
+            
+            return StockEvaluation(
+                file_path=image_path,
+                commercial_viability=scores.get('commercial_viability', 0),
+                technical_quality=scores.get('technical_quality', 0),
+                composition_clarity=scores.get('composition_clarity', 0),
+                keyword_potential=scores.get('keyword_potential', 0),
+                release_concerns=scores.get('release_concerns', 0),
+                rejection_risks=scores.get('rejection_risks', 0),
+                overall_stock_score=scores.get('overall_stock_score', 0),
+                recommendation=scores.get('recommendation', 'UNKNOWN'),
+                primary_category=scores.get('primary_category', 'Unknown'),
+                suggested_keywords=scores.get('suggested_keywords', ''),
+                issues=scores.get('issues', ''),
+                strengths=scores.get('strengths', ''),
+                resolution_mp=technical_data.get('megapixels', 0),
+                dimensions=technical_data.get('dimensions', 'unknown'),
+                file_size_mb=file_size_mb,
+                technical_notes=technical_notes,
+                status="success"
+            )
         
     except Exception as e:
         logger.error(f"Error evaluating {image_path}: {e}")
