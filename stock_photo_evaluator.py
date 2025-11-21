@@ -546,7 +546,8 @@ def save_results_to_csv(results: List[StockEvaluation], output_path: str):
         'commercial_viability', 'technical_quality', 'composition_clarity',
         'keyword_potential', 'release_concerns', 'rejection_risks',
         'primary_category', 'resolution_mp', 'dimensions', 'file_size_mb',
-        'suggested_keywords', 'strengths', 'issues', 'technical_notes', 'status', 'error_message'
+        'suggested_keywords', 'strengths', 'issues', 'fixable_issues',
+        'technical_notes', 'status', 'error_message'
     ]
     
     with open(output_path, 'w', newline='', encoding='utf-8') as f:

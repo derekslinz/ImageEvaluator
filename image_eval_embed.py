@@ -179,11 +179,20 @@ def validate_image(image_path: str) -> bool:
         return False
 
 
-def validate_score(score_str: str) -> Optional[int]:
-    """Extract and validate score is between 1-100."""
+def validate_score(score_input) -> Optional[int]:
+    """Extract and validate score is between 1-100. Accepts int, str, or other types."""
+    # Handle integer input directly
+    if isinstance(score_input, int):
+        if 1 <= score_input <= 100:
+            return score_input
+        else:
+            logger.warning(f"Integer score out of range: {score_input}")
+            return None
+    
+    # Handle string or other input
     try:
         # Try direct conversion first
-        score = int(score_str)
+        score = int(score_input)
         if 1 <= score <= 100:
             return score
     except (ValueError, TypeError):
@@ -191,21 +200,21 @@ def validate_score(score_str: str) -> Optional[int]:
     
     # Try to extract first two-digit or single-digit number from string
     # Look for standalone numbers (with word boundaries)
-    matches = re.findall(r'\b(\d{1,3})\b', str(score_str))
+    matches = re.findall(r'\b(\d{1,3})\b', str(score_input))
     for match in matches:
         score = int(match)
         if 1 <= score <= 100:
             return score
     
     # Fallback: try to find any number
-    match = re.search(r'\d+', str(score_str))
+    match = re.search(r'\d+', str(score_input))
     if match:
         score = int(match.group())
         if 1 <= score <= 100:
             return score
     
     # Truncate long error messages
-    score_preview = str(score_str)[:100] + '...' if len(str(score_str)) > 100 else str(score_str)
+    score_preview = str(score_input)[:100] + '...' if len(str(score_input)) > 100 else str(score_input)
     logger.warning(f"Invalid score (no valid number 1-100 found): {score_preview}")
     return None
 
@@ -725,11 +734,11 @@ def make_single_evaluation(image_path: str, encoded_image: str, ollama_host_url:
         "format": {
             "type": "object",
             "properties": {
-                "technical_score": {"type": "string"},
-                "composition_score": {"type": "string"},
-                "lighting_score": {"type": "string"},
-                "creativity_score": {"type": "string"},
-                "overall_score": {"type": "string"},
+                "technical_score": {"type": ["integer", "string"]},
+                "composition_score": {"type": ["integer", "string"]},
+                "lighting_score": {"type": ["integer", "string"]},
+                "creativity_score": {"type": ["integer", "string"]},
+                "overall_score": {"type": ["integer", "string"]},
                 "title": {"type": "string"},
                 "description": {"type": "string"},
                 "keywords": {"type": "string"}

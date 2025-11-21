@@ -254,6 +254,36 @@ python stock_photo_evaluator.py /photos http://localhost:11434/api/generate \
   --verbose
 ```
 
+#### Example Stock Evaluation Summary
+```text
+===============================================================================
+STOCK PHOTOGRAPHY EVALUATION SUMMARY
+================================================================================
+
+Total images: 245
+Successful: 236
+Failed: 9
+
+AVERAGE STOCK SCORE: 51.3/100
+
+RECOMMENDATIONS:
+  EXCELLENT: 0 (0.0%)
+  GOOD: 14 (5.9%)
+  MARGINAL-FIXABLE: 132 (55.9%) - Easy fixes available
+  MARGINAL: 50 (21.2%)
+  REJECT: 35 (14.8%)
+
+RESOLUTION STATUS:
+  Below minimum (4.0MP): 3
+  Below recommended (12.0MP): 17
+  Meets recommended: 216
+
+================================================================================
+
+Processing time: 5554.6 seconds (92.6 minutes)
+Time per image: 22.67 seconds
+```
+
 #### Example Output: model qwen3-vl:8b running on ollama on an Apple M4 Max with --ensemble=3 (3 passes per image). Each image is ~50 megapixels. Running on gemma3:4b was faster, but the results were all clustered around the same score. It's notably faster on a RTX 3090, but still time consuming with 3 passes. Smaller images process faster, obviously
 ```bash
  $ python image_eval_embed.py process /Volumes/NVMe/Lightroom Test Export/   http://localhost:11434/api/generate --no-skip-existing --csv "Lightroom Test Export.csv"   --model qwen3-vl:8b --ensemble 3 --workers 8
