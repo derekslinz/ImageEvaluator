@@ -491,6 +491,36 @@ def assess_technical_metrics(technical_metrics: Dict) -> List[str]:
     return warnings
 
 
+def compute_post_process_potential(technical_metrics: Dict) -> int:
+    """Estimate how much post-processing can improve this image."""
+    base_score = 70
+    sharpness = technical_metrics.get('sharpness')
+    if sharpness is not None:
+        if sharpness < 35:
+            base_score -= 25
+        elif sharpness < 60:
+            base_score -= 10
+        else:
+            base_score += 5
+
+    highlights = technical_metrics.get('histogram_clipping_highlights', 0)
+    shadows = technical_metrics.get('histogram_clipping_shadows', 0)
+    clipping = max(highlights, shadows)
+    if clipping > 12:
+        base_score -= 20
+    elif clipping > 6:
+        base_score -= 10
+    elif clipping == 0:
+        base_score += 5
+
+    color_cast = technical_metrics.get('color_cast', 'neutral')
+    if color_cast != 'neutral':
+        base_score -= 8
+
+    post_score = max(0, min(100, int(base_score)))
+    return post_score
+
+
 def create_enhanced_prompt(base_prompt: str, exif_data: Dict, technical_metrics: Dict) -> str:
     """Enhance prompt with technical context from image analysis."""
     context_parts = []
@@ -1040,6 +1070,7 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
     technical_metrics = analyze_image_technical(image_path)
     technical_warnings = assess_technical_metrics(technical_metrics)
     technical_metrics['warnings'] = technical_warnings
+    technical_metrics['post_process_potential'] = compute_post_process_potential(technical_metrics)
 
     # Enhance prompt with technical context
     enhanced_prompt = create_enhanced_prompt(prompt, exif_data, technical_metrics)
@@ -1068,6 +1099,7 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
 
             response_metadata['technical_metrics'] = technical_metrics
             response_metadata['technical_warnings'] = technical_warnings
+            response_metadata['post_process_potential'] = technical_metrics.get('post_process_potential')
 
             # Save to cache
             if cache_dir:
@@ -1148,7 +1180,7 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
             'lighting_score', 'creativity_score', 'title', 'description',
             'keywords', 'status', 'sharpness', 'brightness', 'contrast',
             'histogram_clipping_highlights', 'histogram_clipping_shadows',
-            'color_cast', 'technical_warnings'
+            'color_cast', 'technical_warnings', 'post_process_potential'
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
@@ -1175,6 +1207,7 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'histogram_clipping_shadows': technical_metrics.get('histogram_clipping_shadows', ''),
                     'color_cast': technical_metrics.get('color_cast', ''),
                     'technical_warnings': warnings_str,
+                    'post_process_potential': metadata.get('post_process_potential', ''),
                     'status': 'success'
                 })
             else:
@@ -1195,7 +1228,8 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'histogram_clipping_highlights': '',
                     'histogram_clipping_shadows': '',
                     'color_cast': '',
-                    'technical_warnings': ''
+                    'technical_warnings': '',
+                    'post_process_potential': ''
                 })
 
 
@@ -1222,6 +1256,7 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
     scores = []
     raw_count = 0
     pil_count = 0
+    potentials = []
     
     for image_path, metadata in results:
         # Track format types
@@ -1245,6 +1280,11 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
                         scores.append(score)
             except (ValueError, AttributeError):
                 continue
+        if metadata and 'post_process_potential' in metadata:
+            try:
+                potentials.append(int(metadata['post_process_potential']))
+            except (ValueError, TypeError):
+                pass
     
     warning_images = sum(1 for _, md in results if md and md.get('technical_warnings'))
 
@@ -1257,10 +1297,10 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
             'min_score': 0,
             'max_score': 0,
             'score_distribution': {},
-            'raw_count': raw_count,
-            'pil_count': pil_count
-            ,
-            'warning_images': warning_images
+        'raw_count': raw_count,
+        'pil_count': pil_count,
+        'warning_images': warning_images,
+        'avg_post_process_potential': sum(potentials)/len(potentials) if potentials else 0
         }
     
     # Calculate score distribution (bins of 5)
@@ -1300,9 +1340,9 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
         'max_score': max(scores) if scores else 0,
         'score_distribution': distribution,
         'raw_count': raw_count,
-        'pil_count': pil_count
-        ,
-        'warning_images': warning_images
+        'pil_count': pil_count,
+        'warning_images': warning_images,
+        'avg_post_process_potential': sum(potentials)/len(potentials) if potentials else 0
     }
 
 
@@ -1340,6 +1380,9 @@ def print_statistics(stats: Dict):
         print(f"Standard deviation: {stats.get('std_dev', 0):.2f}")
         print(f"Range: {stats['min_score']} - {stats['max_score']}")
         print(f"Quartiles (Q1/Q3): {stats.get('q1', 0):.0f} / {stats.get('q3', 0):.0f}")
+        avg_post = stats.get('avg_post_process_potential')
+        if avg_post is not None:
+            print(f"Average post-process potential: {avg_post:.1f}/100")
         
         print(f"\n{'='*60}")
         print(f"SCORE DISTRIBUTION")
