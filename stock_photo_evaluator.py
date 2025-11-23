@@ -360,10 +360,10 @@ def create_stock_prompt(base_prompt: str, technical_data: Dict) -> str:
     # Clipping warnings
     highlight_clip = technical_data.get('highlight_clip', 0)
     shadow_clip = technical_data.get('shadow_clip', 0)
-    if highlight_clip > 0.02:
-        context_parts.append(f"⚠️ Highlight clipping detected ({highlight_clip*100:.1f}%)")
-    if shadow_clip > 0.02:
-        context_parts.append(f"⚠️ Shadow clipping detected ({shadow_clip*100:.1f}%)")
+    if highlight_clip > 0.12:
+        context_parts.append(f"⚠️ Highlight clipping exceeds 12% ({highlight_clip*100:.1f}%)")
+    if shadow_clip > 0.12:
+        context_parts.append(f"⚠️ Shadow clipping exceeds 12% ({shadow_clip*100:.1f}%)")
     
     # DPI
     dpi = technical_data.get('dpi', 72)
@@ -727,3 +727,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    context_parts.append("High-end anchor: flawless gallery-level images with clean highlights/shadows and razor-sharp detail should score 90+; explain the elements that justify such a grade.")
