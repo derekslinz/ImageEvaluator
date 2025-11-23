@@ -325,7 +325,7 @@ def analyze_technical_quality(image_path: str) -> Dict:
             'shadow_clip': shadow_clip,
             'dpi': dpi_value,
             'aspect_ratio': aspect_ratio,
-            'notes': ' | '.join(notes),
+            'notes': notes,
             'fixable_issues': fixable_issues
         }
         
