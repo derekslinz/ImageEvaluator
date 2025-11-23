@@ -32,13 +32,16 @@ A toolkit for evaluating images using AI vision models (via Ollama) with two spe
 
 **Quality & Safety:**
 - Score validation and extraction from malformed responses
-- Exponential backoff retry logic
+- Exponential backoff retry logic with permanent error detection
 - Image validation and corruption detection
 - Optional metadata verification
 - Backup directory support
 - Full rollback capability
-- Normalized flat-area noise score (ISO-scaled for D850/Z9 100-3200) so warnings aren’t driven by scene contrast alone
+- Camera/ISO-agnostic noise estimation using MAD (Median Absolute Deviation)
+- Scale-normalized sharpness metric for consistent measurements across resolutions
 - Post-processing potential score (0-100) derived from measured sharpness/clipping so you can prioritize images worth retouching
+- Context-aware technical evaluation with 10 photography profiles
+- Status tracking for technical analysis (success/error detection)
 
 **Flexibility:**
 - Configurable models (default: qwen3-vl:8b)
@@ -59,17 +62,24 @@ A toolkit for evaluating images using AI vision models (via Ollama) with two spe
 **Technical Analysis:**
 - Resolution validation (4MP minimum, 12MP recommended)
 - DPI checking (300 DPI standard)
-- Sharpness measurement via Laplacian variance
-- Noise estimation
-- Histogram clipping detection
+- Scale-normalized sharpness measurement via Laplacian variance
+- Camera/ISO-agnostic noise estimation with 0-100 severity scoring
+- Histogram clipping detection (per-channel max for accurate reporting)
+- Color cast detection with dominant channel identification
 - Aspect ratio validation
+- Brightness and contrast measurements
 
 **Recommendations:**
 - EXCELLENT: Ready for immediate submission
 - GOOD: Strong candidate with minor considerations
-- MARGINAL-FIXABLE: Needs easy corrections (e.g., DPI metadata)
+- MARGINAL-FIXABLE: Needs easy corrections (e.g., DPI metadata) - validated against technical measurements
 - MARGINAL: Needs improvement before submission
 - REJECT: Does not meet stock standards
+
+**Smart Classification:**
+- MARGINAL-FIXABLE uses robust keyword detection (checks for unfixable issues like blur, noise, composition)
+- Validates fixability against actual technical measurements (sharpness ≥30, noise ≤65, resolution ≥4MP)
+- Minimum score threshold of 45 for upgrade consideration
 
 **Output:**
 - Detailed CSV with all scores and analysis
@@ -259,6 +269,31 @@ python stock_photo_evaluator.py /photos http://localhost:11434/api/generate \
   --verbose
 ```
 
+#### Context-Aware Evaluation
+
+The image evaluator now includes 10 specialized photography context profiles:
+
+1. **stock_product** - Clean product/catalog with neutral background (strictest standards)
+2. **macro_food** - Close-up food and macro photography with fine detail requirements
+3. **portrait_neutral** - Standard portrait with controlled lighting
+4. **portrait_highkey** - Bright, airy portrait with intentional highlight blowout tolerance
+5. **landscape** - Nature, outdoor scenery, wide vistas
+6. **street_documentary** - Candid, street photography, documentary style (flexible noise/clipping)
+7. **sports_action** - Sports, action, wildlife, fast motion
+8. **concert_night** - Night photography, concerts, low-light (most forgiving noise/clipping)
+9. **architecture_realestate** - Buildings, interiors, real estate
+10. **fineart_creative** - Experimental, abstract, ICM (most flexible technical standards)
+
+Each profile has customized thresholds for:
+- Sharpness requirements (critical/soft boundaries)
+- Clipping tolerance (highlights/shadows warning levels)
+- Color cast sensitivity and penalties
+- Noise acceptability ranges
+- Brightness expectations
+- Post-processing potential scoring
+
+Context is automatically classified or can be manually overridden with `--context` flag.
+
 #### Example Stock Evaluation Summary
 ```text
 ===============================================================================
@@ -274,7 +309,7 @@ AVERAGE STOCK SCORE: 51.3/100
 RECOMMENDATIONS:
   EXCELLENT: 0 (0.0%)
   GOOD: 14 (5.9%)
-  MARGINAL-FIXABLE: 132 (55.9%) - Easy fixes available
+  MARGINAL-FIXABLE: 132 (55.9%) - Easy fixes available (validated against technical metrics)
   MARGINAL: 50 (21.2%)
   REJECT: 35 (14.8%)
 
@@ -451,11 +486,38 @@ Both tools use `temperature=0.3`, `seed=42`, and `top_p=0.9` for deterministic, 
 **Ensemble Mode:**
 The image evaluator supports multiple evaluation passes per image with median aggregation to reduce variance. Recommended for critical evaluations where consistency is paramount.
 
-**Technical Analysis:**
-- Sharpness: Laplacian variance method via OpenCV
-- Noise: Standard deviation estimation in flat areas
-- Clipping: Histogram analysis of highlight/shadow regions
-- DPI: Extracted from image metadata when available
+**Technical Analysis Algorithms:**
+
+- **Sharpness**: Scale-normalized Laplacian variance via OpenCV
+  - Normalizes by √(megapixels) for consistent measurements across resolutions
+  - 1MP baseline ensures comparability between 3MP and 50MP images
+  
+- **Noise**: Camera/ISO-agnostic estimation using 7-step algorithm
+  1. Resize to standardized 2048px long edge
+  2. Normalize to [0,1] range
+  3. Extract high-frequency residual via Gaussian blur
+  4. Mask to flat regions using Sobel edge detection (75th percentile threshold)
+  5. Calculate robust sigma via MAD (Median Absolute Deviation)
+  6. Normalize by dynamic range (p1-p99)
+  7. Map to 0-100 severity score
+  - Fallback uses full image if <1% pixels in flat regions (logged)
+  
+- **Clipping**: Per-channel histogram analysis
+  - Uses **max** across R/G/B channels (not average)
+  - Accurately detects single-channel clipping
+  - Highlight range: bins 250-255
+  - Shadow range: bins 0-5
+  
+- **Color Cast**: Dominant channel detection with threshold
+  - Threshold: 15.0 mean difference between channels
+  - Requires 5+ unit margin to identify dominant channel
+  - Labels: warm/red, cool/blue, green, mixed, neutral
+  
+- **DPI**: Extracted from image metadata when available
+  
+- **Context Classification**: Automatic LLM-based classification into 10 photography contexts
+  - Falls back to 'stock_product' (most restrictive) if uncertain
+  - Manual override available via command-line flag
 
 **Logging:**
 Both tools use Python's logging module with file and console handlers. Log files are timestamped and include DEBUG/INFO/WARNING/ERROR levels.
@@ -463,8 +525,11 @@ Both tools use Python's logging module with file and console handlers. Log files
 **Error Handling:**
 - Invalid paths and missing directories
 - Corrupted or unreadable images
-- API timeouts with automatic retry (stock evaluator: 300s timeout)
+- API timeouts with exponential backoff retry (2s, 4s, 8s...)
+- Permanent error detection (FileNotFoundError, PermissionError, ValueError, TypeError, KeyError)
 - Malformed JSON responses with score extraction fallback
+- Technical analysis status tracking ('success'/'error')
+- Comprehensive ISO parsing (handles "ISO 1600", "1,600", "1600/3200" dual ISO, "100.0" float)
 
 **Backup System:**
 Images are backed up before metadata modification by appending `.original` to the filename. The rollback command restores from these backups.

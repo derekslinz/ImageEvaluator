@@ -680,7 +680,28 @@ def classify_image_context(image_path: str, encoded_image: str, ollama_host_url:
         result = response.json()
         context_label = result.get('response', '').strip().lower()
         
-        # Validate against known contexts
+        # Handle numbered responses (e.g., "1", "1.", "5. landscape")
+        number_to_context = {
+            '1': 'stock_product',
+            '2': 'macro_food',
+            '3': 'portrait_neutral',
+            '4': 'portrait_highkey',
+            '5': 'landscape',
+            '6': 'street_documentary',
+            '7': 'sports_action',
+            '8': 'concert_night',
+            '9': 'architecture_realestate',
+            '10': 'fineart_creative'
+        }
+        
+        # Check if response is just a number
+        clean_response = context_label.rstrip('.').strip()
+        if clean_response in number_to_context:
+            matched_context = number_to_context[clean_response]
+            logger.info(f"Context classification: {matched_context} (from number '{clean_response}') for {image_path}")
+            return matched_context
+        
+        # Validate against known contexts (exact match)
         if context_label in TECH_PROFILES:
             logger.info(f"Context classification: {context_label} (exact match) for {image_path}")
             return context_label
