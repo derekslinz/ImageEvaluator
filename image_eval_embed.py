@@ -147,6 +147,8 @@ Use these as anchors:
 
 Assume most random user-submitted photos fall in the 45-65 overall range. Scores above 80 are uncommon; above 90 are extremely rare. Do not cluster everything in 75-85.
 
+High-end anchor: Award 90+ when the image is technically flawless, beautifully lit, and über compelling; explicitly state which attributes (sharpness, lighting control, composition) justify such a grade rather than letting minor clipping concerns dominate the score, and treat small warnings (<10% clipping or sharpness >40) as advisory unless they severely impair quality.
+
 OVERALL SCORE
 
 Compute the overall score as a weighted combination:
