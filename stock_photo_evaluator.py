@@ -137,10 +137,12 @@ Interpretation (IMPORTANT):
 7. OVERALL_STOCK_SCORE (0-100)
 Overall suitability for stock photography submission. Compute this score from the lower-level components using a consistent formula:
   * Base score = 0.4×TECHNICAL_QUALITY + 0.25×COMMERCIAL_VIABILITY + 0.2×COMPOSITION_CLARITY + 0.1×KEYWORD_POTENTIAL + 0.05×(RELEASE_CONCERNS+REJECTION_RISKS)/2
-  * Penalty = 5 points if highlight or shadow clipping exceeds 5%, 8 points if the sharpness metric is under 35, and 10 total points if both clipping and low sharpness are present.
+  * Penalty = 5 points if highlight or shadow clipping exceeds 12%, 5 points if sharpness metric is under 30, and an additional 5-point penalty (total 10) only when clipping exceeds 12% AND sharpness is under 30. For minor issues (clipping between 5-12% or sharpness between 30-40) treat as warnings but do not subtract points automatically.
   * OVERALL_STOCK_SCORE = Base score − Penalty. Round the result to the nearest integer after applying the penalty, clamp between 0 and 100, and note in the ISSUES field which component or penalty caused a significant deviation if the final score differs by more than 3 points from any individual component.
-  * Example: If TECHNICAL_QUALITY=80, COMMERCIAL_VIABILITY=70, COMPOSITION_CLARITY=65, KEYWORD_POTENTIAL=60, RELEASE_CONCERNS=90, REJECTION_RISKS=85, base score = 0.4*80 + 0.25*70 + 0.2*65 + 0.1*60 + 0.05*((90+85)/2) = 32 + 17.5 + 13 + 6 + 4.375 = 72.875; if sharpness is 30 (penalty 8) then final score = round(72.875 - 8) = 65.
+  * Example: If TECHNICAL_QUALITY=80, COMMERCIAL_VIABILITY=70, COMPOSITION_CLARITY=65, KEYWORD_POTENTIAL=60, RELEASE_CONCERNS=90, REJECTION_RISKS=85, base score = 0.4*80 + 0.25*70 + 0.2*65 + 0.1*60 + 0.05*((90+85)/2) = 32 + 17.5 + 13 + 6 + 4.375 = 72.875; without clipping/sharpness problems award 73; if sharpness drops to 28 (penalty 5) final = round(67.875) = 68. 
 Use the full 0-100 range and do not cluster most images between 70-90; log the driving factor in the ISSUES output when the overall score deviates significantly from the component scores.
+
+High-end anchor: When an image presents flawless technical execution, clean dynamic range, and pro-level composition (e.g., studio portraits, award-winning architecture, or pristine landscapes with no clipping or noise), it should earn 90+; explicitly explain why that score reflects such polish.
 
 Map OVERALL_STOCK_SCORE to a categorical recommendation:
 - EXCELLENT: >= 85
