@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -26,12 +27,32 @@ from colorama import Fore, Style
 from pydantic import BaseModel, ConfigDict, field_validator
 from tqdm import tqdm
 
+try:
+    import rawpy
+except ImportError:
+    rawpy = None
+
+RAWPY_AVAILABLE = rawpy is not None
+RAWPY_IMPORT_WARNINGED = False
+RAW_EXTENSIONS = {'.nef', '.cr2', '.cr3', '.arw', '.rw2', '.raf', '.orf', '.dng'}
+
 # Increase PIL decompression bomb limit for large legitimate images
 Image.MAX_IMAGE_PIXELS = None  # Remove limit entirely (or set to a higher value like 500000000)
 
 # Configure basic logging (will be updated based on verbose flag)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+def _is_raw_image(image_path: str) -> bool:
+    return Path(image_path).suffix.lower() in RAW_EXTENSIONS
+
+def _warn_rawpy_missing():
+    global RAWPY_IMPORT_WARNINGED
+    if not RAWPY_IMPORT_WARNINGED:
+        logger.warning(
+            "rawpy is not installed; RAW files (e.g., NEF, CR2, ARW) will be skipped unless rawpy is available."
+        )
+        RAWPY_IMPORT_WARNINGED = True
 
 def _get_int_env(var_name: str, fallback: int) -> int:
     """Read an integer environment variable, falling back if unset/invalid."""
@@ -155,6 +176,91 @@ Example format (structure only; values are illustrative):
 {"technical_score": 55, "composition_score": 62, "lighting_score": 58, "creativity_score": 60, "overall_score": 58, "title": "sunset over mountains", "description": "Decent sunset composition with strong colors but slightly overexposed highlights and soft detail in the foreground.", "keywords": "sunset, mountains, landscape, golden hour, clouds, peaks, nature, scenic, dramatic sky, outdoor, wilderness"}"""
 
 
+def _safe_raw_metadata_value(meta, *names):
+    for name in names:
+        value = getattr(meta, name, None)
+        if value not in (None, 0, 0.0, ''):
+            return value
+    return None
+
+
+def _extract_rawpy_metadata(image_path: str) -> Dict[str, Optional[str]]:
+    if not RAWPY_AVAILABLE:
+        return {}
+
+    try:
+        raw = rawpy.imread(image_path)
+    except Exception as exc:
+        logger.debug(f"rawpy failed to read {image_path}: {exc}")
+        return {}
+
+    try:
+        meta = getattr(raw, 'metadata', None)
+        if meta is None:
+            logger.debug(f"rawpy metadata not available for {image_path}")
+            return {}
+        raw_metadata: Dict[str, Optional[str]] = {}
+        iso = _safe_raw_metadata_value(meta, 'iso_speed', 'iso')
+        if iso:
+            raw_metadata['iso'] = int(iso)
+
+        aperture = _safe_raw_metadata_value(meta, 'aperture', 'f_number')
+        if aperture:
+            raw_metadata['aperture'] = f"f/{float(aperture):.1f}"
+
+        shutter = _safe_raw_metadata_value(meta, 'shutter', 'exposure_time')
+        if shutter:
+            raw_metadata['shutter_speed'] = f"{float(shutter):.3f}s"
+
+        focal_length = _safe_raw_metadata_value(meta, 'focal_length')
+        if focal_length:
+            raw_metadata['focal_length'] = f"{float(focal_length):.0f}mm"
+
+        camera_make = _safe_raw_metadata_value(meta, 'camera_maker', 'camera')
+        if camera_make:
+            raw_metadata['camera_make'] = str(camera_make).strip()
+
+        camera_model = _safe_raw_metadata_value(meta, 'camera_model')
+        if camera_model:
+            raw_metadata['camera_model'] = str(camera_model).strip()
+
+        lens_model = _safe_raw_metadata_value(meta, 'lens')
+        if lens_model:
+            raw_metadata['lens_model'] = str(lens_model).strip()
+
+        return raw_metadata
+    finally:
+        raw.close()
+
+
+@contextmanager
+def open_image_for_analysis(image_path: str):
+    ext = Path(image_path).suffix.lower()
+    if ext in RAW_EXTENSIONS:
+        if not RAWPY_AVAILABLE:
+            _warn_rawpy_missing()
+            raise RuntimeError("rawpy is required to process RAW files")
+        raw = rawpy.imread(image_path)
+        try:
+            rgb = raw.postprocess(
+                use_camera_wb=True,
+                no_auto_bright=True,
+                output_bps=8,
+                gamma=(1.0, 1.0)
+            )
+        finally:
+            raw.close()
+
+        img = Image.fromarray(rgb.astype('uint8'))
+        try:
+            yield img
+        finally:
+            img.close()
+    else:
+        with Image.open(image_path) as img:
+            yield img
+
+
 def load_prompt_from_file(prompt_file: str) -> str:
     """Load custom prompt from file."""
     try:
@@ -167,6 +273,19 @@ def load_prompt_from_file(prompt_file: str) -> str:
 
 def validate_image(image_path: str) -> bool:
     """Validate if file is a valid, non-corrupted image."""
+    ext = Path(image_path).suffix.lower()
+    if ext in RAW_EXTENSIONS:
+        if not RAWPY_AVAILABLE:
+            _warn_rawpy_missing()
+            return False
+        try:
+            raw = rawpy.imread(image_path)
+            raw.close()
+            return True
+        except Exception as e:
+            logger.warning(f"Invalid or corrupted RAW image {image_path}: {e}")
+            return False
+
     try:
         with Image.open(image_path) as img:
             img.verify()  # Verify it's a valid image
@@ -244,6 +363,9 @@ def extract_exif_metadata(image_path: str) -> Dict[str, Optional[str]]:
         'camera_model': None,
         'lens_model': None
     }
+    if _is_raw_image(image_path):
+        metadata.update(_extract_rawpy_metadata(image_path))
+        return metadata
     
     try:
         with Image.open(image_path) as img:
@@ -302,37 +424,27 @@ def analyze_image_technical(image_path: str) -> Dict:
     }
     
     try:
-        # Read image with PIL for basic stats
-        with Image.open(image_path) as img:
-            # Convert to RGB if needed
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            
-            # Get basic statistics
-            stat = ImageStat.Stat(img)
-            metrics['brightness'] = sum(stat.mean) / len(stat.mean)  # Average brightness
-            metrics['contrast'] = sum(stat.stddev) / len(stat.stddev)  # Average std dev as contrast
-            
-            # Histogram analysis
-            histogram = img.histogram()
-            total_pixels = img.size[0] * img.size[1]
-            
-            # Check for clipping (top 5% of values)
+        # Read image with PIL (or rawpy) for stats
+        with open_image_for_analysis(image_path) as img:
+            img_rgb = img if img.mode == 'RGB' else img.convert('RGB')
+            stat = ImageStat.Stat(img_rgb)
+            metrics['brightness'] = sum(stat.mean) / len(stat.mean)
+            metrics['contrast'] = sum(stat.stddev) / len(stat.stddev)
+
+            histogram = img_rgb.histogram()
+            total_pixels = img_rgb.size[0] * img_rgb.size[1]
+
             for channel_idx in range(3):  # R, G, B
                 channel_hist = histogram[channel_idx * 256:(channel_idx + 1) * 256]
-                # Highlight clipping (values 250-255)
                 highlight_pixels = sum(channel_hist[250:256])
                 metrics['histogram_clipping_highlights'] += (highlight_pixels / total_pixels) * 100
-                
-                # Shadow clipping (values 0-5)
+
                 shadow_pixels = sum(channel_hist[0:6])
                 metrics['histogram_clipping_shadows'] += (shadow_pixels / total_pixels) * 100
-            
-            # Average across channels
+
             metrics['histogram_clipping_highlights'] /= 3
             metrics['histogram_clipping_shadows'] /= 3
-            
-            # Color cast detection (simple method)
+
             r_mean, g_mean, b_mean = stat.mean[:3]
             max_diff = max(abs(r_mean - g_mean), abs(g_mean - b_mean), abs(r_mean - b_mean))
             if max_diff > 15:
@@ -342,12 +454,11 @@ def analyze_image_technical(image_path: str) -> Dict:
                     metrics['color_cast'] = 'cool/blue'
                 elif g_mean > r_mean and g_mean > b_mean:
                     metrics['color_cast'] = 'green'
-        
-        # Use OpenCV on the already-loaded image for sharpness (Laplacian variance)
-        img_gray = img.convert('L')
-        gray_array = np.array(img_gray)
-        laplacian_var = cv2.Laplacian(gray_array, cv2.CV_64F).var()
-        metrics['sharpness'] = laplacian_var
+
+            img_gray = img_rgb.convert('L')
+            gray_array = np.array(img_gray)
+            laplacian_var = cv2.Laplacian(gray_array, cv2.CV_64F).var()
+            metrics['sharpness'] = laplacian_var
     
     except Exception as e:
         logger.debug(f"Could not analyze technical metrics for {image_path}: {e}")
@@ -521,6 +632,17 @@ class Metadata(BaseModel):
 def has_user_comment(image_path: str) -> bool:
     """Check if the UserComment metadata exists and is not empty."""
     try:
+        file_ext = Path(image_path).suffix.lower()
+        if file_ext in RAW_EXTENSIONS:
+            result = subprocess.run(
+                ['exiftool', '-UserComment', '-s3', image_path],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return True
+            return False
+
         with Image.open(image_path) as img:
             exif_data = img.info.get("exif", b"")
             if not exif_data:  # Check if EXIF data is empty

@@ -90,6 +90,7 @@ A toolkit for evaluating images using AI vision models (via Ollama) with two spe
   - `pydantic` - Data validation
   - `colorama` - Colored terminal output
   - `tqdm` - Progress bars
+  - `rawpy` - RAW (NEF/CR2/ARW) decoding for technical analysis
 
 Install dependencies:
 ```bash
