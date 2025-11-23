@@ -291,9 +291,9 @@ def analyze_technical_quality(image_path: str) -> Dict:
             notes.append(f"✓ Sharp: {sharpness_score:.1f}/100")
         
         # Noise check
-        if noise_estimate > 50:
+        if noise_estimate > 65:
             notes.append(f"⚠️ HIGH NOISE: {noise_estimate:.1f}")
-        elif noise_estimate > 30:
+        elif noise_estimate > 45:
             notes.append(f"⚠️ Moderate noise: {noise_estimate:.1f}")
         
         # Clipping check

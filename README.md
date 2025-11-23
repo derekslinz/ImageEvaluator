@@ -288,6 +288,14 @@ Processing time: 5554.6 seconds (92.6 minutes)
 Time per image: 22.67 seconds
 ```
 
+#### Technical analysis helper
+
+For a quick single-file check, run:
+```bash
+python technical_analysis.py /path/to/image.NEF
+```
+Pass `--format json` to get the raw metric dictionary, or let the default text output surface sharpness, noise, clipping, DPI, and the human-readable notes the stock prompt uses.
+
 #### Upload Results to PostgreSQL
 
 Once you have a CSV from either evaluator, use `csv_to_postgres.py` to push it into Postgres:
