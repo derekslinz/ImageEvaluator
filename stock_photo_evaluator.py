@@ -22,7 +22,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union, TypedDict
 from dataclasses import dataclass, asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -57,6 +57,43 @@ MIN_DPI = 300  # Minimum DPI at standard print sizes
 DEFAULT_MODEL = "qwen3-vl:8b"
 DEFAULT_WORKERS = 4
 _EXIFTOOL_AVAILABLE: Optional[bool] = None
+
+# Technical quality thresholds
+SHARPNESS_CRITICAL = 30  # Below this is soft/blurry
+SHARPNESS_OPTIMAL = 60   # Above this is sharp
+NOISE_HIGH = 65          # High noise threshold
+NOISE_MODERATE = 45      # Moderate noise threshold
+CLIPPING_THRESHOLD = 0.02  # 2% clipping threshold
+DPI_FIXABLE = 240        # DPI above this is easily fixable
+MIN_FIXABLE_SCORE = 45   # Minimum score for MARGINAL-FIXABLE classification
+
+# Unfixable issue keywords (issues that cannot be corrected in post)
+UNFIXABLE_KEYWORDS = [
+    'blur', 'blurry', 'out of focus', 'motion blur',
+    'noise', 'noisy', 'grain', 'grainy',
+    'resolution', 'low resolution', 'small',
+    'composition', 'framing', 'crop',
+    'subject', 'concept', 'lighting',
+    'extreme', 'severe', 'major', 'critical'
+]
+
+
+# Type definition for technical analysis results
+class TechnicalData(TypedDict):
+    """Type definition for technical analysis results."""
+    megapixels: float
+    dimensions: str
+    sharpness: float
+    noise: float
+    brightness: float
+    contrast: float
+    highlight_clip: float
+    shadow_clip: float
+    dpi: float
+    aspect_ratio: float
+    notes: List[str]
+    fixable_issues: List[str]
+
 
 # Stock photography evaluation prompt
 STOCK_EVALUATION_PROMPT = """You are an expert stock photography reviewer for major agencies such as Shutterstock, Adobe Stock, and Getty Images.
@@ -193,8 +230,15 @@ class StockEvaluation:
     error_message: str = ""
 
 
-def ensure_resolution_metadata(image_path: str):
-    """Force X/Y resolution metadata to 300 DPI for consistent analysis."""
+def ensure_resolution_metadata(image_path: str) -> None:
+    """Force X/Y resolution metadata to 300 DPI for consistent analysis.
+    
+    Args:
+        image_path: Path to image file
+        
+    Note:
+        Sets global _EXIFTOOL_AVAILABLE flag based on exiftool availability
+    """
     global _EXIFTOOL_AVAILABLE
 
     if _EXIFTOOL_AVAILABLE is False:
@@ -210,17 +254,43 @@ def ensure_resolution_metadata(image_path: str):
     ]
 
     try:
-        subprocess.run(command, check=True, capture_output=True)
+        subprocess.run(command, check=True, capture_output=True, timeout=10)
         _EXIFTOOL_AVAILABLE = True
     except FileNotFoundError:
         _EXIFTOOL_AVAILABLE = False
         logger.warning("ExifTool not found; DPI metadata will not be auto-corrected.")
+    except subprocess.TimeoutExpired:
+        logger.warning(f"ExifTool timeout on {image_path}")
     except subprocess.CalledProcessError as exc:
         logger.debug(f"ExifTool failed on {image_path}: {exc}")
 
 
-def analyze_technical_quality(image_path: str) -> Dict:
-    """Analyze technical aspects for stock photography standards"""
+def analyze_technical_quality(image_path: str) -> TechnicalData:
+    """Analyze technical aspects for stock photography standards.
+    
+    Args:
+        image_path: Path to image file
+        
+    Returns:
+        Dict containing:
+            - megapixels (float): Image resolution in MP
+            - dimensions (str): Width x Height
+            - sharpness (float): Laplacian variance score 0-100
+            - noise (float): Estimated noise level
+            - brightness (float): Mean brightness
+            - contrast (float): Standard deviation of brightness
+            - highlight_clip (float): Fraction of clipped highlights
+            - shadow_clip (float): Fraction of clipped shadows
+            - dpi (float): DPI value
+            - aspect_ratio (float): Width/height ratio
+            - notes (List[str]): Technical warnings and recommendations
+            - fixable_issues (List[str]): Issues that can be easily corrected
+            
+    Example:
+        >>> tech = analyze_technical_quality('photo.jpg')
+        >>> if tech['megapixels'] < 4.0:
+        ...     print("Resolution too low for stock")
+    """
     try:
         ensure_resolution_metadata(image_path)
         # Open image
@@ -245,7 +315,7 @@ def analyze_technical_quality(image_path: str) -> Dict:
         sharpness_score = min(100, laplacian_var / 10)
         
         # Noise estimation (standard deviation in flat areas)
-        noise_estimate = float(np.std(gray.astype(np.float64)))
+        noise_estimate = float(np.std(gray.astype(np.float64)))  # type: ignore
         
         # Brightness and contrast
         stats = ImageStat.Stat(img)
@@ -283,30 +353,30 @@ def analyze_technical_quality(image_path: str) -> Dict:
             notes.append(f"✓ Good resolution: {megapixels:.1f}MP")
         
         # Sharpness check
-        if sharpness_score < 30:
+        if sharpness_score < SHARPNESS_CRITICAL:
             notes.append(f"⚠️ SOFT/BLURRY: Sharpness {sharpness_score:.1f}/100")
-        elif sharpness_score < 60:
+        elif sharpness_score < SHARPNESS_OPTIMAL:
             notes.append(f"⚠️ Below optimal sharpness: {sharpness_score:.1f}/100")
         else:
             notes.append(f"✓ Sharp: {sharpness_score:.1f}/100")
         
         # Noise check
-        if noise_estimate > 65:
+        if noise_estimate > NOISE_HIGH:
             notes.append(f"⚠️ HIGH NOISE: {noise_estimate:.1f}")
-        elif noise_estimate > 45:
+        elif noise_estimate > NOISE_MODERATE:
             notes.append(f"⚠️ Moderate noise: {noise_estimate:.1f}")
         
         # Clipping check
-        if highlight_clip > 0.02:
+        if highlight_clip > CLIPPING_THRESHOLD:
             notes.append(f"⚠️ Highlight clipping: {highlight_clip*100:.1f}%")
-        if shadow_clip > 0.02:
+        if shadow_clip > CLIPPING_THRESHOLD:
             notes.append(f"⚠️ Shadow clipping: {shadow_clip*100:.1f}%")
         
         # DPI check
         fixable_issues = []
         if dpi_value < MIN_DPI:
             notes.append(f"⚠️ LOW DPI: {dpi_value} (recommend {MIN_DPI})")
-            if dpi_value >= 240:  # 240 DPI is easily fixable
+            if dpi_value >= DPI_FIXABLE:
                 fixable_issues.append(f"DPI: {dpi_value} → {MIN_DPI} (metadata correction)")
         
         # Aspect ratio check
@@ -331,17 +401,70 @@ def analyze_technical_quality(image_path: str) -> Dict:
             'fixable_issues': fixable_issues
         }
         
+    except (IOError, OSError) as e:
+        logger.error(f"File access error analyzing {image_path}: {e}")
+        return TechnicalData(
+            megapixels=0.0,
+            dimensions='unknown',
+            sharpness=0.0,
+            noise=0.0,
+            brightness=0.0,
+            contrast=0.0,
+            highlight_clip=0.0,
+            shadow_clip=0.0,
+            dpi=0.0,
+            aspect_ratio=0.0,
+            notes=[f"File error: {str(e)}"],
+            fixable_issues=[]
+        )
+    except (cv2.error, ValueError) as e:
+        logger.error(f"Image processing error analyzing {image_path}: {e}")
+        return TechnicalData(
+            megapixels=0.0,
+            dimensions='unknown',
+            sharpness=0.0,
+            noise=0.0,
+            brightness=0.0,
+            contrast=0.0,
+            highlight_clip=0.0,
+            shadow_clip=0.0,
+            dpi=0.0,
+            aspect_ratio=0.0,
+            notes=[f"Processing error: {str(e)}"],
+            fixable_issues=[]
+        )
     except Exception as e:
-        logger.error(f"Error analyzing {image_path}: {e}")
-        return {
-            'megapixels': 0,
-            'dimensions': 'unknown',
-            'notes': [f"Error: {str(e)}"]
-        }
+        logger.error(f"Unexpected error analyzing {image_path}: {e}")
+        return TechnicalData(
+            megapixels=0.0,
+            dimensions='unknown',
+            sharpness=0.0,
+            noise=0.0,
+            brightness=0.0,
+            contrast=0.0,
+            highlight_clip=0.0,
+            shadow_clip=0.0,
+            dpi=0.0,
+            aspect_ratio=0.0,
+            notes=[f"Error: {str(e)}"],
+            fixable_issues=[]
+        )
 
 
-def create_stock_prompt(base_prompt: str, technical_data: Dict) -> str:
-    """Create enhanced prompt with technical context"""
+def create_stock_prompt(base_prompt: str, technical_data: TechnicalData) -> str:
+    """Create enhanced prompt with technical context.
+    
+    Args:
+        base_prompt: Base evaluation prompt template with {technical_context} placeholder
+        technical_data: Technical analysis results from analyze_technical_quality()
+        
+    Returns:
+        Enhanced prompt with technical context inserted
+        
+    Example:
+        >>> tech = analyze_technical_quality('photo.jpg')
+        >>> prompt = create_stock_prompt(STOCK_EVALUATION_PROMPT, tech)
+    """
     context_parts = []
     
     # Resolution info
@@ -386,7 +509,21 @@ def evaluate_image_for_stock(
     prompt: str,
     timeout: int = 300
 ) -> StockEvaluation:
-    """Evaluate a single image for stock photography suitability"""
+    """Evaluate a single image for stock photography suitability.
+    
+    Args:
+        image_path: Path to image file
+        api_url: Ollama API endpoint URL
+        model: Vision model name (e.g., 'qwen3-vl:8b')
+        prompt: Evaluation prompt template
+        timeout: API request timeout in seconds (default: 300)
+        
+    Returns:
+        StockEvaluation with scores, recommendation, and analysis
+        
+    Raises:
+        Does not raise - returns StockEvaluation with error status on failure
+    """
     
     try:
         # Get file info
@@ -471,18 +608,26 @@ def evaluate_image_for_stock(
             issues = scores.get('issues', '')
             
             # If recommendation is MARGINAL and there are only fixable issues, upgrade to MARGINAL-FIXABLE
-            if recommendation == "MARGINAL" and fixable_list:
-                # Check if main issues are fixable (DPI, minor metadata)
+            if recommendation == "MARGINAL" and fixable_list and overall_stock_score >= MIN_FIXABLE_SCORE:
+                # Check if issues contain any unfixable keywords
                 issues_lower = issues.lower()
-                has_only_fixable = (
-                    fixable_list and  # Has fixable issues
-                    overall_stock_score >= 45 and  # Reasonable base score
-                    'resolution' not in issues_lower and  # No resolution problems
-                    'extreme' not in issues_lower and  # No extreme quality issues
-                    'severe' not in issues_lower
+                has_unfixable = any(keyword in issues_lower for keyword in UNFIXABLE_KEYWORDS)
+                
+                # Also verify technical measurements support fixability
+                tech_sharpness = technical_data.get('sharpness', 0)
+                tech_noise = technical_data.get('noise', 0)
+                tech_mp = technical_data.get('megapixels', 0)
+                
+                # Must meet minimum technical standards to be fixable
+                tech_acceptable = (
+                    tech_sharpness >= SHARPNESS_CRITICAL and
+                    tech_noise <= NOISE_HIGH and
+                    tech_mp >= MIN_RESOLUTION_MP
                 )
-                if has_only_fixable:
+                
+                if not has_unfixable and tech_acceptable:
                     recommendation = "MARGINAL-FIXABLE"
+                    logger.info(f"Upgraded {image_path} to MARGINAL-FIXABLE (fixable: {fixable_issues_str})")
             
             return StockEvaluation(
                 file_path=image_path,
@@ -531,8 +676,56 @@ def evaluate_image_for_stock(
                 error_message=error_msg
             )
         
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API request error evaluating {image_path}: {e}")
+        return StockEvaluation(
+            file_path=image_path,
+            commercial_viability=0,
+            technical_quality=0,
+            composition_clarity=0,
+            keyword_potential=0,
+            release_concerns=0,
+            rejection_risks=0,
+            overall_stock_score=0,
+            recommendation="ERROR",
+            primary_category="",
+            suggested_keywords="",
+            issues=f"API error: {str(e)}",
+            strengths="",
+            resolution_mp=0,
+            dimensions="",
+            file_size_mb=0,
+            technical_notes="",
+            fixable_issues="None",
+            status="error",
+            error_message=str(e)
+        )
+    except (IOError, OSError) as e:
+        logger.error(f"File access error evaluating {image_path}: {e}")
+        return StockEvaluation(
+            file_path=image_path,
+            commercial_viability=0,
+            technical_quality=0,
+            composition_clarity=0,
+            keyword_potential=0,
+            release_concerns=0,
+            rejection_risks=0,
+            overall_stock_score=0,
+            recommendation="ERROR",
+            primary_category="",
+            suggested_keywords="",
+            issues=f"File error: {str(e)}",
+            strengths="",
+            resolution_mp=0,
+            dimensions="",
+            file_size_mb=0,
+            technical_notes="",
+            fixable_issues="None",
+            status="error",
+            error_message=str(e)
+        )
     except Exception as e:
-        logger.error(f"Error evaluating {image_path}: {e}")
+        logger.error(f"Unexpected error evaluating {image_path}: {e}")
         return StockEvaluation(
             file_path=image_path,
             commercial_viability=0,
@@ -558,7 +751,18 @@ def evaluate_image_for_stock(
 
 
 def find_images(directory: str, extensions: Optional[List[str]] = None) -> List[str]:
-    """Find all images in directory recursively"""
+    """Find all images in directory recursively.
+    
+    Args:
+        directory: Root directory to search
+        extensions: List of file extensions (default: ['.jpg', '.jpeg', '.png'])
+        
+    Returns:
+        List of absolute paths to image files
+        
+    Note:
+        Skips files with 'original' in the name
+    """
     if extensions is None:
         extensions = ['.jpg', '.jpeg', '.png']
     
@@ -575,8 +779,13 @@ def find_images(directory: str, extensions: Optional[List[str]] = None) -> List[
     return images
 
 
-def save_results_to_csv(results: List[StockEvaluation], output_path: str):
-    """Save evaluation results to CSV"""
+def save_results_to_csv(results: List[StockEvaluation], output_path: str) -> None:
+    """Save evaluation results to CSV.
+    
+    Args:
+        results: List of stock evaluation results
+        output_path: Path to output CSV file
+    """
     fieldnames = [
         'file_path', 'overall_stock_score', 'recommendation', 
         'commercial_viability', 'technical_quality', 'composition_clarity',
@@ -595,8 +804,18 @@ def save_results_to_csv(results: List[StockEvaluation], output_path: str):
     logger.info(f"Results saved to: {output_path}")
 
 
-def print_summary(results: List[StockEvaluation]):
-    """Print summary statistics"""
+def print_summary(results: List[StockEvaluation]) -> None:
+    """Print summary statistics.
+    
+    Args:
+        results: List of stock evaluation results
+        
+    Displays:
+        - Total/successful/failed counts
+        - Average stock score
+        - Recommendation distribution
+        - Resolution status breakdown
+    """
     if not results:
         print("No results to summarize")
         return
@@ -643,7 +862,8 @@ def print_summary(results: List[StockEvaluation]):
         print("\n" + "="*80)
 
 
-def main():
+def main() -> None:
+    """Main entry point for stock photo evaluator CLI."""
     parser = argparse.ArgumentParser(
         description='Evaluate images for stock photography suitability',
         formatter_class=argparse.RawDescriptionHelpFormatter
@@ -727,4 +947,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    context_parts.append("High-end anchor: flawless gallery-level images with clean highlights/shadows and razor-sharp detail should score 90+; explain the elements that justify such a grade.")

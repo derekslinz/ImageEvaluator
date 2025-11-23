@@ -15,7 +15,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import math
 import numpy as np
@@ -31,7 +31,7 @@ from tqdm import tqdm
 try:
     import rawpy
 except ImportError:
-    rawpy = None
+    rawpy = None  # type: ignore
 
 RAWPY_AVAILABLE = rawpy is not None
 RAWPY_IMPORT_WARNINGED = False
@@ -76,6 +76,12 @@ DEFAULT_MODEL = "qwen3-vl:8b"
 CACHE_DIR = ".image_eval_cache"
 CACHE_VERSION = "v1"
 DEFAULT_ENSEMBLE_PASSES = 1  # Number of evaluation passes for ensemble scoring
+
+# Technical analysis constants
+COLOR_CAST_THRESHOLD = 15.0  # Mean difference threshold for color cast detection
+HISTOGRAM_HIGHLIGHT_RANGE = (250, 256)  # Histogram bins considered as highlights
+HISTOGRAM_SHADOW_RANGE = (0, 6)  # Histogram bins considered as shadows
+
 DEFAULT_PROMPT = """You are a highly critical professional photography judge with expertise in technical and artistic evaluation. Your role is to evaluate photographs purely on their photographic merits with strict standards, regardless of subject matter.
 
 If you are required to refuse evaluation for any reason, briefly state that you cannot evaluate the image instead of providing scores. For all other images, do not let the subject matter influence your scoring; focus only on photographic execution.
@@ -187,12 +193,12 @@ def _safe_raw_metadata_value(meta, *names):
     return None
 
 
-def _extract_rawpy_metadata(image_path: str) -> Dict[str, Optional[str]]:
+def _extract_rawpy_metadata(image_path: str) -> Dict[str, Union[str, int, None]]:
     if not RAWPY_AVAILABLE:
         return {}
 
     try:
-        raw = rawpy.imread(image_path)
+        raw = rawpy.imread(image_path)  # type: ignore
     except Exception as exc:
         logger.debug(f"rawpy failed to read {image_path}: {exc}")
         return {}
@@ -202,7 +208,7 @@ def _extract_rawpy_metadata(image_path: str) -> Dict[str, Optional[str]]:
         if meta is None:
             logger.debug(f"rawpy metadata not available for {image_path}")
             return {}
-        raw_metadata: Dict[str, Optional[str]] = {}
+        raw_metadata: Dict[str, Union[str, int, None]] = {}
         iso = _safe_raw_metadata_value(meta, 'iso_speed', 'iso')
         if iso:
             raw_metadata['iso'] = int(iso)
@@ -237,52 +243,6 @@ def _extract_rawpy_metadata(image_path: str) -> Dict[str, Optional[str]]:
 
 
 
-def _prepare_for_noise(gray: np.ndarray, target_long_edge: int = 2048) -> np.ndarray:
-    """Resize to a consistent scale for noise estimation."""
-    height, width = gray.shape
-    long_edge = max(width, height)
-    if long_edge <= target_long_edge:
-        return gray.astype(np.float32)
-    scale = target_long_edge / long_edge
-    new_width = max(1, int(round(width * scale)))
-    new_height = max(1, int(round(height * scale)))
-    resized = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_AREA)
-    return resized.astype(np.float32)
-
-
-def estimate_flat_area_noise(gray: np.ndarray) -> float:
-    """Estimate noise by focusing on flat regions."""
-    gray_f = _prepare_for_noise(gray)
-    blurred = cv2.GaussianBlur(gray_f, (0, 0), sigmaX=1.0, sigmaY=1.0)
-    residual = gray_f - blurred
-
-    gx = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)
-    grad_mag = np.sqrt(gx * gx + gy * gy)
-    edge_thresh = np.percentile(grad_mag, 75)
-    flat_mask = grad_mag < edge_thresh
-
-    brightness_mask = (gray_f > 5) & (gray_f < 250)
-    combined_mask = flat_mask & brightness_mask
-
-    flat_residuals = residual[combined_mask]
-    if flat_residuals.size == 0:
-        flat_residuals = residual.flatten()
-
-    return float(np.std(flat_residuals))
-
-
-def normalize_noise_score(noise_estimate: float, iso: Optional[int] = None) -> float:
-    """Map noise estimate to 0-100 scale, optionally normalizing by ISO."""
-    clipped = max(0.0, min(noise_estimate, 30.0))
-    base_score = (clipped / 30.0) * 100.0
-    if iso and iso > 0:
-        iso_factor = math.sqrt(min(iso, 3200) / 100.0)
-        if iso_factor > 0:
-            base_score = base_score / iso_factor
-    return max(0.0, min(100.0, base_score))
-
-
 @contextmanager
 def open_image_for_analysis(image_path: str):
     ext = Path(image_path).suffix.lower()
@@ -290,7 +250,7 @@ def open_image_for_analysis(image_path: str):
         if not RAWPY_AVAILABLE:
             _warn_rawpy_missing()
             raise RuntimeError("rawpy is required to process RAW files")
-        raw = rawpy.imread(image_path)
+        raw = rawpy.imread(image_path)  # type: ignore
         try:
             rgb = raw.postprocess(
                 use_camera_wb=True,
@@ -329,7 +289,7 @@ def validate_image(image_path: str) -> bool:
             _warn_rawpy_missing()
             return False
         try:
-            raw = rawpy.imread(image_path)
+            raw = rawpy.imread(image_path)  # type: ignore
             raw.close()
             return True
         except Exception as e:
@@ -389,22 +349,30 @@ def validate_score(score_input) -> Optional[int]:
 
 
 def retry_with_backoff(func, max_retries=MAX_RETRIES, base_delay=RETRY_DELAY_BASE):
-    """Retry function with exponential backoff."""
+    """Retry function with exponential backoff, skipping permanent errors."""
+    # Errors that should not be retried (permanent failures)
+    permanent_error_types = (FileNotFoundError, PermissionError, ValueError, TypeError, KeyError)
+    
     for attempt in range(max_retries):
         try:
             return func()
+        except permanent_error_types as e:
+            # Don't retry permanent errors
+            logger.error(f"Permanent error, not retrying: {e}")
+            raise
         except requests.exceptions.RequestException as e:
             if attempt == max_retries - 1:
                 raise
+            # Exponential backoff with current delay calculation
             delay = base_delay * (2 ** attempt)
             logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}")
             time.sleep(delay)
     return None
 
 
-def extract_exif_metadata(image_path: str) -> Dict[str, Optional[str]]:
+def extract_exif_metadata(image_path: str) -> Dict[str, Union[str, int, None]]:
     """Extract technical metadata from EXIF data."""
-    metadata: Dict[str, Optional[str]] = {
+    metadata: Dict[str, Union[str, int, None]] = {
         'iso': None,
         'aperture': None,
         'shutter_speed': None,
@@ -714,16 +682,17 @@ def classify_image_context(image_path: str, encoded_image: str, ollama_host_url:
         
         # Validate against known contexts
         if context_label in TECH_PROFILES:
-            logger.debug(f"Classified {image_path} as: {context_label}")
+            logger.info(f"Context classification: {context_label} (exact match) for {image_path}")
             return context_label
         
         # Try to extract valid context from response
         for known_context in TECH_PROFILES.keys():
             if known_context in context_label:
-                logger.debug(f"Extracted context {known_context} from response: {context_label}")
+                logger.info(f"Context classification: {known_context} (extracted from '{context_label}') for {image_path}")
                 return known_context
         
-        logger.warning(f"Unknown context '{context_label}' for {image_path}, defaulting to 'stock_product'")
+        logger.warning(f"Context classification failed: unknown '{context_label}' for {image_path}. "
+                      f"Defaulting to 'stock_product' (most restrictive). Consider manual context override.")
         return 'stock_product'
         
     except Exception as e:
@@ -744,6 +713,7 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
         'noise_sigma': 0.0,   # high-frequency noise in flat areas, normalized [0,1]
         'noise_score': 0.0,   # 0–100 severity
         'noise': 0.0,         # alias of noise_score for backward compatibility
+        'status': 'success',  # 'success' or 'error' to indicate analysis status
     }
     
     # Get context profile
@@ -761,40 +731,52 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
             metrics['contrast'] = float(sum(stat.stddev) / len(stat.stddev))
 
             # --- Histogram clipping (highlights/shadows) ---
+            # Use max per channel because a single clipped channel is problematic
             histogram = img_rgb.histogram()
             total_pixels = img_rgb.size[0] * img_rgb.size[1]
 
-            highlights_pct = 0.0
-            shadows_pct = 0.0
+            highlights_per_channel = []
+            shadows_per_channel = []
 
             for channel_idx in range(3):  # R, G, B
                 channel_hist = histogram[channel_idx * 256:(channel_idx + 1) * 256]
-                highlight_pixels = sum(channel_hist[250:256])
-                shadow_pixels = sum(channel_hist[0:6])
+                highlight_pixels = sum(channel_hist[HISTOGRAM_HIGHLIGHT_RANGE[0]:HISTOGRAM_HIGHLIGHT_RANGE[1]])
+                shadow_pixels = sum(channel_hist[HISTOGRAM_SHADOW_RANGE[0]:HISTOGRAM_SHADOW_RANGE[1]])
 
-                highlights_pct += (highlight_pixels / total_pixels) * 100.0
-                shadows_pct += (shadow_pixels / total_pixels) * 100.0
+                highlights_per_channel.append((highlight_pixels / total_pixels) * 100.0)
+                shadows_per_channel.append((shadow_pixels / total_pixels) * 100.0)
 
-            metrics['histogram_clipping_highlights'] = highlights_pct / 3.0
-            metrics['histogram_clipping_shadows'] = shadows_pct / 3.0
+            # Use max to catch worst-case single-channel clipping
+            metrics['histogram_clipping_highlights'] = max(highlights_per_channel)
+            metrics['histogram_clipping_shadows'] = max(shadows_per_channel)
 
             # --- Color cast detection (global) ---
             r_mean, g_mean, b_mean = stat.mean[:3]
             max_diff = max(abs(r_mean - g_mean), abs(g_mean - b_mean), abs(r_mean - b_mean))
             # We only set the label here; the profile decides how/if to penalize.
-            if max_diff > 15:
-                if r_mean > g_mean and r_mean > b_mean:
+            if max_diff > COLOR_CAST_THRESHOLD:
+                # Identify dominant channel with sufficient margin (>5 units)
+                if r_mean > g_mean + 5 and r_mean > b_mean + 5:
                     metrics['color_cast'] = 'warm/red'
-                elif b_mean > r_mean and b_mean > g_mean:
+                elif b_mean > r_mean + 5 and b_mean > g_mean + 5:
                     metrics['color_cast'] = 'cool/blue'
-                elif g_mean > r_mean and g_mean > b_mean:
+                elif g_mean > r_mean + 5 and g_mean > b_mean + 5:
                     metrics['color_cast'] = 'green'
+                else:
+                    # max_diff > threshold but no clear dominant channel
+                    metrics['color_cast'] = 'mixed'
 
-            # --- Sharpness via Laplacian variance ---
+            # --- Sharpness via Laplacian variance (scale-normalized) ---
             img_gray = img_rgb.convert('L')
             gray_array = np.array(img_gray)
             laplacian_var = cv2.Laplacian(gray_array, cv2.CV_64F).var()
-            metrics['sharpness'] = float(laplacian_var)
+            
+            # Scale-normalize: adjust for image resolution
+            # Larger images naturally have higher variance, normalize to 1MP baseline
+            h, w = gray_array.shape
+            mp = (h * w) / 1_000_000
+            scale_factor = np.sqrt(max(mp, 0.1))  # Avoid division by zero
+            metrics['sharpness'] = float(laplacian_var / scale_factor)
 
             # --- Camera/ISO-agnostic noise estimation ---
             # 1) Standardize size
@@ -838,12 +820,16 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
             final_mask = flat_mask & luminance_mask
             flat_residuals = residual[final_mask]
 
-            if flat_residuals.size == 0:
+            # Fallback: need at least 1% of pixels for reliable noise estimate
+            min_pixels = int(0.01 * residual.size)
+            if flat_residuals.size < min_pixels:
+                # If too few flat pixels, use full image but log it
                 flat_residuals = residual.flatten()
+                logger.debug(f"Noise estimation using full image for {image_path} (insufficient flat regions)")
 
             # Robust sigma via MAD
-            med = float(np.median(flat_residuals))
-            mad = float(np.median(np.abs(flat_residuals - med)))
+            med = float(np.median(flat_residuals))  # type: ignore
+            mad = float(np.median(np.abs(flat_residuals - med)))  # type: ignore
             if mad < 1e-6:
                 sigma_noise = 0.0
             else:
@@ -866,6 +852,7 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
     
     except Exception as e:
         logger.debug(f"Could not analyze technical metrics for {image_path}: {e}")
+        metrics['status'] = 'error'
     
     return metrics
 
@@ -939,6 +926,7 @@ def compute_post_process_potential(technical_metrics: Dict, context: str = "stoc
         base_score -= 10
     elif clipping < profile["clip_bonus_max"]:
         base_score += 5
+    # else: neutral zone (between clip_bonus_max and clip_penalty_mid) - no adjustment
 
     # Noise contribution
     noise_score = float(technical_metrics.get('noise_score', 0.0))
@@ -1536,15 +1524,28 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
     # Step 2: Extract EXIF and technical metrics with context
     exif_data = extract_exif_metadata(image_path)
     
-    # Convert ISO from string to int if needed
+    # Convert ISO from string to int if needed (handle various formats)
     iso_value = exif_data.get('iso')
     if isinstance(iso_value, str):
         try:
-            iso_value = int(iso_value.replace('ISO', '').strip())
+            # Handle formats: "ISO 1600", "1600", "1,600", "1600/3200" (dual ISO)
+            iso_str = iso_value.replace('ISO', '').replace(',', '').strip()
+            # For dual ISO, take the first value
+            if '/' in iso_str:
+                iso_str = iso_str.split('/')[0]
+            iso_value = int(float(iso_str))  # Handle "100.0" format
         except (ValueError, AttributeError):
+            logger.debug(f"Could not parse ISO value: {iso_value}")
             iso_value = None
+    elif isinstance(iso_value, float):
+        iso_value = int(iso_value)
     
     technical_metrics = analyze_image_technical(image_path, iso_value, context=image_context)
+    
+    # Check if technical analysis succeeded
+    if technical_metrics.get('status') == 'error':
+        logger.warning(f"Technical analysis failed for {image_path}, using default metrics")
+    
     technical_warnings = assess_technical_metrics(technical_metrics, context=image_context)
     technical_metrics['warnings'] = technical_warnings
     technical_metrics['post_process_potential'] = compute_post_process_potential(technical_metrics, context=image_context)
@@ -1652,9 +1653,9 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
         fieldnames = [
             'file_path', 'overall_score', 'technical_score', 'composition_score',
             'lighting_score', 'creativity_score', 'title', 'description',
-            'keywords', 'status', 'sharpness', 'brightness', 'contrast',
+            'keywords', 'status', 'context', 'context_profile', 'sharpness', 'brightness', 'contrast',
             'histogram_clipping_highlights', 'histogram_clipping_shadows',
-            'color_cast', 'technical_warnings', 'post_process_potential'
+            'color_cast', 'noise_sigma', 'noise_score', 'technical_warnings', 'post_process_potential'
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
@@ -1674,12 +1675,16 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'title': metadata.get('title', ''),
                     'description': metadata.get('description', ''),
                     'keywords': metadata.get('keywords', ''),
+                    'context': technical_metrics.get('context', ''),
+                    'context_profile': technical_metrics.get('context_profile', ''),
                     'sharpness': technical_metrics.get('sharpness', ''),
                     'brightness': technical_metrics.get('brightness', ''),
                     'contrast': technical_metrics.get('contrast', ''),
                     'histogram_clipping_highlights': technical_metrics.get('histogram_clipping_highlights', ''),
                     'histogram_clipping_shadows': technical_metrics.get('histogram_clipping_shadows', ''),
                     'color_cast': technical_metrics.get('color_cast', ''),
+                    'noise_sigma': technical_metrics.get('noise_sigma', ''),
+                    'noise_score': technical_metrics.get('noise_score', ''),
                     'technical_warnings': warnings_str,
                     'post_process_potential': metadata.get('post_process_potential', ''),
                     'status': 'success'
@@ -1696,12 +1701,16 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'description': '',
                     'keywords': '',
                     'status': 'failed',
+                    'context': '',
+                    'context_profile': '',
                     'sharpness': '',
                     'brightness': '',
                     'contrast': '',
                     'histogram_clipping_highlights': '',
                     'histogram_clipping_shadows': '',
                     'color_cast': '',
+                    'noise_sigma': '',
+                    'noise_score': '',
                     'technical_warnings': '',
                     'post_process_potential': ''
                 })
