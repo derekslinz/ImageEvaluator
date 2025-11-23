@@ -543,15 +543,15 @@ def create_enhanced_prompt(base_prompt: str, exif_data: Dict, technical_metrics:
     
     # Add technical analysis context
     highlights = technical_metrics.get('histogram_clipping_highlights')
-    if highlights is not None and highlights > 0:
+    if highlights is not None and highlights > 12:
         context_parts.append(f"Highlight clipping: {highlights:.1f}%")
 
     shadows = technical_metrics.get('histogram_clipping_shadows')
-    if shadows is not None and shadows > 0:
+    if shadows is not None and shadows > 12:
         context_parts.append(f"Shadow clipping: {shadows:.1f}%")
 
     sharpness = technical_metrics.get('sharpness')
-    if sharpness is not None:
+    if sharpness is not None and sharpness < 35:
         context_parts.append(f"Sharpness metric: {sharpness:.1f}")
 
     color_cast = technical_metrics.get('color_cast')
