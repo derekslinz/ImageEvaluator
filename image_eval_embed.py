@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import math
 import numpy as np
 import cv2
 import piexif
@@ -235,6 +236,53 @@ def _extract_rawpy_metadata(image_path: str) -> Dict[str, Optional[str]]:
         raw.close()
 
 
+
+def _prepare_for_noise(gray: np.ndarray, target_long_edge: int = 2048) -> np.ndarray:
+    """Resize to a consistent scale for noise estimation."""
+    height, width = gray.shape
+    long_edge = max(width, height)
+    if long_edge <= target_long_edge:
+        return gray.astype(np.float32)
+    scale = target_long_edge / long_edge
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+    resized = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    return resized.astype(np.float32)
+
+
+def estimate_flat_area_noise(gray: np.ndarray) -> float:
+    """Estimate noise by focusing on flat regions."""
+    gray_f = _prepare_for_noise(gray)
+    blurred = cv2.GaussianBlur(gray_f, (0, 0), sigmaX=1.0, sigmaY=1.0)
+    residual = gray_f - blurred
+
+    gx = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(gx * gx + gy * gy)
+    edge_thresh = np.percentile(grad_mag, 75)
+    flat_mask = grad_mag < edge_thresh
+
+    brightness_mask = (gray_f > 5) & (gray_f < 250)
+    combined_mask = flat_mask & brightness_mask
+
+    flat_residuals = residual[combined_mask]
+    if flat_residuals.size == 0:
+        flat_residuals = residual.flatten()
+
+    return float(np.std(flat_residuals))
+
+
+def normalize_noise_score(noise_estimate: float, iso: Optional[int] = None) -> float:
+    """Map noise estimate to 0-100 scale, optionally normalizing by ISO."""
+    clipped = max(0.0, min(noise_estimate, 30.0))
+    base_score = (clipped / 30.0) * 100.0
+    if iso and iso > 0:
+        iso_factor = math.sqrt(min(iso, 3200) / 100.0)
+        if iso_factor > 0:
+            base_score = base_score / iso_factor
+    return max(0.0, min(100.0, base_score))
+
+
 @contextmanager
 def open_image_for_analysis(image_path: str):
     ext = Path(image_path).suffix.lower()
@@ -414,41 +462,326 @@ def extract_exif_metadata(image_path: str) -> Dict[str, Optional[str]]:
     return metadata
 
 
-def analyze_image_technical(image_path: str) -> Dict:
-    """Analyze image for technical quality metrics."""
+# Context-aware technical evaluation profiles
+# Each profile defines numeric thresholds for warnings and post-processing potential scoring
+TECH_PROFILES = {
+    # 1. Stock / product / catalog: strict, neutral, technically clean
+    "stock_product": {
+        "name": "Stock/Product Photography",
+        "post_base": 70,
+        "sharpness_crit": 30.0,
+        "sharpness_soft": 60.0,
+        "sharpness_post_heavy": 35.0,
+        "sharpness_post_soft": 60.0,
+        "clip_warn": 5.0,
+        "clip_penalty_mid": 6.0,
+        "clip_penalty_high": 12.0,
+        "clip_bonus_max": 0.5,
+        "color_cast_threshold": 15.0,
+        "color_cast_penalty": 8,
+        "noise_warn": 30.0,
+        "noise_high": 60.0,
+        "noise_penalty_mid": 8,
+        "noise_penalty_high": 18,
+        "brightness_range": (200, 245),
+    },
+    
+    # 2. Macro / food
+    "macro_food": {
+        "name": "Macro/Food Photography",
+        "post_base": 70,
+        "sharpness_crit": 35.0,
+        "sharpness_soft": 65.0,
+        "sharpness_post_heavy": 40.0,
+        "sharpness_post_soft": 65.0,
+        "clip_warn": 3.0,
+        "clip_penalty_mid": 5.0,
+        "clip_penalty_high": 10.0,
+        "clip_bonus_max": 0.5,
+        "color_cast_threshold": 18.0,
+        "color_cast_penalty": 6,
+        "noise_warn": 30.0,
+        "noise_high": 55.0,
+        "noise_penalty_mid": 8,
+        "noise_penalty_high": 16,
+        "brightness_range": (180, 240),
+    },
+    
+    # 3. Portrait, neutral/standard
+    "portrait_neutral": {
+        "name": "Portrait (Neutral/Studio)",
+        "post_base": 70,
+        "sharpness_crit": 25.0,
+        "sharpness_soft": 55.0,
+        "sharpness_post_heavy": 30.0,
+        "sharpness_post_soft": 55.0,
+        "clip_warn": 6.0,
+        "clip_penalty_mid": 10.0,
+        "clip_penalty_high": 18.0,
+        "clip_bonus_max": 1.0,
+        "color_cast_threshold": 12.0,
+        "color_cast_penalty": 10,
+        "noise_warn": 35.0,
+        "noise_high": 65.0,
+        "noise_penalty_mid": 8,
+        "noise_penalty_high": 16,
+        "brightness_range": (100, 200),
+    },
+    
+    # 4. Portrait, high-key
+    "portrait_highkey": {
+        "name": "High-Key Portrait",
+        "post_base": 70,
+        "sharpness_crit": 20.0,
+        "sharpness_soft": 50.0,
+        "sharpness_post_heavy": 25.0,
+        "sharpness_post_soft": 50.0,
+        "clip_warn": 12.0,
+        "clip_penalty_mid": 25.0,
+        "clip_penalty_high": 40.0,
+        "clip_bonus_max": 2.0,
+        "color_cast_threshold": 18.0,
+        "color_cast_penalty": 4,
+        "noise_warn": 40.0,
+        "noise_high": 70.0,
+        "noise_penalty_mid": 6,
+        "noise_penalty_high": 12,
+        "brightness_range": (180, 255),
+    },
+    
+    # 5. Landscape / nature
+    "landscape": {
+        "name": "Landscape/Nature",
+        "post_base": 70,
+        "sharpness_crit": 30.0,
+        "sharpness_soft": 60.0,
+        "sharpness_post_heavy": 35.0,
+        "sharpness_post_soft": 60.0,
+        "clip_warn": 4.0,
+        "clip_penalty_mid": 8.0,
+        "clip_penalty_high": 15.0,
+        "clip_bonus_max": 0.5,
+        "color_cast_threshold": 18.0,
+        "color_cast_penalty": 5,
+        "noise_warn": 30.0,
+        "noise_high": 60.0,
+        "noise_penalty_mid": 8,
+        "noise_penalty_high": 16,
+        "brightness_range": (100, 200),
+    },
+    
+    # 6. Street / documentary
+    "street_documentary": {
+        "name": "Street/Documentary",
+        "post_base": 70,
+        "sharpness_crit": 20.0,
+        "sharpness_soft": 45.0,
+        "sharpness_post_heavy": 25.0,
+        "sharpness_post_soft": 45.0,
+        "clip_warn": 10.0,
+        "clip_penalty_mid": 25.0,
+        "clip_penalty_high": 45.0,
+        "clip_bonus_max": 2.0,
+        "color_cast_threshold": 22.0,
+        "color_cast_penalty": 4,
+        "noise_warn": 40.0,
+        "noise_high": 75.0,
+        "noise_penalty_mid": 4,
+        "noise_penalty_high": 10,
+        "brightness_range": (50, 200),
+    },
+    
+    # 7. Sports / action / wildlife
+    "sports_action": {
+        "name": "Sports/Action/Wildlife",
+        "post_base": 70,
+        "sharpness_crit": 25.0,
+        "sharpness_soft": 55.0,
+        "sharpness_post_heavy": 30.0,
+        "sharpness_post_soft": 55.0,
+        "clip_warn": 8.0,
+        "clip_penalty_mid": 20.0,
+        "clip_penalty_high": 35.0,
+        "clip_bonus_max": 1.0,
+        "color_cast_threshold": 20.0,
+        "color_cast_penalty": 6,
+        "noise_warn": 40.0,
+        "noise_high": 70.0,
+        "noise_penalty_mid": 6,
+        "noise_penalty_high": 12,
+        "brightness_range": (80, 220),
+    },
+    
+    # 8. Concert / night / city at night
+    "concert_night": {
+        "name": "Concert/Night/Low-Light",
+        "post_base": 70,
+        "sharpness_crit": 15.0,
+        "sharpness_soft": 40.0,
+        "sharpness_post_heavy": 20.0,
+        "sharpness_post_soft": 40.0,
+        "clip_warn": 20.0,
+        "clip_penalty_mid": 40.0,
+        "clip_penalty_high": 70.0,
+        "clip_bonus_max": 3.0,
+        "color_cast_threshold": 30.0,
+        "color_cast_penalty": 0,
+        "noise_warn": 50.0,
+        "noise_high": 80.0,
+        "noise_penalty_mid": 4,
+        "noise_penalty_high": 10,
+        "brightness_range": (20, 120),
+    },
+    
+    # 9. Architecture / real estate
+    "architecture_realestate": {
+        "name": "Architecture/Real Estate",
+        "post_base": 70,
+        "sharpness_crit": 30.0,
+        "sharpness_soft": 65.0,
+        "sharpness_post_heavy": 35.0,
+        "sharpness_post_soft": 65.0,
+        "clip_warn": 4.0,
+        "clip_penalty_mid": 8.0,
+        "clip_penalty_high": 15.0,
+        "clip_bonus_max": 0.5,
+        "color_cast_threshold": 15.0,
+        "color_cast_penalty": 8,
+        "noise_warn": 30.0,
+        "noise_high": 55.0,
+        "noise_penalty_mid": 8,
+        "noise_penalty_high": 18,
+        "brightness_range": (120, 220),
+    },
+    
+    # 10. Fine-art / experimental / ICM
+    "fineart_creative": {
+        "name": "Fine Art/Creative/Experimental",
+        "post_base": 70,
+        "sharpness_crit": 10.0,
+        "sharpness_soft": 25.0,
+        "sharpness_post_heavy": 15.0,
+        "sharpness_post_soft": 25.0,
+        "clip_warn": 25.0,
+        "clip_penalty_mid": 60.0,
+        "clip_penalty_high": 90.0,
+        "clip_bonus_max": 5.0,
+        "color_cast_threshold": 25.0,
+        "color_cast_penalty": 0,
+        "noise_warn": 60.0,
+        "noise_high": 90.0,
+        "noise_penalty_mid": 2,
+        "noise_penalty_high": 6,
+        "brightness_range": (0, 255),
+    },
+}
+
+# Lightweight classification prompt for 10 contexts
+IMAGE_CONTEXT_CLASSIFIER_PROMPT = """Analyze this image and classify it into ONE of these photography contexts:
+
+1. stock_product - clean product/catalog photography with neutral background
+2. macro_food - close-up food, macro photography with fine detail
+3. portrait_neutral - standard portrait with controlled lighting
+4. portrait_highkey - bright, airy portrait with intentional highlight blowout
+5. landscape - nature, outdoor scenery, wide vistas
+6. street_documentary - candid, street photography, documentary style
+7. sports_action - sports, action, wildlife, fast motion
+8. concert_night - night photography, concerts, city at night, low-light
+9. architecture_realestate - buildings, interiors, real estate
+10. fineart_creative - experimental, abstract, ICM, intentionally unconventional
+
+Respond with ONLY the context name, nothing else."""
+
+
+def classify_image_context(image_path: str, encoded_image: str, ollama_host_url: str, model: str) -> str:
+    """Quickly classify image context using vision model."""
+    try:
+        payload = {
+            "model": model,
+            "stream": False,
+            "images": [encoded_image],
+            "prompt": IMAGE_CONTEXT_CLASSIFIER_PROMPT,
+            "options": {
+                "temperature": 0.1,
+                "num_predict": 30  # Short response expected
+            }
+        }
+        
+        response = requests.post(ollama_host_url, json=payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        context_label = result.get('response', '').strip().lower()
+        
+        # Validate against known contexts
+        if context_label in TECH_PROFILES:
+            logger.debug(f"Classified {image_path} as: {context_label}")
+            return context_label
+        
+        # Try to extract valid context from response
+        for known_context in TECH_PROFILES.keys():
+            if known_context in context_label:
+                logger.debug(f"Extracted context {known_context} from response: {context_label}")
+                return known_context
+        
+        logger.warning(f"Unknown context '{context_label}' for {image_path}, defaulting to 'stock_product'")
+        return 'stock_product'
+        
+    except Exception as e:
+        logger.warning(f"Context classification failed for {image_path}: {e}, defaulting to 'stock_product'")
+        return 'stock_product'
+
+
+def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, context: str = 'stock_product') -> Dict:
+    """Analyze image for technical quality metrics with camera/ISO-agnostic noise estimation."""
     metrics = {
-        'sharpness': 0,
-        'brightness': 0,
-        'contrast': 0,
-        'histogram_clipping_highlights': 0,
-        'histogram_clipping_shadows': 0,
-        'color_cast': 'neutral'
+        'sharpness': 0.0,
+        'brightness': 0.0,
+        'contrast': 0.0,
+        'histogram_clipping_highlights': 0.0,
+        'histogram_clipping_shadows': 0.0,
+        'color_cast': 'neutral',
+        'context': context,
+        'noise_sigma': 0.0,   # high-frequency noise in flat areas, normalized [0,1]
+        'noise_score': 0.0,   # 0–100 severity
+        'noise': 0.0,         # alias of noise_score for backward compatibility
     }
+    
+    # Get context profile
+    profile = TECH_PROFILES.get(context, TECH_PROFILES['stock_product'])
+    metrics['context_profile'] = profile['name']
     
     try:
         # Read image with PIL (or rawpy) for stats
         with open_image_for_analysis(image_path) as img:
             img_rgb = img if img.mode == 'RGB' else img.convert('RGB')
+            
+            # --- Brightness / contrast ---
             stat = ImageStat.Stat(img_rgb)
-            metrics['brightness'] = sum(stat.mean) / len(stat.mean)
-            metrics['contrast'] = sum(stat.stddev) / len(stat.stddev)
+            metrics['brightness'] = float(sum(stat.mean) / len(stat.mean))
+            metrics['contrast'] = float(sum(stat.stddev) / len(stat.stddev))
 
+            # --- Histogram clipping (highlights/shadows) ---
             histogram = img_rgb.histogram()
             total_pixels = img_rgb.size[0] * img_rgb.size[1]
+
+            highlights_pct = 0.0
+            shadows_pct = 0.0
 
             for channel_idx in range(3):  # R, G, B
                 channel_hist = histogram[channel_idx * 256:(channel_idx + 1) * 256]
                 highlight_pixels = sum(channel_hist[250:256])
-                metrics['histogram_clipping_highlights'] += (highlight_pixels / total_pixels) * 100
-
                 shadow_pixels = sum(channel_hist[0:6])
-                metrics['histogram_clipping_shadows'] += (shadow_pixels / total_pixels) * 100
 
-            metrics['histogram_clipping_highlights'] /= 3
-            metrics['histogram_clipping_shadows'] /= 3
+                highlights_pct += (highlight_pixels / total_pixels) * 100.0
+                shadows_pct += (shadow_pixels / total_pixels) * 100.0
 
+            metrics['histogram_clipping_highlights'] = highlights_pct / 3.0
+            metrics['histogram_clipping_shadows'] = shadows_pct / 3.0
+
+            # --- Color cast detection (global) ---
             r_mean, g_mean, b_mean = stat.mean[:3]
             max_diff = max(abs(r_mean - g_mean), abs(g_mean - b_mean), abs(r_mean - b_mean))
+            # We only set the label here; the profile decides how/if to penalize.
             if max_diff > 15:
                 if r_mean > g_mean and r_mean > b_mean:
                     metrics['color_cast'] = 'warm/red'
@@ -457,10 +790,79 @@ def analyze_image_technical(image_path: str) -> Dict:
                 elif g_mean > r_mean and g_mean > b_mean:
                     metrics['color_cast'] = 'green'
 
+            # --- Sharpness via Laplacian variance ---
             img_gray = img_rgb.convert('L')
             gray_array = np.array(img_gray)
             laplacian_var = cv2.Laplacian(gray_array, cv2.CV_64F).var()
-            metrics['sharpness'] = laplacian_var
+            metrics['sharpness'] = float(laplacian_var)
+
+            # --- Camera/ISO-agnostic noise estimation ---
+            # 1) Standardize size
+            h, w = gray_array.shape
+            target_long = 2048
+            scale = target_long / float(max(h, w))
+            if scale < 1.0:
+                gray_small = cv2.resize(
+                    gray_array,
+                    dsize=None,
+                    fx=scale,
+                    fy=scale,
+                    interpolation=cv2.INTER_AREA,
+                )
+            else:
+                gray_small = gray_array
+
+            # 2) Normalize to [0,1]
+            gray_f = gray_small.astype(np.float32)
+            max_val = gray_f.max()
+            if max_val > 1.5:  # assume 8-bit-equivalent
+                gray_f /= 255.0
+            elif max_val > 0:  # already 0–1
+                gray_f /= max_val  # safety normalization on odd inputs
+
+            # 3) High-frequency residual
+            blurred = cv2.GaussianBlur(gray_f, (0, 0), sigmaX=1.0, sigmaY=1.0)
+            residual = gray_f - blurred
+
+            # 4) Mask to flat regions (avoid edges and extremes)
+            gx = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)
+            grad_mag = np.sqrt(gx**2 + gy**2)
+
+            edge_thresh = np.percentile(grad_mag, 75.0)
+            flat_mask = grad_mag < edge_thresh
+
+            p_low, p_high = np.percentile(gray_f, [5.0, 95.0])
+            luminance_mask = (gray_f > p_low) & (gray_f < p_high)
+
+            final_mask = flat_mask & luminance_mask
+            flat_residuals = residual[final_mask]
+
+            if flat_residuals.size == 0:
+                flat_residuals = residual.flatten()
+
+            # Robust sigma via MAD
+            med = float(np.median(flat_residuals))
+            mad = float(np.median(np.abs(flat_residuals - med)))
+            if mad < 1e-6:
+                sigma_noise = 0.0
+            else:
+                sigma_noise = 1.4826 * mad  # approx std for Gaussian
+
+            # 5) Normalize by effective dynamic range
+            p1, p99 = np.percentile(gray_f, [1.0, 99.0])
+            dynamic_range = max(float(p99 - p1), 1e-6)
+            relative_noise = sigma_noise / dynamic_range
+
+            # 6) Map to 0–100 severity score
+            REL_NOISE_MIN = 0.002
+            REL_NOISE_MAX = 0.04
+            rn_clipped = min(max(relative_noise, REL_NOISE_MIN), REL_NOISE_MAX)
+            noise_score = (rn_clipped - REL_NOISE_MIN) / (REL_NOISE_MAX - REL_NOISE_MIN) * 100.0
+
+            metrics['noise_sigma'] = float(sigma_noise)
+            metrics['noise_score'] = float(noise_score)
+            metrics['noise'] = float(noise_score)  # backward-compatible alias
     
     except Exception as e:
         logger.debug(f"Could not analyze technical metrics for {image_path}: {e}")
@@ -468,72 +870,118 @@ def analyze_image_technical(image_path: str) -> Dict:
     return metrics
 
 
-def assess_technical_metrics(technical_metrics: Dict) -> List[str]:
-    """Generate human-readable warnings based on measured metrics."""
-    warnings = []
+def get_profile(context: str) -> Dict:
+    """Retrieve technical profile for a given context, with fallback."""
+    return TECH_PROFILES.get(context, TECH_PROFILES["stock_product"])
+
+
+def assess_technical_metrics(technical_metrics: Dict, context: str = "stock_product") -> List[str]:
+    """Generate human-readable warnings based on measured metrics and context."""
+    profile = get_profile(context)
+    warnings: List[str] = []
+
+    # Sharpness
     sharpness = technical_metrics.get('sharpness')
     if sharpness is not None:
-        if sharpness < 30:
+        if sharpness < profile["sharpness_crit"]:
             warnings.append(f"Sharpness critically low ({sharpness:.1f})")
-        elif sharpness < 60:
+        elif sharpness < profile["sharpness_soft"]:
             warnings.append(f"Lower sharpness ({sharpness:.1f}) may impact detail")
 
-    highlights = technical_metrics.get('histogram_clipping_highlights', 0)
-    if highlights > 5:
+    # Highlight and shadow clipping
+    highlights = float(technical_metrics.get('histogram_clipping_highlights', 0.0))
+    shadows = float(technical_metrics.get('histogram_clipping_shadows', 0.0))
+
+    if highlights > profile["clip_warn"]:
         warnings.append(f"Highlight clipping {highlights:.1f}% reduces tonal range")
 
-    shadows = technical_metrics.get('histogram_clipping_shadows', 0)
-    if shadows > 5:
+    if shadows > profile["clip_warn"]:
         warnings.append(f"Shadow clipping {shadows:.1f}% removes shadow detail")
 
+    # Color cast (respect profile penalties)
     color_cast = technical_metrics.get('color_cast', 'neutral')
-    if color_cast != 'neutral':
+    if color_cast != 'neutral' and profile["color_cast_penalty"] > 0:
         warnings.append(f"Color cast detected: {color_cast}")
+
+    # Noise (0–100 severity)
+    noise_score = float(technical_metrics.get('noise_score', 0.0))
+    if noise_score > profile["noise_high"]:
+        warnings.append(f"High noise level (score {noise_score:.1f}/100)")
+    elif noise_score > profile["noise_warn"]:
+        warnings.append(f"Elevated noise (score {noise_score:.1f}/100)")
 
     return warnings
 
 
-def compute_post_process_potential(technical_metrics: Dict) -> int:
-    """Estimate how much post-processing can improve this image."""
-    base_score = 70
+def compute_post_process_potential(technical_metrics: Dict, context: str = "stock_product") -> int:
+    """Estimate how much post-processing can improve this image (0–100)."""
+    profile = get_profile(context)
+    base_score = float(profile["post_base"])
+
+    # Sharpness contribution
     sharpness = technical_metrics.get('sharpness')
     if sharpness is not None:
-        if sharpness < 35:
+        if sharpness < profile["sharpness_post_heavy"]:
             base_score -= 25
-        elif sharpness < 60:
+        elif sharpness < profile["sharpness_post_soft"]:
             base_score -= 10
         else:
             base_score += 5
 
-    highlights = technical_metrics.get('histogram_clipping_highlights', 0)
-    shadows = technical_metrics.get('histogram_clipping_shadows', 0)
+    # Clipping contribution
+    highlights = float(technical_metrics.get('histogram_clipping_highlights', 0.0))
+    shadows = float(technical_metrics.get('histogram_clipping_shadows', 0.0))
     clipping = max(highlights, shadows)
-    if clipping > 12:
+
+    if clipping > profile["clip_penalty_high"]:
         base_score -= 20
-    elif clipping > 6:
+    elif clipping > profile["clip_penalty_mid"]:
         base_score -= 10
-    elif clipping == 0:
+    elif clipping < profile["clip_bonus_max"]:
         base_score += 5
 
+    # Noise contribution
+    noise_score = float(technical_metrics.get('noise_score', 0.0))
+    if noise_score > profile["noise_high"]:
+        base_score -= profile["noise_penalty_high"]
+    elif noise_score > profile["noise_warn"]:
+        base_score -= profile["noise_penalty_mid"]
+
+    # Color cast contribution
     color_cast = technical_metrics.get('color_cast', 'neutral')
     if color_cast != 'neutral':
-        base_score -= 8
+        base_score -= profile["color_cast_penalty"]
 
-    post_score = max(0, min(100, int(base_score)))
+    post_score = max(0, min(100, int(round(base_score))))
     return post_score
 
 
 def create_enhanced_prompt(base_prompt: str, exif_data: Dict, technical_metrics: Dict) -> str:
-    """Enhance prompt with technical context from image analysis."""
+    """Enhance prompt with technical context from image analysis, including context awareness."""
     context_parts = []
+    
+    # Add image context classification
+    image_context = technical_metrics.get('context', 'stock_product')
+    context_profile_name = technical_metrics.get('context_profile', 'Stock/Product Photography')
+    context_parts.append(f"IMAGE CONTEXT: {context_profile_name}")
+    
+    profile = get_profile(image_context)
+    context_parts.append(f"Expected brightness: {profile['brightness_range'][0]}-{profile['brightness_range'][1]}")
+    context_parts.append(f"Sharpness thresholds: critical<{profile['sharpness_crit']}, soft<{profile['sharpness_soft']}")
+    context_parts.append(f"Clipping tolerance: warn>{profile['clip_warn']}%, penalty>{profile['clip_penalty_mid']}%")
+    context_parts.append(f"Color cast sensitivity: {profile['color_cast_penalty']} point penalty if detected")
     
     # Add EXIF context
     if exif_data.get('iso'):
         iso_val = exif_data['iso']
-        if iso_val > 3200:
+        if isinstance(iso_val, str):
+            context_parts.append(f"ISO: {iso_val}")
+        elif iso_val > 3200:
             context_parts.append(f"High ISO ({iso_val}) - check for noise")
         elif iso_val > 800:
             context_parts.append(f"Moderate ISO ({iso_val})")
+        else:
+            context_parts.append(f"ISO: {iso_val}")
     
     if exif_data.get('aperture'):
         context_parts.append(f"Aperture: {exif_data['aperture']}")
@@ -542,17 +990,25 @@ def create_enhanced_prompt(base_prompt: str, exif_data: Dict, technical_metrics:
         context_parts.append(f"Shutter: {exif_data['shutter_speed']}")
     
     # Add technical analysis context
+    brightness = technical_metrics.get('brightness')
+    if brightness is not None:
+        context_parts.append(f"Measured brightness: {brightness:.0f}")
+    
     highlights = technical_metrics.get('histogram_clipping_highlights')
-    if highlights is not None and highlights > 12:
+    if highlights is not None:
         context_parts.append(f"Highlight clipping: {highlights:.1f}%")
 
     shadows = technical_metrics.get('histogram_clipping_shadows')
-    if shadows is not None and shadows > 12:
+    if shadows is not None:
         context_parts.append(f"Shadow clipping: {shadows:.1f}%")
 
     sharpness = technical_metrics.get('sharpness')
-    if sharpness is not None and sharpness < 35:
+    if sharpness is not None:
         context_parts.append(f"Sharpness metric: {sharpness:.1f}")
+
+    noise_score = technical_metrics.get('noise_score', 0)
+    if noise_score > 0:
+        context_parts.append(f"Noise score: {noise_score:.1f}/100")
 
     color_cast = technical_metrics.get('color_cast')
     if color_cast and color_cast != 'neutral':
@@ -564,7 +1020,9 @@ def create_enhanced_prompt(base_prompt: str, exif_data: Dict, technical_metrics:
     # Build enhanced prompt
     if context_parts:
         technical_context = "\n\nTECHNICAL CONTEXT:\n" + "\n".join(f"- {part}" for part in context_parts)
-        technical_context += "\n\nConsider these technical factors in your evaluation."
+        technical_context += "\n\nConsider these technical factors and the image context in your evaluation. "
+        technical_context += f"Note that this image is classified as '{context_profile_name}', which may have different "
+        technical_context += "expectations for technical attributes like clipping, sharpness, and noise tolerance."
         return base_prompt + technical_context
     
     return base_prompt
@@ -1067,23 +1525,37 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
             logger.error(f"Error embedding cached metadata for {image_path}: {e}")
             return (image_path, None)
     
-    # Extract EXIF and technical metrics
+    # Encode image once for all operations
+    with open(image_path, 'rb') as image_file:
+        encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
+    
+    # Step 1: Classify image context (quick pass)
+    image_context = classify_image_context(image_path, encoded_image, ollama_host_url, model)
+    logger.info(f"Image context for {image_path}: {image_context} ({TECH_PROFILES[image_context]['name']})")
+    
+    # Step 2: Extract EXIF and technical metrics with context
     exif_data = extract_exif_metadata(image_path)
-    technical_metrics = analyze_image_technical(image_path)
-    technical_warnings = assess_technical_metrics(technical_metrics)
+    
+    # Convert ISO from string to int if needed
+    iso_value = exif_data.get('iso')
+    if isinstance(iso_value, str):
+        try:
+            iso_value = int(iso_value.replace('ISO', '').strip())
+        except (ValueError, AttributeError):
+            iso_value = None
+    
+    technical_metrics = analyze_image_technical(image_path, iso_value, context=image_context)
+    technical_warnings = assess_technical_metrics(technical_metrics, context=image_context)
     technical_metrics['warnings'] = technical_warnings
-    technical_metrics['post_process_potential'] = compute_post_process_potential(technical_metrics)
+    technical_metrics['post_process_potential'] = compute_post_process_potential(technical_metrics, context=image_context)
 
-    # Enhance prompt with technical context
+    # Step 3: Enhance prompt with technical context
     enhanced_prompt = create_enhanced_prompt(prompt, exif_data, technical_metrics)
     
-    # Retry logic for malformed responses
+    # Step 4: Retry logic for malformed responses
     max_attempts = 3
     for attempt in range(max_attempts):
         try:
-            with open(image_path, 'rb') as image_file:
-                encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
-            
             # Perform ensemble evaluation
             response_metadata = ensemble_evaluate(image_path, encoded_image, ollama_host_url, 
                                                  model, enhanced_prompt, headers, ensemble_passes)

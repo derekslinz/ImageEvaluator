@@ -37,6 +37,7 @@ A toolkit for evaluating images using AI vision models (via Ollama) with two spe
 - Optional metadata verification
 - Backup directory support
 - Full rollback capability
+- Normalized flat-area noise score (ISO-scaled for D850/Z9 100-3200) so warnings aren’t driven by scene contrast alone
 - Post-processing potential score (0-100) derived from measured sharpness/clipping so you can prioritize images worth retouching
 
 **Flexibility:**
