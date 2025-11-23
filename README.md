@@ -113,8 +113,8 @@ pip install -r requirements.txt
    ```
 
 3. **View results:**
-   - Console displays statistics and score distribution
-   - CSV report saved with timestamp
+   - Console displays statistics and score distribution (warning count now reported)
+   - CSV report saved with timestamp and includes the measured technical metrics plus any automated warnings/filter cues
    - Metadata embedded in image EXIF
 
 #### Stock Photo Evaluator
@@ -286,6 +286,14 @@ RESOLUTION STATUS:
 Processing time: 5554.6 seconds (92.6 minutes)
 Time per image: 22.67 seconds
 ```
+
+#### Upload Results to PostgreSQL
+
+Once you have a CSV from either evaluator, use `csv_to_postgres.py` to push it into Postgres:
+```bash
+python csv_to_postgres.py path/to/results.csv --db-url postgres://localhost:5432/photos
+```
+The script normalizes the header, creates `image_evaluation_results` (or your chosen table) with text columns, and inserts all rows; pass `--truncate` if you want to drop existing rows first. Ensure `psycopg2-binary` is installed along with the other requirements.
 
 #### Example Output: model qwen3-vl:8b running on ollama on an Apple M4 Max with --ensemble=3 (3 passes per image). Each image is ~50 megapixels. Running on gemma3:4b was faster, but the results were all clustered around the same score. It's notably faster on a RTX 3090, but still time consuming with 3 passes. Smaller images process faster, obviously
 ```bash

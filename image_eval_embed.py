@@ -466,6 +466,31 @@ def analyze_image_technical(image_path: str) -> Dict:
     return metrics
 
 
+def assess_technical_metrics(technical_metrics: Dict) -> List[str]:
+    """Generate human-readable warnings based on measured metrics."""
+    warnings = []
+    sharpness = technical_metrics.get('sharpness')
+    if sharpness is not None:
+        if sharpness < 30:
+            warnings.append(f"Sharpness critically low ({sharpness:.1f})")
+        elif sharpness < 60:
+            warnings.append(f"Lower sharpness ({sharpness:.1f}) may impact detail")
+
+    highlights = technical_metrics.get('histogram_clipping_highlights', 0)
+    if highlights > 5:
+        warnings.append(f"Highlight clipping {highlights:.1f}% reduces tonal range")
+
+    shadows = technical_metrics.get('histogram_clipping_shadows', 0)
+    if shadows > 5:
+        warnings.append(f"Shadow clipping {shadows:.1f}% removes shadow detail")
+
+    color_cast = technical_metrics.get('color_cast', 'neutral')
+    if color_cast != 'neutral':
+        warnings.append(f"Color cast detected: {color_cast}")
+
+    return warnings
+
+
 def create_enhanced_prompt(base_prompt: str, exif_data: Dict, technical_metrics: Dict) -> str:
     """Enhance prompt with technical context from image analysis."""
     context_parts = []
@@ -485,17 +510,24 @@ def create_enhanced_prompt(base_prompt: str, exif_data: Dict, technical_metrics:
         context_parts.append(f"Shutter: {exif_data['shutter_speed']}")
     
     # Add technical analysis context
-    if technical_metrics.get('histogram_clipping_highlights', 0) > 2:
-        context_parts.append(f"⚠ Highlight clipping detected ({technical_metrics['histogram_clipping_highlights']:.1f}%)")
-    
-    if technical_metrics.get('histogram_clipping_shadows', 0) > 2:
-        context_parts.append(f"⚠ Shadow clipping detected ({technical_metrics['histogram_clipping_shadows']:.1f}%)")
-    
-    if technical_metrics.get('sharpness', 0) < 100:
-        context_parts.append("⚠ Possible soft focus or motion blur")
-    
-    if technical_metrics.get('color_cast') != 'neutral':
-        context_parts.append(f"Color cast: {technical_metrics['color_cast']}")
+    highlights = technical_metrics.get('histogram_clipping_highlights')
+    if highlights is not None and highlights > 0:
+        context_parts.append(f"Highlight clipping: {highlights:.1f}%")
+
+    shadows = technical_metrics.get('histogram_clipping_shadows')
+    if shadows is not None and shadows > 0:
+        context_parts.append(f"Shadow clipping: {shadows:.1f}%")
+
+    sharpness = technical_metrics.get('sharpness')
+    if sharpness is not None:
+        context_parts.append(f"Sharpness metric: {sharpness:.1f}")
+
+    color_cast = technical_metrics.get('color_cast')
+    if color_cast and color_cast != 'neutral':
+        context_parts.append(f"Color cast: {color_cast}")
+
+    for warning in technical_metrics.get('warnings', []):
+        context_parts.append(f"Warning: {warning}")
     
     # Build enhanced prompt
     if context_parts:
@@ -1006,7 +1038,9 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
     # Extract EXIF and technical metrics
     exif_data = extract_exif_metadata(image_path)
     technical_metrics = analyze_image_technical(image_path)
-    
+    technical_warnings = assess_technical_metrics(technical_metrics)
+    technical_metrics['warnings'] = technical_warnings
+
     # Enhance prompt with technical context
     enhanced_prompt = create_enhanced_prompt(prompt, exif_data, technical_metrics)
     
@@ -1027,11 +1061,14 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
                     time.sleep(2)
                     continue
                 return (image_path, None)
-            
+
             # Add 'score' field for backwards compatibility (use overall_score)
             if 'overall_score' in response_metadata:
                 response_metadata['score'] = response_metadata['overall_score']
-            
+
+            response_metadata['technical_metrics'] = technical_metrics
+            response_metadata['technical_warnings'] = technical_warnings
+
             # Save to cache
             if cache_dir:
                 save_to_cache(image_path, model, response_metadata, cache_dir)
@@ -1106,13 +1143,21 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
 def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: str):
     """Save processing results to CSV file."""
     with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['file_path', 'overall_score', 'technical_score', 'composition_score', 
-                     'lighting_score', 'creativity_score', 'title', 'description', 'keywords', 'status']
+        fieldnames = [
+            'file_path', 'overall_score', 'technical_score', 'composition_score',
+            'lighting_score', 'creativity_score', 'title', 'description',
+            'keywords', 'status', 'sharpness', 'brightness', 'contrast',
+            'histogram_clipping_highlights', 'histogram_clipping_shadows',
+            'color_cast', 'technical_warnings'
+        ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         writer.writeheader()
         for file_path, metadata in results:
             if metadata:
+                technical_metrics = metadata.get('technical_metrics', {})
+                warnings = metadata.get('technical_warnings', [])
+                warnings_str = '; '.join(warnings) if warnings else ''
                 writer.writerow({
                     'file_path': file_path,
                     'overall_score': metadata.get('overall_score', metadata.get('score', '')),
@@ -1123,6 +1168,13 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'title': metadata.get('title', ''),
                     'description': metadata.get('description', ''),
                     'keywords': metadata.get('keywords', ''),
+                    'sharpness': technical_metrics.get('sharpness', ''),
+                    'brightness': technical_metrics.get('brightness', ''),
+                    'contrast': technical_metrics.get('contrast', ''),
+                    'histogram_clipping_highlights': technical_metrics.get('histogram_clipping_highlights', ''),
+                    'histogram_clipping_shadows': technical_metrics.get('histogram_clipping_shadows', ''),
+                    'color_cast': technical_metrics.get('color_cast', ''),
+                    'technical_warnings': warnings_str,
                     'status': 'success'
                 })
             else:
@@ -1136,8 +1188,14 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'title': '',
                     'description': '',
                     'keywords': '',
-                    'keywords': '',
-                    'status': 'failed'
+                    'status': 'failed',
+                    'sharpness': '',
+                    'brightness': '',
+                    'contrast': '',
+                    'histogram_clipping_highlights': '',
+                    'histogram_clipping_shadows': '',
+                    'color_cast': '',
+                    'technical_warnings': ''
                 })
 
 
@@ -1188,6 +1246,8 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
             except (ValueError, AttributeError):
                 continue
     
+    warning_images = sum(1 for _, md in results if md and md.get('technical_warnings'))
+
     if not scores:
         return {
             'total_processed': len(results),
@@ -1199,6 +1259,8 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
             'score_distribution': {},
             'raw_count': raw_count,
             'pil_count': pil_count
+            ,
+            'warning_images': warning_images
         }
     
     # Calculate score distribution (bins of 5)
@@ -1239,6 +1301,8 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
         'score_distribution': distribution,
         'raw_count': raw_count,
         'pil_count': pil_count
+        ,
+        'warning_images': warning_images
     }
 
 
@@ -1250,6 +1314,8 @@ def print_statistics(stats: Dict):
     print(f"Total images processed: {stats['total_processed']}")
     print(f"Successful: {stats['successful']}")
     print(f"Failed: {stats['failed']}")
+    if stats.get('warning_images'):
+        print(f"Images with technical warnings: {stats['warning_images']}")
     print(f"RAW formats (exiftool): {stats.get('raw_count', 0)}")
     print(f"Standard formats (PIL): {stats.get('pil_count', 0)}")
     

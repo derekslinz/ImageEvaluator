@@ -135,10 +135,12 @@ Interpretation (IMPORTANT):
 - 0 = very likely rejection.
 
 7. OVERALL_STOCK_SCORE (0-100)
-Overall suitability for stock photography submission. Base this primarily on:
-- COMMERCIAL_VIABILITY and TECHNICAL_QUALITY as the core factors,
-- Then adjust up or down (up to +/- 10 points) based on COMPOSITION_CLARITY, KEYWORD_POTENTIAL, RELEASE_CONCERNS, and REJECTION_RISKS.
-Use the full 0-100 range and do not cluster most images between 70-90.
+Overall suitability for stock photography submission. Compute this score from the lower-level components using a consistent formula:
+  * Base score = 0.4×TECHNICAL_QUALITY + 0.25×COMMERCIAL_VIABILITY + 0.2×COMPOSITION_CLARITY + 0.1×KEYWORD_POTENTIAL + 0.05×(RELEASE_CONCERNS+REJECTION_RISKS)/2
+  * Penalty = 5 points if highlight or shadow clipping exceeds 5%, 8 points if the sharpness metric is under 35, and 10 total points if both clipping and low sharpness are present.
+  * OVERALL_STOCK_SCORE = Base score − Penalty. Round the result to the nearest integer after applying the penalty, clamp between 0 and 100, and note in the ISSUES field which component or penalty caused a significant deviation if the final score differs by more than 3 points from any individual component.
+  * Example: If TECHNICAL_QUALITY=80, COMMERCIAL_VIABILITY=70, COMPOSITION_CLARITY=65, KEYWORD_POTENTIAL=60, RELEASE_CONCERNS=90, REJECTION_RISKS=85, base score = 0.4*80 + 0.25*70 + 0.2*65 + 0.1*60 + 0.05*((90+85)/2) = 32 + 17.5 + 13 + 6 + 4.375 = 72.875; if sharpness is 30 (penalty 8) then final score = round(72.875 - 8) = 65.
+Use the full 0-100 range and do not cluster most images between 70-90; log the driving factor in the ISSUES output when the overall score deviates significantly from the component scores.
 
 Map OVERALL_STOCK_SCORE to a categorical recommendation:
 - EXCELLENT: >= 85
