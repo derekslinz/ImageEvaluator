@@ -3,6 +3,7 @@ import base64
 import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
+import io
 import json  # Import json for parsing the response
 import logging
 import logging.handlers
@@ -185,62 +186,159 @@ Example format (structure only; values are illustrative):
 {"technical_score": 55, "composition_score": 62, "lighting_score": 58, "creativity_score": 60, "overall_score": 58, "title": "sunset over mountains", "description": "Decent sunset composition with strong colors but slightly overexposed highlights and soft detail in the foreground.", "keywords": "sunset, mountains, landscape, golden hour, clouds, peaks, nature, scenic, dramatic sky, outdoor, wilderness"}"""
 
 
-def _safe_raw_metadata_value(meta, *names):
-    for name in names:
-        value = getattr(meta, name, None)
-        if value not in (None, 0, 0.0, ''):
-            return value
-    return None
-
-
-def _extract_rawpy_metadata(image_path: str) -> Dict[str, Union[str, int, None]]:
-    if not RAWPY_AVAILABLE:
+def _extract_pil_exif_metadata(image_path: str) -> Dict[str, Union[str, int, None]]:
+    """Extract EXIF metadata using PIL - works for both RAW (NEF/CR2) and JPEG/PNG.
+    
+    Note: Lens information may not be available for all RAW files as it's often stored in
+    manufacturer-specific MakerNote tags that PIL doesn't parse. Use exiftool for complete
+    lens metadata extraction if needed.
+    """
+    metadata: Dict[str, Union[str, int, None]] = {}
+    
+    try:
+        with Image.open(image_path) as img:
+            exif = img.getexif()
+            if not exif:
+                return metadata
+            
+            # For RAW files, EXIF data is in a separate IFD (tag 0x8769)
+            # Try to get the EXIF IFD for more complete metadata
+            exif_ifd = None
+            try:
+                if hasattr(exif, 'get_ifd'):
+                    exif_ifd = exif.get_ifd(0x8769)
+            except Exception:
+                pass
+            
+            # Use EXIF IFD if available, otherwise fall back to main EXIF
+            data_source = exif_ifd if exif_ifd else exif
+            
+            # ISO - tag 34855
+            iso = data_source.get(34855)
+            if iso:
+                metadata['iso'] = int(iso)
+            
+            # Aperture (FNumber) - tag 33437
+            f_number = data_source.get(33437)
+            if f_number:
+                if isinstance(f_number, tuple) and len(f_number) == 2:
+                    metadata['aperture'] = f"f/{f_number[0]/f_number[1]:.1f}"
+                elif hasattr(f_number, '__float__'):
+                    metadata['aperture'] = f"f/{float(f_number):.1f}"
+            
+            # Shutter speed (ExposureTime) - tag 33434
+            exposure_time = data_source.get(33434)
+            if exposure_time:
+                if isinstance(exposure_time, tuple) and len(exposure_time) == 2:
+                    if exposure_time[0] == 1:
+                        metadata['shutter_speed'] = f"1/{exposure_time[1]}s"
+                    else:
+                        metadata['shutter_speed'] = f"{exposure_time[0]/exposure_time[1]:.3f}s"
+                elif hasattr(exposure_time, '__float__'):
+                    exp_val = float(exposure_time)
+                    if exp_val < 1:
+                        metadata['shutter_speed'] = f"1/{int(1/exp_val)}s"
+                    else:
+                        metadata['shutter_speed'] = f"{exp_val:.3f}s"
+            
+            # Focal length - tag 37386
+            focal_length = data_source.get(37386)
+            if focal_length:
+                if isinstance(focal_length, tuple) and len(focal_length) == 2:
+                    metadata['focal_length'] = f"{focal_length[0]/focal_length[1]:.0f}mm"
+                elif hasattr(focal_length, '__float__'):
+                    metadata['focal_length'] = f"{float(focal_length):.0f}mm"
+            
+            # Camera make - tag 271 (from main EXIF, not IFD)
+            camera_make = exif.get(271)
+            if camera_make:
+                metadata['camera_make'] = str(camera_make).strip()
+            
+            # Camera model - tag 272 (from main EXIF, not IFD)
+            camera_model = exif.get(272)
+            if camera_model:
+                metadata['camera_model'] = str(camera_model).strip()
+            
+            # Lens model - tag 42036
+            lens_model = data_source.get(42036)
+            if lens_model:
+                metadata['lens_model'] = str(lens_model).strip()
+            
+            if metadata:
+                logger.debug(f"Extracted {len(metadata)} EXIF fields from {image_path}")
+            else:
+                logger.debug(f"No EXIF metadata found in {image_path}")
+            
+            return metadata
+            
+    except Exception as e:
+        logger.debug(f"PIL EXIF extraction failed for {image_path}: {e}")
         return {}
 
-    try:
-        raw = rawpy.imread(image_path)  # type: ignore
-    except Exception as exc:
-        logger.debug(f"rawpy failed to read {image_path}: {exc}")
-        return {}
 
-    try:
-        meta = getattr(raw, 'metadata', None)
-        if meta is None:
-            logger.debug(f"rawpy metadata not available for {image_path}")
-            return {}
-        raw_metadata: Dict[str, Union[str, int, None]] = {}
-        iso = _safe_raw_metadata_value(meta, 'iso_speed', 'iso')
-        if iso:
-            raw_metadata['iso'] = int(iso)
 
-        aperture = _safe_raw_metadata_value(meta, 'aperture', 'f_number')
-        if aperture:
-            raw_metadata['aperture'] = f"f/{float(aperture):.1f}"
-
-        shutter = _safe_raw_metadata_value(meta, 'shutter', 'exposure_time')
-        if shutter:
-            raw_metadata['shutter_speed'] = f"{float(shutter):.3f}s"
-
-        focal_length = _safe_raw_metadata_value(meta, 'focal_length')
-        if focal_length:
-            raw_metadata['focal_length'] = f"{float(focal_length):.0f}mm"
-
-        camera_make = _safe_raw_metadata_value(meta, 'camera_maker', 'camera')
-        if camera_make:
-            raw_metadata['camera_make'] = str(camera_make).strip()
-
-        camera_model = _safe_raw_metadata_value(meta, 'camera_model')
-        if camera_model:
-            raw_metadata['camera_model'] = str(camera_model).strip()
-
-        lens_model = _safe_raw_metadata_value(meta, 'lens')
-        if lens_model:
-            raw_metadata['lens_model'] = str(lens_model).strip()
-
-        return raw_metadata
-    finally:
-        raw.close()
-
+def encode_image_for_classification(image_path: str) -> str:
+    """Encode image as base64 JPEG for classification. Converts RAW to preview first."""
+    ext = Path(image_path).suffix.lower()
+    
+    # For RAW files, extract embedded JPEG preview or render small version
+    if ext in RAW_EXTENSIONS:
+        if not RAWPY_AVAILABLE:
+            _warn_rawpy_missing()
+            # Fallback: try to read as regular image (may work for some RAW formats)
+            try:
+                with Image.open(image_path) as img:
+                    buffer = io.BytesIO()
+                    # Resize to reasonable size for classification
+                    img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+                    img.convert('RGB').save(buffer, format='JPEG', quality=85)
+                    return base64.b64encode(buffer.getvalue()).decode('utf-8')
+            except Exception as e:
+                logger.warning(f"Could not encode RAW file {image_path} for classification: {e}")
+                raise
+        
+        try:
+            # Use rawpy to get embedded JPEG preview or render small version
+            raw = rawpy.imread(image_path)  # type: ignore
+            try:
+                # Try to extract embedded JPEG preview (fast)
+                try:
+                    thumb = raw.extract_thumb()
+                    if thumb.format == rawpy.ThumbFormat.JPEG:  # type: ignore
+                        return base64.b64encode(thumb.data).decode('utf-8')
+                except Exception:
+                    pass  # No thumbnail, will render below
+                
+                # Render a small preview (slower but works)
+                rgb = raw.postprocess(
+                    use_camera_wb=True,
+                    no_auto_bright=True,
+                    output_bps=8,
+                    half_size=True  # Render at half resolution for speed
+                )
+                img = Image.fromarray(rgb.astype('uint8'))
+                # Further resize if still large
+                img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+                buffer = io.BytesIO()
+                img.save(buffer, format='JPEG', quality=85)
+                return base64.b64encode(buffer.getvalue()).decode('utf-8')
+            finally:
+                raw.close()
+        except Exception as e:
+            logger.warning(f"Could not process RAW file {image_path} for classification: {e}")
+            raise
+    else:
+        # For standard formats, resize and encode as JPEG
+        try:
+            with Image.open(image_path) as img:
+                buffer = io.BytesIO()
+                # Resize to reasonable size for classification
+                img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+                img.convert('RGB').save(buffer, format='JPEG', quality=85)
+                return base64.b64encode(buffer.getvalue()).decode('utf-8')
+        except Exception as e:
+            logger.warning(f"Could not encode image {image_path} for classification: {e}")
+            raise
 
 
 @contextmanager
@@ -371,7 +469,7 @@ def retry_with_backoff(func, max_retries=MAX_RETRIES, base_delay=RETRY_DELAY_BAS
 
 
 def extract_exif_metadata(image_path: str) -> Dict[str, Union[str, int, None]]:
-    """Extract technical metadata from EXIF data."""
+    """Extract technical metadata from EXIF data using PIL (works for RAW and standard formats)."""
     metadata: Dict[str, Union[str, int, None]] = {
         'iso': None,
         'aperture': None,
@@ -381,52 +479,9 @@ def extract_exif_metadata(image_path: str) -> Dict[str, Union[str, int, None]]:
         'camera_model': None,
         'lens_model': None
     }
-    if _is_raw_image(image_path):
-        metadata.update(_extract_rawpy_metadata(image_path))
-        return metadata
     
-    try:
-        with Image.open(image_path) as img:
-            exif_data = img.info.get("exif")
-            if exif_data:
-                exif_dict = piexif.load(exif_data)
-                
-                # Extract ISO
-                if piexif.ExifIFD.ISOSpeedRatings in exif_dict.get("Exif", {}):
-                    metadata['iso'] = exif_dict["Exif"][piexif.ExifIFD.ISOSpeedRatings]
-                
-                # Extract Aperture (FNumber)
-                if piexif.ExifIFD.FNumber in exif_dict.get("Exif", {}):
-                    f_num = exif_dict["Exif"][piexif.ExifIFD.FNumber]
-                    if isinstance(f_num, tuple):
-                        metadata['aperture'] = f"f/{f_num[0]/f_num[1]:.1f}"
-                
-                # Extract Shutter Speed (ExposureTime)
-                if piexif.ExifIFD.ExposureTime in exif_dict.get("Exif", {}):
-                    exp_time = exif_dict["Exif"][piexif.ExifIFD.ExposureTime]
-                    if isinstance(exp_time, tuple):
-                        metadata['shutter_speed'] = f"{exp_time[0]}/{exp_time[1]}s"
-                
-                # Extract Focal Length
-                if piexif.ExifIFD.FocalLength in exif_dict.get("Exif", {}):
-                    focal = exif_dict["Exif"][piexif.ExifIFD.FocalLength]
-                    if isinstance(focal, tuple):
-                        metadata['focal_length'] = f"{focal[0]/focal[1]:.0f}mm"
-                
-                # Extract Camera Make/Model
-                if piexif.ImageIFD.Make in exif_dict.get("0th", {}):
-                    metadata['camera_make'] = exif_dict["0th"][piexif.ImageIFD.Make].decode('utf-8', errors='ignore').strip()
-                
-                if piexif.ImageIFD.Model in exif_dict.get("0th", {}):
-                    metadata['camera_model'] = exif_dict["0th"][piexif.ImageIFD.Model].decode('utf-8', errors='ignore').strip()
-                
-                # Extract Lens Model
-                if piexif.ExifIFD.LensModel in exif_dict.get("Exif", {}):
-                    metadata['lens_model'] = exif_dict["Exif"][piexif.ExifIFD.LensModel].decode('utf-8', errors='ignore').strip()
-    
-    except Exception as e:
-        logger.debug(f"Could not extract EXIF metadata from {image_path}: {e}")
-    
+    # Use PIL for EXIF extraction - it works for both RAW and standard formats
+    metadata.update(_extract_pil_exif_metadata(image_path))
     return metadata
 
 
@@ -645,74 +700,150 @@ TECH_PROFILES = {
 }
 
 # Lightweight classification prompt for 10 contexts
-IMAGE_CONTEXT_CLASSIFIER_PROMPT = """Analyze this image and classify it into ONE of these photography contexts:
+IMAGE_CONTEXT_CLASSIFIER_PROMPT = """You are analyzing this photograph to classify it into ONE category.
 
-1. stock_product - clean product/catalog photography with neutral background
-2. macro_food - close-up food, macro photography with fine detail
-3. portrait_neutral - standard portrait with controlled lighting
-4. portrait_highkey - bright, airy portrait with intentional highlight blowout
-5. landscape - nature, outdoor scenery, wide vistas
-6. street_documentary - candid, street photography, documentary style
-7. sports_action - sports, action, wildlife, fast motion
-8. concert_night - night photography, concerts, city at night, low-light
-9. architecture_realestate - buildings, interiors, real estate
-10. fineart_creative - experimental, abstract, ICM, intentionally unconventional
+Look at the image and determine which category it belongs to:
 
-Respond with ONLY the context name, nothing else."""
+1. landscape - outdoor nature scenes, mountains, forests, seascapes, sunsets, natural vistas
+2. portrait_neutral - people photos with standard lighting, headshots, portraits
+3. portrait_highkey - bright, overexposed people photos, airy portraits
+4. macro_food - extreme close-ups of food or small objects, detailed macro shots
+5. street_documentary - candid street photography, photojournalism, documentary style
+6. sports_action - fast motion, sports, wildlife in motion, action photography
+7. concert_night - dark scenes, concerts, night cityscapes, low-light photography
+8. architecture_realestate - buildings, interiors, rooms, architectural photography
+9. stock_product - clean product shots on white/neutral backgrounds, catalog photography
+10. fineart_creative - abstract, experimental, artistic, intentionally unconventional
+
+Respond with ONLY the category name from the list above. Examples: "landscape" or "portrait_neutral" or "street_documentary"
+
+Your response:"""
 
 
-def classify_image_context(image_path: str, encoded_image: str, ollama_host_url: str, model: str) -> str:
+def classify_image_context(image_path: str, ollama_host_url: str, model: str) -> str:
     """Quickly classify image context using vision model."""
     try:
+        # Encode image appropriately (handles RAW files by creating JPEG preview)
+        logger.debug(f"Encoding image for classification: {image_path}")
+        encoded_image = encode_image_for_classification(image_path)
+        image_size_kb = len(encoded_image) * 3 / 4 / 1024  # Approximate decoded size in KB
+        logger.debug(f"Encoded image size: {image_size_kb:.1f}KB")
+        
+        headers = {'Content-Type': 'application/json'}
         payload = {
             "model": model,
             "stream": False,
             "images": [encoded_image],
             "prompt": IMAGE_CONTEXT_CLASSIFIER_PROMPT,
             "options": {
-                "temperature": 0.1,
-                "num_predict": 30  # Short response expected
+                "temperature": 0.3,
+                "num_predict": 100,
+                "top_p": 0.9,
+                "repeat_penalty": 1.1
             }
         }
         
-        response = requests.post(ollama_host_url, json=payload, timeout=30)
+        logger.debug(f"Sending classification request for {image_path}")
+        response = requests.post(ollama_host_url, json=payload, headers=headers, timeout=120)
         response.raise_for_status()
         result = response.json()
-        context_label = result.get('response', '').strip().lower()
+        
+        # Log full result for debugging
+        logger.debug(f"Classification API response keys: {result.keys()}")
+        
+        raw_response = result.get('response', '')
+        context_label = raw_response.strip().lower()
+        
+        # Log raw response for debugging
+        logger.debug(f"Context classification raw response: '{raw_response}' for {image_path}")
+        
+        # Check for empty response - this indicates the model doesn't support vision or has an issue
+        if not raw_response or not context_label:
+            # try alternate fields
+            fallback_response = (
+                result.get('text') or
+                result.get('message') or
+                (result.get('choices', [{}])[0].get('text') if isinstance(result.get('choices'), list) and result.get('choices') else '') or
+                result.get('thinking')
+            )
+            if fallback_response:
+                raw_response = fallback_response
+                context_label = raw_response.strip().lower()
+                logger.debug(f"Context classification fallback response: '{raw_response}' for {image_path}")
+            if not raw_response or not context_label:
+                logger.warning(f"Context classification returned empty response for {image_path}. Model payload: {result}")
+                return 'stock_product'
         
         # Handle numbered responses (e.g., "1", "1.", "5. landscape")
         number_to_context = {
-            '1': 'stock_product',
-            '2': 'macro_food',
-            '3': 'portrait_neutral',
-            '4': 'portrait_highkey',
-            '5': 'landscape',
-            '6': 'street_documentary',
-            '7': 'sports_action',
-            '8': 'concert_night',
-            '9': 'architecture_realestate',
+            '1': 'landscape',
+            '2': 'portrait_neutral',
+            '3': 'portrait_highkey',
+            '4': 'macro_food',
+            '5': 'street_documentary',
+            '6': 'sports_action',
+            '7': 'concert_night',
+            '8': 'architecture_realestate',
+            '9': 'stock_product',
             '10': 'fineart_creative'
         }
         
-        # Check if response is just a number
-        clean_response = context_label.rstrip('.').strip()
-        if clean_response in number_to_context:
-            matched_context = number_to_context[clean_response]
-            logger.info(f"Context classification: {matched_context} (from number '{clean_response}') for {image_path}")
+        # Check if response starts with a number
+        first_word = context_label.split()[0] if context_label.split() else ''
+        clean_number = first_word.rstrip('.').strip()
+        if clean_number in number_to_context:
+            matched_context = number_to_context[clean_number]
+            logger.info(f"Context classification: {matched_context} (from number '{clean_number}') for {image_path}")
             return matched_context
         
+        # Explicit "category X" reference takes priority
+        import re
+        category_matches = re.findall(r'category\s*(\d+)', context_label)
+        if category_matches:
+            last_match = category_matches[-1]
+            if last_match in number_to_context:
+                matched_context = number_to_context[last_match]
+                logger.info(f"Context classification: {matched_context} (from 'category {last_match}') for {image_path}")
+                return matched_context
+
+        # Weighted sentence analysis to avoid false positives
+        sentences = re.split(r'[.!?\n]+', context_label)
+        positive_markers = ["include", "includes", "fits", "fit", "belongs to", "classified as", "this is", "is a", "matches", "best fits"]
+        negative_markers = ["don't fit", "doesn't fit", "does not fit", "not ", "no ", "without"]
+        candidate_scores = {}
+        for sentence in sentences:
+            s = sentence.strip()
+            if not s:
+                continue
+            sentiment = 0
+            lowered = s
+            if any(marker in lowered for marker in negative_markers):
+                sentiment = -1
+            elif any(marker in lowered for marker in positive_markers):
+                sentiment = 1
+            for known_context in TECH_PROFILES.keys():
+                if known_context in lowered:
+                    score = 2 if sentiment == 1 else (-2 if sentiment == -1 else 1)
+                    candidate_scores[known_context] = max(score, candidate_scores.get(known_context, -10))
+        if candidate_scores:
+            best_context, best_score = max(candidate_scores.items(), key=lambda kv: kv[1])
+            if best_score > 0:
+                logger.info(f"Context classification: {best_context} (sentence-weighted) for {image_path}")
+                return best_context
+
         # Validate against known contexts (exact match)
         if context_label in TECH_PROFILES:
             logger.info(f"Context classification: {context_label} (exact match) for {image_path}")
             return context_label
         
-        # Try to extract valid context from response
+        # Try to extract valid context from response (partial match)
         for known_context in TECH_PROFILES.keys():
             if known_context in context_label:
                 logger.info(f"Context classification: {known_context} (extracted from '{context_label}') for {image_path}")
                 return known_context
         
-        logger.warning(f"Context classification failed: unknown '{context_label}' for {image_path}. "
+        # Log the failure with the actual response
+        logger.warning(f"Context classification failed: unknown response '{raw_response}' (normalized: '{context_label}') for {image_path}. "
                       f"Defaulting to 'stock_product' (most restrictive). Consider manual context override.")
         return 'stock_product'
         
@@ -1512,7 +1643,8 @@ def ensemble_evaluate(image_path: str, encoded_image: str, ollama_host_url: str,
 
 def process_single_image(image_path: str, ollama_host_url: str, model: str, prompt: str, 
                         dry_run: bool = False, backup_dir: Optional[str] = None, verify: bool = False,
-                        cache_dir: Optional[str] = None, ensemble_passes: int = 1) -> Tuple[str, Optional[Dict]]:
+                        cache_dir: Optional[str] = None, ensemble_passes: int = 1,
+                        context_override: Optional[str] = None, skip_context_classification: bool = False) -> Tuple[str, Optional[Dict]]:
     """Process a single image and return result."""
     logger.debug(f"Processing image: {image_path}")
     headers = {'Content-Type': 'application/json'}
@@ -1538,8 +1670,23 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
     with open(image_path, 'rb') as image_file:
         encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
     
-    # Step 1: Classify image context (quick pass)
-    image_context = classify_image_context(image_path, encoded_image, ollama_host_url, model)
+    # Step 1: Determine image context
+    if context_override:
+        # Use manual override
+        image_context = context_override if context_override in TECH_PROFILES else 'stock_product'
+        logger.info(f"Using manual context override: {image_context}")
+    elif skip_context_classification:
+        # Skip classification entirely
+        image_context = 'stock_product'
+        logger.debug(f"Context classification disabled, using default: {image_context}")
+    else:
+        # Classify image context (handles RAW files automatically)
+        try:
+            image_context = classify_image_context(image_path, ollama_host_url, model)
+        except Exception as e:
+            logger.warning(f"Context classification failed for {image_path}: {e}, using default")
+            image_context = 'stock_product'
+    
     logger.info(f"Image context for {image_path}: {image_context} ({TECH_PROFILES[image_context]['name']})")
     
     # Step 2: Extract EXIF and technical metrics with context
@@ -1628,7 +1775,9 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
                             file_types: Optional[List[str]] = None, skip_existing: bool = True,
                             dry_run: bool = False, min_score: Optional[int] = None,
                             backup_dir: Optional[str] = None, verify: bool = False,
-                            cache_dir: Optional[str] = None, ensemble_passes: int = 1) -> List[Tuple[str, Optional[Dict]]]:
+                            cache_dir: Optional[str] = None, ensemble_passes: int = 1,
+                            context_override: Optional[str] = None,
+                            skip_context_classification: bool = False) -> List[Tuple[str, Optional[Dict]]]:
     """Process images with parallel execution and progress bar."""
     # Collect all images to process
     image_paths = collect_images(folder_path, file_types=file_types, skip_existing=skip_existing)
@@ -1643,7 +1792,20 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
         future_to_path = {
-            executor.submit(process_single_image, path, ollama_host_url, model, prompt, dry_run, backup_dir, verify, cache_dir, ensemble_passes): path 
+            executor.submit(
+                process_single_image,
+                path,
+                ollama_host_url,
+                model,
+                prompt,
+                dry_run,
+                backup_dir,
+                verify,
+                cache_dir,
+                ensemble_passes,
+                context_override,
+                skip_context_classification
+            ): path 
             for path in image_paths
         }
         
@@ -1991,6 +2153,10 @@ if __name__ == "__main__":
     process_parser.add_argument('--clear-cache', action='store_true', help='Clear cache before processing')
     process_parser.add_argument('--ensemble', type=int, default=DEFAULT_ENSEMBLE_PASSES, 
                               help=f'Number of evaluation passes for ensemble scoring (default: {DEFAULT_ENSEMBLE_PASSES})')
+    process_parser.add_argument('--context', type=str, default=None,
+                              help='Manual context override (e.g., landscape, portrait_neutral, stock_product)')
+    process_parser.add_argument('--no-context-classification', action='store_true',
+                              help='Skip automatic context classification, use stock_product for all')
     
     # Rollback command
     rollback_parser = subparsers.add_parser('rollback', help='Restore images from backups')
@@ -2130,7 +2296,9 @@ if __name__ == "__main__":
         backup_dir=args.backup_dir,
         verify=args.verify,
         cache_dir=cache_dir,
-        ensemble_passes=args.ensemble
+        ensemble_passes=args.ensemble,
+        context_override=args.context,
+        skip_context_classification=args.no_context_classification
     )
     elapsed_time = time.time() - start_time
     logger.info(f"Completed processing {len(results)} images in {elapsed_time:.2f} seconds")
