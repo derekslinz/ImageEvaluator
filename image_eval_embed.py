@@ -30,6 +30,7 @@ from PIL import Image, ImageStat
 from colorama import Fore, Style
 from pydantic import BaseModel, ConfigDict, field_validator
 from tqdm import tqdm
+from profile_config import PROFILE_CONFIG
 
 try:
     import rawpy
