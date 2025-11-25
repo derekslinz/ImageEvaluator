@@ -1281,56 +1281,55 @@ def create_enhanced_prompt(base_prompt: str, exif_data: Dict, technical_metrics:
     return base_prompt
 
 
-def build_nima_metadata(nima_scores: Dict[str, Any], technical_metrics: Dict, model_type: str,
-                       score_shift: float = 0.0) -> Dict[str, Any]:
-    """Convert raw NIMA outputs into the metadata structure used throughout the pipeline."""
-    mean_score = float(nima_scores.get('mean_score', 0.0))
-    overall_score = mean_score * 10.0
-    if score_shift:
-        overall_score += score_shift
-    overall_score = max(1, min(100, int(round(overall_score))))  # Convert scale 1–10 to 1–100 with shift
-    distribution = nima_scores.get('score_distribution', [])
+def build_nima_metadata(
+    aesthetic_scores: Dict[str, Any],
+    technical_scores: Optional[Dict[str, Any]],
+    aesthetic_model_type: str,
+    score_shift: float = 0.0,
+    technical_shift: float = 0.0
+) -> Dict[str, Any]:
+    """Convert NIMA outputs into the metadata structure used throughout the pipeline."""
+    mean_score = float(aesthetic_scores.get('mean_score', 0.0))
+    overall_score = mean_score * 10.0 + score_shift
+    overall_score = max(1, min(100, int(round(overall_score))))
+    distribution = aesthetic_scores.get('score_distribution', [])
     distribution_str = json.dumps(distribution) if isinstance(distribution, (list, tuple)) else str(distribution)
     
-    metadata = {
+    metadata: Dict[str, Any] = {
         'overall_score': str(overall_score),
-        'technical_score': str(overall_score),
         'composition_score': str(overall_score),
         'lighting_score': str(overall_score),
         'creativity_score': str(overall_score),
         'score': str(overall_score),
-        'title': f"NIMA {model_type.title()} Score",
-        'description': f"NIMA {model_type} mean score {mean_score:.2f}/10 (overall {overall_score}/100)",
-        'keywords': f"nima,{model_type},automated score",
+        'title': f"NIMA {aesthetic_model_type.title()} Score",
+        'description': f"NIMA {aesthetic_model_type} mean score {mean_score:.2f}/10 (overall {overall_score}/100)",
+        'keywords': f"nima,{aesthetic_model_type},automated score",
         'nima_mean_score': f"{mean_score:.3f}",
         'nima_distribution': distribution_str,
-        'nima_model_type': model_type.lower(),
+        'nima_model_type': aesthetic_model_type.lower(),
+        'technical_warnings': [],
     }
+    
+    technical_metrics: Dict[str, Any] = {}
+    if technical_scores is not None:
+        tech_mean = float(technical_scores.get('mean_score', 0.0))
+        tech_score = tech_mean * 10.0 + technical_shift
+        tech_score = max(1, min(100, int(round(tech_score))))
+        metadata['technical_score'] = str(tech_score)
+        metadata['nima_technical_mean_score'] = f"{tech_mean:.3f}"
+        metadata['nima_technical_model_type'] = 'technical'
+        technical_metrics = {
+            'context': 'nima_technical',
+            'nima_technical_mean_score': f"{tech_mean:.3f}",
+            'nima_technical_score': tech_score,
+        }
+        metadata['post_process_potential'] = tech_score
+    else:
+        metadata['technical_score'] = str(overall_score)
+        metadata['post_process_potential'] = overall_score
     
     metadata['technical_metrics'] = technical_metrics
-    metadata['technical_warnings'] = technical_metrics.get('warnings', [])
-    metadata['post_process_potential'] = technical_metrics.get('post_process_potential')
-    
     return metadata
-
-
-def default_technical_metrics() -> Dict[str, Any]:
-    """Return a minimal technical-metrics stub when context analysis is skipped."""
-    profile = TECH_PROFILES['stock_product']
-    return {
-        'context': 'stock_product',
-        'context_profile': profile['name'],
-        'sharpness': '',
-        'brightness': '',
-        'contrast': '',
-        'histogram_clipping_highlights': '',
-        'histogram_clipping_shadows': '',
-        'color_cast': '',
-        'noise_sigma': '',
-        'noise_score': '',
-        'warnings': [],
-        'post_process_potential': profile.get('post_base', 50),
-    }
 
 
 def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str,
@@ -1575,6 +1574,8 @@ def embed_metadata_exiftool(image_path: str, metadata: Dict, backup_dir: Optiona
         
         # Build exiftool command
         # UserComment for score, XPTitle, XPComment (description), XPKeywords
+        technical_str = metadata.get("technical_score", "")
+
         cmd = [
             'exiftool',
             '-overwrite_original',  # Don't create _original files
@@ -1582,6 +1583,7 @@ def embed_metadata_exiftool(image_path: str, metadata: Dict, backup_dir: Optiona
             f'-XPTitle={metadata.get("title", "")}',
             f'-XPComment={metadata.get("description", "")}',
             f'-XPKeywords={metadata.get("keywords", "")}',
+            f'-XPSubject={technical_str}',
             image_path
         ]
         
@@ -1594,6 +1596,8 @@ def embed_metadata_exiftool(image_path: str, metadata: Dict, backup_dir: Optiona
         
         if result.returncode == 0:
             print(f"{Fore.BLUE}Embedding score:{Fore.RESET} {Fore.GREEN}{metadata.get('score', '')}{Fore.RESET}")
+            if technical_str:
+                print(f"{Fore.BLUE}Embedding technical score:{Fore.RESET} {Fore.GREEN}{technical_str}{Fore.RESET}")
             print(f"{Fore.BLUE}Embedding Title:{Fore.RESET} {Fore.GREEN}{metadata.get('title', '')}{Fore.RESET}")
             print(f"{Fore.BLUE}Embedding Description:{Fore.RESET} {Fore.GREEN}{metadata.get('description', '')}{Fore.RESET}")
             print(f"{Fore.BLUE}Embedding Keywords:{Fore.RESET} {Fore.GREEN}{metadata.get('keywords', '')}{Fore.RESET}")
@@ -1653,6 +1657,11 @@ def embed_metadata(image_path: str, metadata: Dict, backup_dir: Optional[str] = 
             keywords = metadata.get('keywords', '').encode('utf-16le') + b'\x00\x00'
             exif_dict["0th"][piexif.ImageIFD.XPKeywords] = keywords
             print(f"{Fore.BLUE}Embedding Keywords:{Fore.RESET} {Fore.GREEN}{metadata.get('keywords', '')}{Fore.RESET}")
+
+            technical_value = metadata.get('technical_score', '')
+            exif_dict["0th"][piexif.ImageIFD.XPSubject] = (str(technical_value).encode('utf-16le') + b'\x00\x00')
+            if technical_value:
+                print(f"{Fore.BLUE}Embedding technical score:{Fore.RESET} {Fore.GREEN}{technical_value}{Fore.RESET}")
 
             # Prepare Exif data with sanitized strings
             exif_bytes = piexif.dump(exif_dict)
@@ -1855,7 +1864,8 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
                         dry_run: bool = False, backup_dir: Optional[str] = None, verify: bool = False,
                         cache_dir: Optional[str] = None, ensemble_passes: int = 1,
                         context_override: Optional[str] = None, skip_context_classification: bool = False,
-                        scoring_engine: str = 'ollama', nima_backend: Optional[NimaScorer] = None) -> Tuple[str, Optional[Dict]]:
+                        scoring_engine: str = 'ollama', nima_backend: Optional[NimaScorer] = None,
+                        nima_technical_backend: Optional[NimaScorer] = None) -> Tuple[str, Optional[Dict]]:
     """Process a single image using the selected scoring engine and return result."""
     logger.debug(f"Processing image: {image_path}")
     headers = {'Content-Type': 'application/json'}
@@ -1883,13 +1893,11 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
         with open(image_path, 'rb') as image_file:
             encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
     
-    technical_metrics: Dict[str, Any]
+    technical_metrics: Dict[str, Any] = {}
     technical_warnings: List[str] = []
     exif_data: Dict = {}
     
-    if scoring_engine == 'nima':
-        technical_metrics = default_technical_metrics()
-    else:
+    if scoring_engine == 'ollama':
         _, exif_data, technical_metrics, technical_warnings = analyze_image_with_context(
             image_path, ollama_host_url, model, context_override, skip_context_classification
         )
@@ -1901,16 +1909,18 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
     
     # Step 4 (NIMA backend): short-circuit with local inference
     if scoring_engine == 'nima':
-        if not nima_backend:
+        if not nima_backend or not nima_technical_backend:
             logger.error("NIMA backend requested but not initialized.")
             return (image_path, None)
         try:
-            nima_scores = nima_backend.score_image(image_path)
+            aesthetic_scores = nima_backend.score_image(image_path)
+            technical_scores = nima_technical_backend.score_image(image_path)
             response_metadata = build_nima_metadata(
-                nima_scores,
-                technical_metrics,
+                aesthetic_scores,
+                technical_scores,
                 nima_backend.model_type,
-                score_shift=nima_backend.score_shift if hasattr(nima_backend, "score_shift") else 0.0,
+                score_shift=getattr(nima_backend, "score_shift", 0.0),
+                technical_shift=getattr(nima_technical_backend, "score_shift", 0.0),
             )
         except Exception as e:
             logger.error(f"NIMA evaluation failed for {image_path}: {e}")
@@ -1922,7 +1932,10 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
 
         try:
             embed_metadata(image_path, response_metadata, backup_dir, verify)
-            logger.info(f"NIMA score for {image_path}: {response_metadata.get('score')}")
+            logger.info(
+                f"NIMA scores for {image_path}: overall {response_metadata.get('score')} / "
+                f"technical {response_metadata.get('technical_score')}"
+            )
             return (image_path, response_metadata)
         except Exception as e:
             logger.error(f"Error embedding NIMA metadata for {image_path}: {e}")
@@ -2008,6 +2021,7 @@ def process_images_with_nima_batches(
     context_override: Optional[str],
     skip_context_classification: bool,
     nima_backend: NimaScorer,
+    nima_technical_backend: NimaScorer,
     min_score: Optional[int],
     nima_batch_size: int,
     dry_run: bool
@@ -2024,26 +2038,31 @@ def process_images_with_nima_batches(
         pending.clear()
         batch_paths = [item['image_path'] for item in batch]
         scores = nima_backend.score_batch(batch_paths)
+        technical_scores = nima_technical_backend.score_batch(batch_paths)
         batch_results: List[Tuple[str, Optional[Dict]]] = []
         for item in batch:
             image_path = item['image_path']
-            technical_metrics = item['technical_metrics']
             score_payload = scores.get(image_path)
             if not score_payload:
                 logger.error(f"NIMA did not return a score for {image_path}")
                 batch_results.append((image_path, None))
                 continue
+            technical_payload = technical_scores.get(image_path)
             response_metadata = build_nima_metadata(
                 score_payload,
-                technical_metrics,
+                technical_payload,
                 nima_backend.model_type,
                 score_shift=nima_backend.score_shift,
+                technical_shift=nima_technical_backend.score_shift,
             )
             if cache_dir:
                 save_to_cache(image_path, model, response_metadata, cache_dir)
             try:
                 embed_metadata(image_path, response_metadata, backup_dir, verify)
-                logger.info(f"NIMA score for {image_path}: {response_metadata.get('score')}")
+                logger.info(
+                    f"NIMA scores for {image_path}: overall {response_metadata.get('score')} / "
+                    f"technical {response_metadata.get('technical_score')}"
+                )
             except Exception as e:
                 logger.error(f"Error embedding NIMA metadata for {image_path}: {e}")
                 batch_results.append((image_path, None))
@@ -2068,11 +2087,7 @@ def process_images_with_nima_batches(
                 pbar.update(1)
                 continue
 
-            technical_metrics = default_technical_metrics()
-            pending.append({
-                'image_path': image_path,
-                'technical_metrics': technical_metrics,
-            })
+            pending.append({'image_path': image_path})
             if len(pending) >= batch_size:
                 batch_results = flush_pending()
                 pbar.update(len(batch_results))
@@ -2112,6 +2127,7 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
                             skip_context_classification: bool = False,
                             scoring_engine: str = 'ollama',
                             nima_backend: Optional[NimaScorer] = None,
+                            nima_technical_backend: Optional[NimaScorer] = None,
                             nima_batch_size: int = 16) -> List[Tuple[str, Optional[Dict]]]:
     """Process images with parallel execution and progress bar."""
     # Collect all images to process
@@ -2122,8 +2138,8 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
         return []
     
     if scoring_engine == 'nima':
-        if nima_backend is None:
-            logger.error("NIMA backend selected but not initialized.")
+        if nima_backend is None or nima_technical_backend is None:
+            logger.error("NIMA backend selected but not fully initialized.")
             return []
         return process_images_with_nima_batches(
             image_paths=image_paths,
@@ -2135,6 +2151,7 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
             context_override=context_override,
             skip_context_classification=skip_context_classification,
             nima_backend=nima_backend,
+            nima_technical_backend=nima_technical_backend,
             min_score=min_score,
             nima_batch_size=nima_batch_size,
             dry_run=dry_run
@@ -2160,7 +2177,8 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
                 context_override,
                 skip_context_classification,
                 scoring_engine,
-                nima_backend
+                nima_backend,
+                nima_technical_backend
             ): path 
             for path in image_paths
         }
@@ -2262,6 +2280,36 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                 })
 
 
+def load_results_from_csv(csv_path: str) -> List[Tuple[str, Optional[Dict]]]:
+    """Load previously saved results so statistics can be recomputed without reprocessing."""
+    results: List[Tuple[str, Optional[Dict]]] = []
+    with open(csv_path, 'r', encoding='utf-8', newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            metadata: Optional[Dict[str, Any]]
+            if row.get('status') == 'failed':
+                metadata = None
+            else:
+                metadata = {
+                    'overall_score': row.get('overall_score', ''),
+                    'score': row.get('overall_score', ''),
+                    'technical_score': row.get('technical_score', ''),
+                    'composition_score': row.get('composition_score', ''),
+                    'lighting_score': row.get('lighting_score', ''),
+                    'creativity_score': row.get('creativity_score', ''),
+                    'title': row.get('title', ''),
+                    'description': row.get('description', ''),
+                    'keywords': row.get('keywords', ''),
+                    'technical_warnings': row.get('technical_warnings', '').split('; ') if row.get('technical_warnings') else [],
+                    'post_process_potential': row.get('post_process_potential', ''),
+                    'nima_mean_score': row.get('nima_mean_score', ''),
+                    'nima_distribution': row.get('nima_distribution', ''),
+                    'nima_model_type': row.get('nima_model_type', ''),
+                }
+            results.append((row.get('file_path', ''), metadata))
+    return results
+
+
 def get_cache_stats(cache_dir: str) -> Dict:
     """Get cache statistics."""
     if not cache_dir or not os.path.exists(cache_dir):
@@ -2283,6 +2331,7 @@ def get_cache_stats(cache_dir: str) -> Dict:
 def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
     """Calculate statistics from processing results."""
     scores = []
+    tech_scores: List[int] = []
     raw_count = 0
     pil_count = 0
     potentials = []
@@ -2309,6 +2358,13 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
                         scores.append(score)
             except (ValueError, AttributeError):
                 continue
+        if metadata and metadata.get('technical_score'):
+            try:
+                tech_val = int(str(metadata['technical_score']))
+                if 1 <= tech_val <= 100:
+                    tech_scores.append(tech_val)
+            except (ValueError, TypeError):
+                pass
         if metadata and 'post_process_potential' in metadata:
             try:
                 potentials.append(int(metadata['post_process_potential']))
@@ -2326,6 +2382,7 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
             'min_score': 0,
             'max_score': 0,
             'score_distribution': {},
+            'technical_score_distribution': {},
         'raw_count': raw_count,
         'pil_count': pil_count,
         'warning_images': warning_images,
@@ -2334,10 +2391,13 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
     
     # Calculate score distribution (bins of 5)
     distribution = {}
+    tech_distribution = {}
     for i in range(0, 100, 5):
         bin_label = f"{i}-{i+4}"
         distribution[bin_label] = sum(1 for s in scores if i <= s < i+5)
+        tech_distribution[bin_label] = sum(1 for s in tech_scores if i <= s < i+5)
     distribution["95-100"] = sum(1 for s in scores if 95 <= s <= 100)
+    tech_distribution["95-100"] = sum(1 for s in tech_scores if 95 <= s <= 100)
     
     # Calculate statistical measures
     avg_score = sum(scores) / len(scores) if scores else 0
@@ -2371,7 +2431,22 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
         'raw_count': raw_count,
         'pil_count': pil_count,
         'warning_images': warning_images,
-        'avg_post_process_potential': sum(potentials)/len(potentials) if potentials else 0
+        'avg_post_process_potential': sum(potentials)/len(potentials) if potentials else 0,
+        'technical_score_distribution': tech_distribution,
+        'avg_technical_score': (sum(tech_scores) / len(tech_scores)) if tech_scores else 0,
+        'technical_min_score': min(tech_scores) if tech_scores else 0,
+        'technical_max_score': max(tech_scores) if tech_scores else 0,
+        'technical_median_score': (
+            sorted(tech_scores)[len(tech_scores) // 2] if tech_scores and len(tech_scores) % 2 == 1
+            else ((sorted(tech_scores)[len(tech_scores) // 2 - 1] + sorted(tech_scores)[len(tech_scores) // 2]) / 2)
+            if tech_scores else 0
+        ),
+        'technical_q1': (sorted(tech_scores)[len(tech_scores) // 4] if len(tech_scores) >= 4 else (sorted(tech_scores)[0] if tech_scores else 0)),
+        'technical_q3': (sorted(tech_scores)[(3 * len(tech_scores)) // 4] if len(tech_scores) >= 4 else (sorted(tech_scores)[-1] if tech_scores else 0)),
+        'technical_std_dev': (
+            (sum((s - ((sum(tech_scores)/len(tech_scores)) if tech_scores else 0)) ** 2 for s in tech_scores) / len(tech_scores)) ** 0.5
+            if tech_scores and len(tech_scores) > 1 else 0
+        )
     }
 
 
@@ -2409,6 +2484,15 @@ def print_statistics(stats: Dict):
         print(f"Standard deviation: {stats.get('std_dev', 0):.2f}")
         print(f"Range: {stats['min_score']} - {stats['max_score']}")
         print(f"Quartiles (Q1/Q3): {stats.get('q1', 0):.0f} / {stats.get('q3', 0):.0f}")
+        if stats.get('technical_score_distribution'):
+            print(f"\n{'-'*60}")
+            print(f"TECHNICAL SCORE SUMMARY")
+            print(f"{'-'*60}")
+            print(f"Average technical score: {stats.get('avg_technical_score', 0):.2f}")
+            print(f"Median technical score: {stats.get('technical_median_score', 0):.2f}")
+            print(f"Technical std dev: {stats.get('technical_std_dev', 0):.2f}")
+            print(f"Technical range: {stats.get('technical_min_score', 0)} - {stats.get('technical_max_score', 0)}")
+            print(f"Technical quartiles (Q1/Q3): {stats.get('technical_q1', 0):.0f} / {stats.get('technical_q3', 0):.0f}")
         avg_post = stats.get('avg_post_process_potential')
         if avg_post is not None:
             print(f"Average post-process potential: {avg_post:.1f}/100")
@@ -2416,9 +2500,29 @@ def print_statistics(stats: Dict):
         print(f"\n{'='*60}")
         print(f"SCORE DISTRIBUTION")
         print(f"{'='*60}")
-        for bin_range, count in sorted(stats['score_distribution'].items()):
-            bar = '█' * count
+        score_bins_sorted = sorted(
+            stats['score_distribution'].items(),
+            key=lambda item: int(item[0].split('-')[0])
+        )
+        max_overall = max((count for _, count in score_bins_sorted), default=1)
+        scale_overall = max_overall / 80 if max_overall > 80 else 1
+        for bin_range, count in score_bins_sorted:
+            bar = '█' * max(1, int(count / scale_overall))
             print(f"{bin_range:>8}: {bar} ({count})")
+        tech_dist = stats.get('technical_score_distribution')
+        if tech_dist:
+            print(f"\n{'='*60}")
+            print(f"TECHNICAL SCORE DISTRIBUTION")
+            print(f"{'='*60}")
+            tech_bins_sorted = sorted(
+                tech_dist.items(),
+                key=lambda item: int(item[0].split('-')[0])
+            )
+            max_tech = max((count for _, count in tech_bins_sorted), default=1)
+            scale_tech = max_tech / 80 if max_tech > 80 else 1
+            for bin_range, count in tech_bins_sorted:
+                bar = '█' * max(1, int(count / scale_tech))
+                print(f"{bin_range:>8}: {bar} ({count})")
     
     print(f"\n{'='*60}")
     print(f"Note: JPEG/PNG use PIL, RAW/TIFF use exiftool for metadata embedding")
@@ -2468,7 +2572,7 @@ def prepare_cli_args(cli_args: List[str]) -> Tuple[List[str], Optional[str]]:
         return ['process'], 'implicit'
     if cli_args[0] in ('-h', '--help'):
         return cli_args, None
-    if cli_args[0] in {'process', 'rollback'}:
+    if cli_args[0] in {'process', 'rollback', 'stats'}:
         return cli_args, None
     return ['process'] + cli_args, 'inferred'
 
@@ -2504,16 +2608,20 @@ if __name__ == "__main__":
                                help=f'Model identifier (LLM name or custom label). Default: {DEFAULT_MODEL}')
     process_parser.add_argument('--score-engine', choices=['ollama', 'nima'], default='ollama',
                                help='Choose between Ollama (LLM) or local NIMA scoring')
-    process_parser.add_argument('--nima-model-type', choices=['aesthetic', 'technical'], default='aesthetic',
-                               help='NIMA head to use when --score-engine nima')
+    process_parser.add_argument('--nima-model-type', choices=['aesthetic', 'technical', 'both'], default='both',
+                               help='NIMA head to use for overall scoring (technical head still runs by default)')
     process_parser.add_argument('--nima-base-model', type=str, default='MobileNet',
                                help='Base CNN used for the NIMA model (default: MobileNet)')
     process_parser.add_argument('--nima-weights', type=str, default=None,
-                               help='Override path to NIMA weight file (.hdf5). Defaults to bundled weights if available')
+                               help='Override path to NIMA aesthetic weight file (.hdf5). Defaults to bundled weights if available')
+    process_parser.add_argument('--nima-technical-weights', type=str, default=None,
+                               help='Override path to NIMA technical weight file (.hdf5). Defaults to bundled weights if available')
     process_parser.add_argument('--nima-batch-size', type=int, default=16,
                                help='Number of images to score per NIMA batch (default: 16)')
     process_parser.add_argument('--nima-score-shift', type=float, default=27.0,
                                help='Additive adjustment (in 0-100 scale) applied to all NIMA scores (default: 27)')
+    process_parser.add_argument('--nima-technical-score-shift', type=float, default=27.0,
+                               help='Additive adjustment (0-100 scale) applied to all NIMA technical scores (default: 27)')
     process_parser.add_argument('--prompt-file', type=str, default=None, help='Path to custom prompt file (overrides default prompt)')
     process_parser.add_argument('--skip-existing', action='store_true', default=True, help='Skip images with existing metadata (default: True)')
     process_parser.add_argument('--no-skip-existing', action='store_false', dest='skip_existing', help='Process all images, even with existing metadata')
@@ -2538,6 +2646,10 @@ if __name__ == "__main__":
     rollback_parser = subparsers.add_parser('rollback', help='Restore images from backups')
     rollback_parser.add_argument('folder_path', type=str, help='Path to the folder containing images')
     rollback_parser.add_argument('--backup-dir', type=str, default=None, help='Directory where backups are stored')
+
+    # Stats command
+    stats_parser = subparsers.add_parser('stats', help='Print statistics for an existing CSV report')
+    stats_parser.add_argument('csv_path', type=str, help='Path to a CSV created by this tool')
     
     raw_cli_args = sys.argv[1:]
     normalized_args, inferred_command = prepare_cli_args(raw_cli_args)
@@ -2554,6 +2666,15 @@ if __name__ == "__main__":
         if args.backup_dir:
             print(f"Using backup directory: {args.backup_dir}")
         rollback_images(args.folder_path, getattr(args, 'backup_dir', None))
+        sys.exit(0)
+
+    if args.command == 'stats':
+        if not os.path.exists(args.csv_path):
+            logger.error(f"CSV file '{args.csv_path}' not found.")
+            sys.exit(1)
+        results = load_results_from_csv(args.csv_path)
+        stats = calculate_statistics(results)
+        print_statistics(stats)
         sys.exit(0)
     
     # Fill in defaults for positional arguments when omitted
@@ -2597,7 +2718,9 @@ if __name__ == "__main__":
         logger.info(f"API response caching enabled: {cache_dir}")
 
     nima_backend = None
+    nima_technical_backend = None
     nima_weights_path_str: Optional[str] = None
+    nima_technical_weights_path_str: Optional[str] = None
     nima_context_forced = False
 
     # Validate folder path
@@ -2624,7 +2747,8 @@ if __name__ == "__main__":
         if not NIMA_AVAILABLE:
             logger.error("NIMA backend requested but dependencies are missing. Install TensorFlow/Keras per image-quality-assessment requirements.")
             sys.exit(1)
-        weights_path = args.nima_weights or get_default_nima_weights(args.nima_model_type)
+        nima_overall_model_type = 'aesthetic' if args.nima_model_type in (None, 'both') else args.nima_model_type
+        weights_path = args.nima_weights or get_default_nima_weights(nima_overall_model_type)
         if not weights_path:
             logger.error("Could not locate NIMA weights. Provide --nima-weights pointing to an .hdf5 file.")
             sys.exit(1)
@@ -2632,15 +2756,31 @@ if __name__ == "__main__":
             nima_backend = NimaScorer(
                 base_model_name=args.nima_base_model,
                 weights_path=weights_path,
-                model_type=args.nima_model_type,
+                model_type=nima_overall_model_type,
                 score_shift=args.nima_score_shift,
             )
         except Exception as e:
             logger.error(f"Failed to initialize NIMA backend: {e}")
             sys.exit(1)
+        tech_weights_path = args.nima_technical_weights or get_default_nima_weights('technical')
+        if not tech_weights_path:
+            logger.error("Could not locate NIMA technical weights. Provide --nima-technical-weights pointing to an .hdf5 file.")
+            sys.exit(1)
+        try:
+            nima_technical_backend = NimaScorer(
+                base_model_name=args.nima_base_model,
+                weights_path=tech_weights_path,
+                model_type='technical',
+                score_shift=args.nima_technical_score_shift,
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize NIMA technical backend: {e}")
+            sys.exit(1)
         args.model = nima_backend.model_label
         nima_weights_path_str = str(weights_path)
+        nima_technical_weights_path_str = str(tech_weights_path)
         logger.info(f"Initialized NIMA backend ({nima_backend.model_label}) with weights: {nima_weights_path_str}")
+        logger.info(f"Initialized NIMA technical backend ({nima_technical_backend.model_label}) with weights: {nima_technical_weights_path_str}")
         if not args.context and not args.no_context_classification:
             args.no_context_classification = True
             nima_context_forced = True
@@ -2663,13 +2803,18 @@ if __name__ == "__main__":
     print(f"Scoring engine: {args.score_engine}")
     if args.score_engine == 'nima':
         print(f"NIMA base model: {args.nima_base_model}")
+        print(f"NIMA overall head: {nima_overall_model_type}")
         if nima_weights_path_str:
             print(f"NIMA weights: {nima_weights_path_str}")
+        if nima_technical_weights_path_str:
+            print(f"NIMA technical weights: {nima_technical_weights_path_str}")
         if nima_context_forced:
             print("Context classification: disabled (NIMA default)")
         print(f"NIMA batch size: {args.nima_batch_size}")
         if args.nima_score_shift:
             print(f"NIMA score shift: {args.nima_score_shift:+.2f}")
+        if args.nima_technical_score_shift:
+            print(f"NIMA technical score shift: {args.nima_technical_score_shift:+.2f}")
     print(f"Workers: {args.workers}")
     if args.score_engine == 'nima' and args.workers > 1:
         print("Note: NIMA backend runs sequentially; worker count will be limited to 1.")
@@ -2720,6 +2865,7 @@ if __name__ == "__main__":
         skip_context_classification=args.no_context_classification,
         scoring_engine=args.score_engine,
         nima_backend=nima_backend,
+        nima_technical_backend=nima_technical_backend,
         nima_batch_size=args.nima_batch_size
     )
     elapsed_time = time.time() - start_time
