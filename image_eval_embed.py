@@ -16,7 +16,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import math
 import numpy as np
@@ -44,6 +44,119 @@ Image.MAX_IMAGE_PIXELS = None  # Remove limit entirely (or set to a higher value
 # Configure basic logging (will be updated based on verbose flag)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Optional NIMA backend support
+NIMA_SRC_DIR = Path(__file__).parent / "image-quality-assessment" / "src"
+if NIMA_SRC_DIR.exists():
+    nima_src_path = str(NIMA_SRC_DIR)
+    if nima_src_path not in sys.path:
+        sys.path.append(nima_src_path)
+
+try:
+    from handlers.model_builder import Nima as NimaModel  # type: ignore
+    from utils import utils as nima_utils  # type: ignore
+    NIMA_AVAILABLE = True
+except Exception as nima_import_error:  # pragma: no cover - optional dependency
+    NIMA_AVAILABLE = False
+    NimaModel = None  # type: ignore
+    nima_utils = None  # type: ignore
+    logger.debug(f"NIMA backend unavailable: {nima_import_error}")
+
+DEFAULT_NIMA_WEIGHTS = {
+    'aesthetic': Path(__file__).parent / 'image-quality-assessment' / 'models' / 'MobileNet' / 'weights_mobilenet_aesthetic_0.07.hdf5',
+    'technical': Path(__file__).parent / 'image-quality-assessment' / 'models' / 'MobileNet' / 'weights_mobilenet_technical_0.11.hdf5',
+}
+
+
+def get_default_nima_weights(model_type: str) -> Optional[Path]:
+    """Return the bundled weights path for the requested NIMA model type, if available."""
+    weights_path = DEFAULT_NIMA_WEIGHTS.get(model_type.lower())
+    if weights_path and weights_path.exists():
+        return weights_path
+    return None
+
+
+class NimaScorer:
+    """Lightweight wrapper around the bundled NIMA models for local inference."""
+
+    def __init__(self, base_model_name: str, weights_path: Union[str, Path], model_type: str = 'aesthetic',
+                 score_shift: float = 0.0):
+        if not NIMA_AVAILABLE:
+            raise RuntimeError("NIMA backend is unavailable. Ensure TensorFlow/Keras dependencies are installed.")
+
+        self.base_model_name = base_model_name
+        self.model_type = model_type.lower()
+        self.weights_path = Path(weights_path)
+        if not self.weights_path.exists():
+            raise FileNotFoundError(f"NIMA weights not found at {self.weights_path}")
+
+        self.input_size = (224, 224)
+        self.model_label = f"nima_{self.model_type}_{self.base_model_name.lower()}"
+        self.score_shift = score_shift
+        self._build_model()
+
+    def _build_model(self) -> None:
+        assert NimaModel is not None and nima_utils is not None  # for type checkers
+        self.nima = NimaModel(self.base_model_name, weights=None)
+        self.nima.build()
+        self.nima.nima_model.load_weights(str(self.weights_path))
+        self.preprocess_fn = self.nima.preprocessing_function()
+
+    def score_image(self, image_path: str) -> Dict[str, Any]:
+        """Return the mean score (1-10) and raw distribution for a single image."""
+        assert nima_utils is not None
+        image_array = nima_utils.load_image(image_path, self.input_size)
+        if image_array is None:
+            raise ValueError(f"Unable to load image for NIMA scoring: {image_path}")
+
+        batch = np.expand_dims(image_array, axis=0)
+        batch = self.preprocess_fn(batch)
+        predictions = self.nima.nima_model.predict(batch, verbose=0)
+
+        if predictions.size == 0:
+            raise RuntimeError("NIMA returned empty predictions.")
+
+        score_distribution = predictions[0]
+        mean_score = float(nima_utils.calc_mean_score(score_distribution))
+        return {
+            'mean_score': mean_score,
+            'score_distribution': score_distribution.tolist(),
+        }
+
+    def score_batch(self, image_paths: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Score a batch of images efficiently. Returns mapping of path -> score info."""
+        assert nima_utils is not None
+        batch_arrays: List[np.ndarray] = []
+        valid_paths: List[str] = []
+        for image_path in image_paths:
+            try:
+                image_array = nima_utils.load_image(image_path, self.input_size)
+            except Exception as exc:  # pragma: no cover - depends on TF
+                logger.error(f"Failed to load image for NIMA scoring ({image_path}): {exc}")
+                continue
+            if image_array is None:
+                logger.error(f"NIMA scoring skipped (empty image array) for {image_path}")
+                continue
+            batch_arrays.append(image_array)
+            valid_paths.append(image_path)
+
+        if not batch_arrays:
+            return {}
+
+        batch = np.stack(batch_arrays, axis=0)
+        batch = self.preprocess_fn(batch)
+        predictions = self.nima.nima_model.predict(batch, verbose=0)
+
+        results: Dict[str, Dict[str, Any]] = {}
+        for idx, image_path in enumerate(valid_paths):
+            score_distribution = predictions[idx]
+            mean_score = float(nima_utils.calc_mean_score(score_distribution))
+            results[image_path] = {
+                'mean_score': mean_score,
+                'score_distribution': score_distribution.tolist(),
+            }
+        return results
+
 
 def _is_raw_image(image_path: str) -> bool:
     return Path(image_path).suffix.lower() in RAW_EXTENSIONS
@@ -1168,6 +1281,103 @@ def create_enhanced_prompt(base_prompt: str, exif_data: Dict, technical_metrics:
     return base_prompt
 
 
+def build_nima_metadata(nima_scores: Dict[str, Any], technical_metrics: Dict, model_type: str,
+                       score_shift: float = 0.0) -> Dict[str, Any]:
+    """Convert raw NIMA outputs into the metadata structure used throughout the pipeline."""
+    mean_score = float(nima_scores.get('mean_score', 0.0))
+    overall_score = mean_score * 10.0
+    if score_shift:
+        overall_score += score_shift
+    overall_score = max(1, min(100, int(round(overall_score))))  # Convert scale 1–10 to 1–100 with shift
+    distribution = nima_scores.get('score_distribution', [])
+    distribution_str = json.dumps(distribution) if isinstance(distribution, (list, tuple)) else str(distribution)
+    
+    metadata = {
+        'overall_score': str(overall_score),
+        'technical_score': str(overall_score),
+        'composition_score': str(overall_score),
+        'lighting_score': str(overall_score),
+        'creativity_score': str(overall_score),
+        'score': str(overall_score),
+        'title': f"NIMA {model_type.title()} Score",
+        'description': f"NIMA {model_type} mean score {mean_score:.2f}/10 (overall {overall_score}/100)",
+        'keywords': f"nima,{model_type},automated score",
+        'nima_mean_score': f"{mean_score:.3f}",
+        'nima_distribution': distribution_str,
+        'nima_model_type': model_type.lower(),
+    }
+    
+    metadata['technical_metrics'] = technical_metrics
+    metadata['technical_warnings'] = technical_metrics.get('warnings', [])
+    metadata['post_process_potential'] = technical_metrics.get('post_process_potential')
+    
+    return metadata
+
+
+def default_technical_metrics() -> Dict[str, Any]:
+    """Return a minimal technical-metrics stub when context analysis is skipped."""
+    profile = TECH_PROFILES['stock_product']
+    return {
+        'context': 'stock_product',
+        'context_profile': profile['name'],
+        'sharpness': '',
+        'brightness': '',
+        'contrast': '',
+        'histogram_clipping_highlights': '',
+        'histogram_clipping_shadows': '',
+        'color_cast': '',
+        'noise_sigma': '',
+        'noise_score': '',
+        'warnings': [],
+        'post_process_potential': profile.get('post_base', 50),
+    }
+
+
+def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str,
+                               context_override: Optional[str], skip_context_classification: bool
+                               ) -> Tuple[str, Dict, Dict, List[str]]:
+    """Determine context, extract EXIF, and compute technical metrics for an image."""
+    if context_override:
+        image_context = context_override if context_override in TECH_PROFILES else 'stock_product'
+        logger.info(f"Using manual context override: {image_context}")
+    elif skip_context_classification:
+        image_context = 'stock_product'
+        logger.debug(f"Context classification disabled, using default: {image_context}")
+    else:
+        try:
+            image_context = classify_image_context(image_path, ollama_host_url, model)
+        except Exception as e:
+            logger.warning(f"Context classification failed for {image_path}: {e}, using default")
+            image_context = 'stock_product'
+
+    logger.info(f"Image context for {image_path}: {image_context} ({TECH_PROFILES[image_context]['name']})")
+
+    exif_data = extract_exif_metadata(image_path)
+
+    iso_value = exif_data.get('iso')
+    if isinstance(iso_value, str):
+        try:
+            iso_str = iso_value.replace('ISO', '').replace(',', '').strip()
+            if '/' in iso_str:
+                iso_str = iso_str.split('/')[0]
+            iso_value = int(float(iso_str))
+        except (ValueError, AttributeError):
+            logger.debug(f"Could not parse ISO value: {iso_value}")
+            iso_value = None
+    elif isinstance(iso_value, float):
+        iso_value = int(iso_value)
+
+    technical_metrics = analyze_image_technical(image_path, iso_value, context=image_context)
+    if technical_metrics.get('status') == 'error':
+        logger.warning(f"Technical analysis failed for {image_path}, using default metrics")
+
+    technical_warnings = assess_technical_metrics(technical_metrics, context=image_context)
+    technical_metrics['warnings'] = technical_warnings
+    technical_metrics['post_process_potential'] = compute_post_process_potential(technical_metrics, context=image_context)
+
+    return image_context, exif_data, technical_metrics, technical_warnings
+
+
 def setup_logging(log_file: Optional[str] = None, verbose: bool = False):
     """Configure logging with file handler and appropriate level."""
     # Set level based on verbose flag
@@ -1644,8 +1854,9 @@ def ensemble_evaluate(image_path: str, encoded_image: str, ollama_host_url: str,
 def process_single_image(image_path: str, ollama_host_url: str, model: str, prompt: str, 
                         dry_run: bool = False, backup_dir: Optional[str] = None, verify: bool = False,
                         cache_dir: Optional[str] = None, ensemble_passes: int = 1,
-                        context_override: Optional[str] = None, skip_context_classification: bool = False) -> Tuple[str, Optional[Dict]]:
-    """Process a single image and return result."""
+                        context_override: Optional[str] = None, skip_context_classification: bool = False,
+                        scoring_engine: str = 'ollama', nima_backend: Optional[NimaScorer] = None) -> Tuple[str, Optional[Dict]]:
+    """Process a single image using the selected scoring engine and return result."""
     logger.debug(f"Processing image: {image_path}")
     headers = {'Content-Type': 'application/json'}
     
@@ -1666,62 +1877,58 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
             logger.error(f"Error embedding cached metadata for {image_path}: {e}")
             return (image_path, None)
     
-    # Encode image once for all operations
-    with open(image_path, 'rb') as image_file:
-        encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
+    # Encode image once for all operations (only needed for Ollama backend)
+    encoded_image = None
+    if scoring_engine == 'ollama':
+        with open(image_path, 'rb') as image_file:
+            encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
     
-    # Step 1: Determine image context
-    if context_override:
-        # Use manual override
-        image_context = context_override if context_override in TECH_PROFILES else 'stock_product'
-        logger.info(f"Using manual context override: {image_context}")
-    elif skip_context_classification:
-        # Skip classification entirely
-        image_context = 'stock_product'
-        logger.debug(f"Context classification disabled, using default: {image_context}")
+    technical_metrics: Dict[str, Any]
+    technical_warnings: List[str] = []
+    exif_data: Dict = {}
+    
+    if scoring_engine == 'nima':
+        technical_metrics = default_technical_metrics()
     else:
-        # Classify image context (handles RAW files automatically)
+        _, exif_data, technical_metrics, technical_warnings = analyze_image_with_context(
+            image_path, ollama_host_url, model, context_override, skip_context_classification
+        )
+    
+    # Step 3: Enhance prompt with technical context (only needed for Ollama backend)
+    enhanced_prompt = prompt
+    if scoring_engine == 'ollama':
+        enhanced_prompt = create_enhanced_prompt(prompt, exif_data, technical_metrics)
+    
+    # Step 4 (NIMA backend): short-circuit with local inference
+    if scoring_engine == 'nima':
+        if not nima_backend:
+            logger.error("NIMA backend requested but not initialized.")
+            return (image_path, None)
         try:
-            image_context = classify_image_context(image_path, ollama_host_url, model)
+            nima_scores = nima_backend.score_image(image_path)
+            response_metadata = build_nima_metadata(
+                nima_scores,
+                technical_metrics,
+                nima_backend.model_type,
+                score_shift=nima_backend.score_shift if hasattr(nima_backend, "score_shift") else 0.0,
+            )
         except Exception as e:
-            logger.warning(f"Context classification failed for {image_path}: {e}, using default")
-            image_context = 'stock_product'
-    
-    logger.info(f"Image context for {image_path}: {image_context} ({TECH_PROFILES[image_context]['name']})")
-    
-    # Step 2: Extract EXIF and technical metrics with context
-    exif_data = extract_exif_metadata(image_path)
-    
-    # Convert ISO from string to int if needed (handle various formats)
-    iso_value = exif_data.get('iso')
-    if isinstance(iso_value, str):
-        try:
-            # Handle formats: "ISO 1600", "1600", "1,600", "1600/3200" (dual ISO)
-            iso_str = iso_value.replace('ISO', '').replace(',', '').strip()
-            # For dual ISO, take the first value
-            if '/' in iso_str:
-                iso_str = iso_str.split('/')[0]
-            iso_value = int(float(iso_str))  # Handle "100.0" format
-        except (ValueError, AttributeError):
-            logger.debug(f"Could not parse ISO value: {iso_value}")
-            iso_value = None
-    elif isinstance(iso_value, float):
-        iso_value = int(iso_value)
-    
-    technical_metrics = analyze_image_technical(image_path, iso_value, context=image_context)
-    
-    # Check if technical analysis succeeded
-    if technical_metrics.get('status') == 'error':
-        logger.warning(f"Technical analysis failed for {image_path}, using default metrics")
-    
-    technical_warnings = assess_technical_metrics(technical_metrics, context=image_context)
-    technical_metrics['warnings'] = technical_warnings
-    technical_metrics['post_process_potential'] = compute_post_process_potential(technical_metrics, context=image_context)
+            logger.error(f"NIMA evaluation failed for {image_path}: {e}")
+            return (image_path, None)
 
-    # Step 3: Enhance prompt with technical context
-    enhanced_prompt = create_enhanced_prompt(prompt, exif_data, technical_metrics)
-    
-    # Step 4: Retry logic for malformed responses
+        if cache_dir:
+            save_to_cache(image_path, model, response_metadata, cache_dir)
+            logger.debug(f"Saved NIMA response to cache for {image_path}")
+
+        try:
+            embed_metadata(image_path, response_metadata, backup_dir, verify)
+            logger.info(f"NIMA score for {image_path}: {response_metadata.get('score')}")
+            return (image_path, response_metadata)
+        except Exception as e:
+            logger.error(f"Error embedding NIMA metadata for {image_path}: {e}")
+            return (image_path, None)
+
+    # Step 4: Retry logic for malformed responses (Ollama backend)
     max_attempts = 3
     for attempt in range(max_attempts):
         try:
@@ -1770,6 +1977,131 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
     return (image_path, None)
 
 
+def _handle_cached_or_dry_run(image_path: str, cache_dir: Optional[str], model: str,
+                              backup_dir: Optional[str], verify: bool,
+                              dry_run: bool) -> Optional[Tuple[str, Optional[Dict]]]:
+    """Return immediate result for dry-run or cached entries."""
+    if dry_run:
+        logger.debug(f"Dry run - skipping processing for {image_path}")
+        return (image_path, {'score': '0', 'title': '[DRY RUN]', 'description': 'Would process this image', 'keywords': 'dry-run'})
+
+    if cache_dir:
+        cached_metadata = load_from_cache(image_path, model, cache_dir)
+        if cached_metadata:
+            logger.info(f"Using cached result for {image_path}")
+            try:
+                embed_metadata(image_path, cached_metadata, backup_dir, verify)
+                return (image_path, cached_metadata)
+            except Exception as e:
+                logger.error(f"Error embedding cached metadata for {image_path}: {e}")
+                return (image_path, None)
+    return None
+
+
+def process_images_with_nima_batches(
+    image_paths: List[str],
+    ollama_host_url: str,
+    model: str,
+    cache_dir: Optional[str],
+    backup_dir: Optional[str],
+    verify: bool,
+    context_override: Optional[str],
+    skip_context_classification: bool,
+    nima_backend: NimaScorer,
+    min_score: Optional[int],
+    nima_batch_size: int,
+    dry_run: bool
+) -> List[Tuple[str, Optional[Dict]]]:
+    """Process images using local NIMA scoring with batching."""
+    batch_size = max(1, nima_batch_size)
+    results: List[Tuple[str, Optional[Dict]]] = []
+    pending: List[Dict[str, Any]] = []
+
+    def flush_pending() -> List[Tuple[str, Optional[Dict]]]:
+        if not pending:
+            return []
+        batch = pending.copy()
+        pending.clear()
+        batch_paths = [item['image_path'] for item in batch]
+        scores = nima_backend.score_batch(batch_paths)
+        batch_results: List[Tuple[str, Optional[Dict]]] = []
+        for item in batch:
+            image_path = item['image_path']
+            technical_metrics = item['technical_metrics']
+            score_payload = scores.get(image_path)
+            if not score_payload:
+                logger.error(f"NIMA did not return a score for {image_path}")
+                batch_results.append((image_path, None))
+                continue
+            response_metadata = build_nima_metadata(
+                score_payload,
+                technical_metrics,
+                nima_backend.model_type,
+                score_shift=nima_backend.score_shift,
+            )
+            if cache_dir:
+                save_to_cache(image_path, model, response_metadata, cache_dir)
+            try:
+                embed_metadata(image_path, response_metadata, backup_dir, verify)
+                logger.info(f"NIMA score for {image_path}: {response_metadata.get('score')}")
+            except Exception as e:
+                logger.error(f"Error embedding NIMA metadata for {image_path}: {e}")
+                batch_results.append((image_path, None))
+                continue
+            batch_results.append((image_path, response_metadata))
+        return batch_results
+
+    with tqdm(total=len(image_paths), desc="Processing images", unit="img") as pbar:
+        for image_path in image_paths:
+            immediate = _handle_cached_or_dry_run(image_path, cache_dir, model, backup_dir, verify, dry_run=dry_run)
+            if immediate:
+                path, metadata = immediate
+                if min_score is None or metadata is None:
+                    results.append((path, metadata))
+                else:
+                    try:
+                        score = int(validate_score(metadata.get('score', '0')) or 0)
+                        if score >= min_score:
+                            results.append((path, metadata))
+                    except (ValueError, TypeError):
+                        results.append((path, metadata))
+                pbar.update(1)
+                continue
+
+            technical_metrics = default_technical_metrics()
+            pending.append({
+                'image_path': image_path,
+                'technical_metrics': technical_metrics,
+            })
+            if len(pending) >= batch_size:
+                batch_results = flush_pending()
+                pbar.update(len(batch_results))
+                for path, metadata in batch_results:
+                    if min_score is not None and metadata is not None:
+                        try:
+                            score = int(validate_score(metadata.get('score', '0')) or 0)
+                            if score < min_score:
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+                    results.append((path, metadata))
+
+        # Flush leftovers
+        batch_results = flush_pending()
+        pbar.update(len(batch_results))
+        for path, metadata in batch_results:
+            if min_score is not None and metadata is not None:
+                try:
+                    score = int(validate_score(metadata.get('score', '0')) or 0)
+                    if score < min_score:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            results.append((path, metadata))
+
+    return results
+
+
 def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers: int = 4, 
                             model: str = DEFAULT_MODEL, prompt: str = DEFAULT_PROMPT,
                             file_types: Optional[List[str]] = None, skip_existing: bool = True,
@@ -1777,7 +2109,10 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
                             backup_dir: Optional[str] = None, verify: bool = False,
                             cache_dir: Optional[str] = None, ensemble_passes: int = 1,
                             context_override: Optional[str] = None,
-                            skip_context_classification: bool = False) -> List[Tuple[str, Optional[Dict]]]:
+                            skip_context_classification: bool = False,
+                            scoring_engine: str = 'ollama',
+                            nima_backend: Optional[NimaScorer] = None,
+                            nima_batch_size: int = 16) -> List[Tuple[str, Optional[Dict]]]:
     """Process images with parallel execution and progress bar."""
     # Collect all images to process
     image_paths = collect_images(folder_path, file_types=file_types, skip_existing=skip_existing)
@@ -1786,7 +2121,26 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
         logger.warning("No images found to process")
         return []
     
-    results = []
+    if scoring_engine == 'nima':
+        if nima_backend is None:
+            logger.error("NIMA backend selected but not initialized.")
+            return []
+        return process_images_with_nima_batches(
+            image_paths=image_paths,
+            ollama_host_url=ollama_host_url,
+            model=model,
+            cache_dir=cache_dir,
+            backup_dir=backup_dir,
+            verify=verify,
+            context_override=context_override,
+            skip_context_classification=skip_context_classification,
+            nima_backend=nima_backend,
+            min_score=min_score,
+            nima_batch_size=nima_batch_size,
+            dry_run=dry_run
+        )
+
+    results: List[Tuple[str, Optional[Dict]]] = []
     
     # Process images in parallel with progress bar
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1804,7 +2158,9 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
                 cache_dir,
                 ensemble_passes,
                 context_override,
-                skip_context_classification
+                skip_context_classification,
+                scoring_engine,
+                nima_backend
             ): path 
             for path in image_paths
         }
@@ -1838,7 +2194,8 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
             'lighting_score', 'creativity_score', 'title', 'description',
             'keywords', 'status', 'context', 'context_profile', 'sharpness', 'brightness', 'contrast',
             'histogram_clipping_highlights', 'histogram_clipping_shadows',
-            'color_cast', 'noise_sigma', 'noise_score', 'technical_warnings', 'post_process_potential'
+            'color_cast', 'noise_sigma', 'noise_score', 'technical_warnings', 'post_process_potential',
+            'nima_mean_score', 'nima_distribution', 'nima_model_type'
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
@@ -1870,6 +2227,9 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'noise_score': technical_metrics.get('noise_score', ''),
                     'technical_warnings': warnings_str,
                     'post_process_potential': metadata.get('post_process_potential', ''),
+                    'nima_mean_score': metadata.get('nima_mean_score', ''),
+                    'nima_distribution': metadata.get('nima_distribution', ''),
+                    'nima_model_type': metadata.get('nima_model_type', ''),
                     'status': 'success'
                 })
             else:
@@ -1895,7 +2255,10 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'noise_sigma': '',
                     'noise_score': '',
                     'technical_warnings': '',
-                    'post_process_potential': ''
+                    'post_process_potential': '',
+                    'nima_mean_score': '',
+                    'nima_distribution': '',
+                    'nima_model_type': ''
                 })
 
 
@@ -2137,7 +2500,20 @@ if __name__ == "__main__":
         help=f'Number of parallel workers (default: IMAGE_EVAL_WORKERS or {DEFAULT_WORKER_COUNT})'
     )
     process_parser.add_argument('--csv', type=str, default=None, help='Path to save CSV report (default: auto-generated)')
-    process_parser.add_argument('--model', type=str, default=DEFAULT_MODEL, help=f'Ollama model to use (default: {DEFAULT_MODEL})')
+    process_parser.add_argument('--model', type=str, default=DEFAULT_MODEL,
+                               help=f'Model identifier (LLM name or custom label). Default: {DEFAULT_MODEL}')
+    process_parser.add_argument('--score-engine', choices=['ollama', 'nima'], default='ollama',
+                               help='Choose between Ollama (LLM) or local NIMA scoring')
+    process_parser.add_argument('--nima-model-type', choices=['aesthetic', 'technical'], default='aesthetic',
+                               help='NIMA head to use when --score-engine nima')
+    process_parser.add_argument('--nima-base-model', type=str, default='MobileNet',
+                               help='Base CNN used for the NIMA model (default: MobileNet)')
+    process_parser.add_argument('--nima-weights', type=str, default=None,
+                               help='Override path to NIMA weight file (.hdf5). Defaults to bundled weights if available')
+    process_parser.add_argument('--nima-batch-size', type=int, default=16,
+                               help='Number of images to score per NIMA batch (default: 16)')
+    process_parser.add_argument('--nima-score-shift', type=float, default=27.0,
+                               help='Additive adjustment (in 0-100 scale) applied to all NIMA scores (default: 27)')
     process_parser.add_argument('--prompt-file', type=str, default=None, help='Path to custom prompt file (overrides default prompt)')
     process_parser.add_argument('--skip-existing', action='store_true', default=True, help='Skip images with existing metadata (default: True)')
     process_parser.add_argument('--no-skip-existing', action='store_false', dest='skip_existing', help='Process all images, even with existing metadata')
@@ -2220,6 +2596,10 @@ if __name__ == "__main__":
         os.makedirs(cache_dir, exist_ok=True)
         logger.info(f"API response caching enabled: {cache_dir}")
 
+    nima_backend = None
+    nima_weights_path_str: Optional[str] = None
+    nima_context_forced = False
+
     # Validate folder path
     if not os.path.exists(args.folder_path):
         logger.error(f"The folder path '{args.folder_path}' does not exist.")
@@ -2239,6 +2619,33 @@ if __name__ == "__main__":
         logger.error(f"No image files found in the directory '{args.folder_path}' or its subdirectories.")
         sys.exit(1)
 
+    # Initialize NIMA backend if requested
+    if args.score_engine == 'nima':
+        if not NIMA_AVAILABLE:
+            logger.error("NIMA backend requested but dependencies are missing. Install TensorFlow/Keras per image-quality-assessment requirements.")
+            sys.exit(1)
+        weights_path = args.nima_weights or get_default_nima_weights(args.nima_model_type)
+        if not weights_path:
+            logger.error("Could not locate NIMA weights. Provide --nima-weights pointing to an .hdf5 file.")
+            sys.exit(1)
+        try:
+            nima_backend = NimaScorer(
+                base_model_name=args.nima_base_model,
+                weights_path=weights_path,
+                model_type=args.nima_model_type,
+                score_shift=args.nima_score_shift,
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize NIMA backend: {e}")
+            sys.exit(1)
+        args.model = nima_backend.model_label
+        nima_weights_path_str = str(weights_path)
+        logger.info(f"Initialized NIMA backend ({nima_backend.model_label}) with weights: {nima_weights_path_str}")
+        if not args.context and not args.no_context_classification:
+            args.no_context_classification = True
+            nima_context_forced = True
+            logger.info("NIMA mode: context classification disabled (override with --context or --no-context-classification).")
+
     # Load custom prompt if specified
     prompt = DEFAULT_PROMPT
     if args.prompt_file:
@@ -2253,7 +2660,19 @@ if __name__ == "__main__":
     
     print(f"\nProcessing images from: {Style.BRIGHT}{args.folder_path}{Style.RESET_ALL}")
     print(f"Model: {args.model}")
+    print(f"Scoring engine: {args.score_engine}")
+    if args.score_engine == 'nima':
+        print(f"NIMA base model: {args.nima_base_model}")
+        if nima_weights_path_str:
+            print(f"NIMA weights: {nima_weights_path_str}")
+        if nima_context_forced:
+            print("Context classification: disabled (NIMA default)")
+        print(f"NIMA batch size: {args.nima_batch_size}")
+        if args.nima_score_shift:
+            print(f"NIMA score shift: {args.nima_score_shift:+.2f}")
     print(f"Workers: {args.workers}")
+    if args.score_engine == 'nima' and args.workers > 1:
+        print("Note: NIMA backend runs sequentially; worker count will be limited to 1.")
     print(f"Skip existing: {args.skip_existing}")
     if args.ensemble > 1:
         print(f"{Fore.CYAN}Ensemble mode: {args.ensemble} evaluation passes per image{Fore.RESET}")
@@ -2298,7 +2717,10 @@ if __name__ == "__main__":
         cache_dir=cache_dir,
         ensemble_passes=args.ensemble,
         context_override=args.context,
-        skip_context_classification=args.no_context_classification
+        skip_context_classification=args.no_context_classification,
+        scoring_engine=args.score_engine,
+        nima_backend=nima_backend,
+        nima_batch_size=args.nima_batch_size
     )
     elapsed_time = time.time() - start_time
     logger.info(f"Completed processing {len(results)} images in {elapsed_time:.2f} seconds")
