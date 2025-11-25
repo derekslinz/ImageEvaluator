@@ -59,10 +59,10 @@ def list_pyiqa_metrics() -> List[str]:
 
 def get_default_pyiqa_shift(model_name: str) -> float:
     defaults = {
-        'clipiqa+_vitl14_512': 22.0,
-        'maniqa': 22.0,
-        'maniqa-kadid': 22.0,
-        'maniqa-pipal': 22.0,
+        'clipiqa+_vitl14_512': 14.0,
+        'maniqa': 14.0,
+        'maniqa-kadid': 14.0,
+        'maniqa-pipal': 14.0,
     }
     return defaults.get(model_name.lower(), 0.0)
 
