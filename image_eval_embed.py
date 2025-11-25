@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -38,8 +38,40 @@ RAWPY_AVAILABLE = rawpy is not None
 RAWPY_IMPORT_WARNINGED = False
 RAW_EXTENSIONS = {'.nef', '.cr2', '.cr3', '.arw', '.rw2', '.raf', '.orf', '.dng'}
 
+try:
+    import torch
+    import pyiqa  # type: ignore
+    PYIQA_AVAILABLE = True
+except ImportError:
+    torch = None  # type: ignore
+    pyiqa = None  # type: ignore
+    PYIQA_AVAILABLE = False
+
+
+def list_pyiqa_metrics() -> List[str]:
+    if not PYIQA_AVAILABLE or pyiqa is None:
+        return []
+    try:
+        return sorted(getattr(pyiqa, "AVAILABLE_METRICS", []))
+    except Exception:
+        return []
+
+
+def get_default_pyiqa_shift(model_name: str) -> float:
+    defaults = {
+        'clipiqa+_vitl14_512': 22.0,
+        'maniqa': 22.0,
+        'maniqa-kadid': 22.0,
+        'maniqa-pipal': 22.0,
+    }
+    return defaults.get(model_name.lower(), 0.0)
+
 # Increase PIL decompression bomb limit for large legitimate images
 Image.MAX_IMAGE_PIXELS = None  # Remove limit entirely (or set to a higher value like 500000000)
+
+
+PYIQA_MAX_LONG_EDGE = 2048
+
 
 # Configure basic logging (will be updated based on verbose flag)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -74,6 +106,26 @@ def get_default_nima_weights(model_type: str) -> Optional[Path]:
     if weights_path and weights_path.exists():
         return weights_path
     return None
+
+
+def load_image_tensor_with_max_edge(image_path: str, max_long_edge: int) -> Optional["torch.Tensor"]:
+    if torch is None:
+        return None
+    try:
+        with Image.open(image_path) as img:
+            img = img.convert('RGB')
+            w, h = img.size
+            long_edge = max(w, h)
+            if long_edge > max_long_edge and max_long_edge > 0:
+                scale = max_long_edge / float(long_edge)
+                new_size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+                img = img.resize(new_size, Image.LANCZOS)
+            np_img = np.asarray(img).astype('float32') / 255.0
+    except Exception as exc:
+        logger.error(f'Failed to load image for PyIQA preprocessing {image_path}: {exc}')
+        return None
+    tensor = torch.from_numpy(np_img).permute(2, 0, 1).unsqueeze(0)
+    return tensor
 
 
 class NimaScorer:
@@ -156,6 +208,71 @@ class NimaScorer:
                 'score_distribution': score_distribution.tolist(),
             }
         return results
+
+
+class PyIqaScorer:
+    """Wrapper around PyIQA metrics for local inference."""
+
+    def __init__(self, model_name: str = 'musiq', device: Optional[str] = None,
+                 score_shift: float = 0.0, scale_factor: Optional[float] = None,
+                 max_long_edge: int = PYIQA_MAX_LONG_EDGE):
+        if not PYIQA_AVAILABLE:
+            raise RuntimeError("PyIQA backend is unavailable. Install torch and pyiqa to use this scoring engine.")
+        available = list_pyiqa_metrics()
+        canonical_name = model_name
+        if available:
+            lower_lookup = {name.lower(): name for name in available}
+            match = lower_lookup.get(model_name.lower())
+            if not match:
+                raise RuntimeError(
+                    f"PyIQA metric '{model_name}' not available. Installed metrics: {', '.join(available)}"
+                )
+            canonical_name = match
+        self.model_name = canonical_name
+        desired_device = device or ('cuda' if torch and torch.cuda.is_available() else 'cpu')
+        if torch is None:
+            raise RuntimeError("PyIQA requires PyTorch, but it could not be imported.")
+        if desired_device.startswith('cuda') and not torch.cuda.is_available():
+            logger.warning("Requested CUDA for PyIQA but no GPU detected; falling back to CPU.")
+            desired_device = 'cpu'
+        self.device = desired_device
+        self.metric = pyiqa.create_metric(canonical_name, device=self.device)
+        self.score_shift = score_shift
+        self.scale_factor = scale_factor
+        self.max_long_edge = max_long_edge
+        self.use_amp = bool(torch) and self.device.startswith('cuda')
+
+    def score_batch(self, image_paths: List[str]) -> Dict[str, float]:
+        results: Dict[str, float] = {}
+        autocast_ctx = (lambda: torch.amp.autocast('cuda')) if self.use_amp and torch is not None else nullcontext
+        with torch.no_grad():
+            for image_path in image_paths:
+                try:
+                    image_tensor = load_image_tensor_with_max_edge(image_path, self.max_long_edge) if torch is not None else None
+                    if image_tensor is not None:
+                        image_tensor = image_tensor.to(self.device)
+                        with autocast_ctx():
+                            score = self.metric(image_tensor)
+                    else:
+                        with autocast_ctx():
+                            score = self.metric(image_path)
+                    if hasattr(score, 'item'):
+                        value = float(score.item())
+                    else:
+                        value = float(score)
+                    results[image_path] = value
+                except Exception as exc:
+                    logger.error(f"PyIQA scoring failed for {image_path}: {exc}")
+        return results
+
+    def convert_score(self, raw_score: float) -> float:
+        if self.scale_factor is not None:
+            return raw_score * self.scale_factor
+        if 0.0 <= raw_score <= 1.0:
+            return raw_score * 100.0
+        if 0.0 <= raw_score <= 10.0:
+            return raw_score * 10.0
+        return raw_score
 
 
 def _is_raw_image(image_path: str) -> bool:
@@ -1332,6 +1449,29 @@ def build_nima_metadata(
     return metadata
 
 
+def build_pyiqa_metadata(raw_score: float, calibrated_score: float, model_name: str, score_shift: float = 0.0) -> Dict[str, Any]:
+    """Build metadata entries for PyIQA-based scoring."""
+    overall_score = max(1, min(100, int(round(calibrated_score + score_shift))))
+    metadata: Dict[str, Any] = {
+        'overall_score': str(overall_score),
+        'technical_score': '',
+        'composition_score': str(overall_score),
+        'lighting_score': str(overall_score),
+        'creativity_score': str(overall_score),
+        'score': str(overall_score),
+        'title': f"PyIQA {model_name} score",
+        'description': f"PyIQA {model_name} raw {raw_score:.4f} (scaled {calibrated_score:.2f}, calibrated {overall_score}/100)",
+        'keywords': f"pyiqa,{model_name},automated score",
+        'pyiqa_raw_score': f"{raw_score:.4f}",
+        'pyiqa_scaled_score': f"{calibrated_score:.4f}",
+        'pyiqa_model': model_name,
+        'technical_metrics': {},
+        'technical_warnings': [],
+        'post_process_potential': overall_score,
+    }
+    return metadata
+
+
 def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str,
                                context_override: Optional[str], skip_context_classification: bool
                                ) -> Tuple[str, Dict, Dict, List[str]]:
@@ -1865,7 +2005,8 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
                         cache_dir: Optional[str] = None, ensemble_passes: int = 1,
                         context_override: Optional[str] = None, skip_context_classification: bool = False,
                         scoring_engine: str = 'ollama', nima_backend: Optional[NimaScorer] = None,
-                        nima_technical_backend: Optional[NimaScorer] = None) -> Tuple[str, Optional[Dict]]:
+                        nima_technical_backend: Optional[NimaScorer] = None,
+                        pyiqa_backend: Optional[PyIqaScorer] = None) -> Tuple[str, Optional[Dict]]:
     """Process a single image using the selected scoring engine and return result."""
     logger.debug(f"Processing image: {image_path}")
     headers = {'Content-Type': 'application/json'}
@@ -1939,6 +2080,32 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
             return (image_path, response_metadata)
         except Exception as e:
             logger.error(f"Error embedding NIMA metadata for {image_path}: {e}")
+            return (image_path, None)
+
+    if scoring_engine == 'pyiqa':
+        if not pyiqa_backend:
+            logger.error("PyIQA backend requested but not initialized.")
+            return (image_path, None)
+        try:
+            score_value = pyiqa_backend.score_batch([image_path]).get(image_path)
+            if score_value is None:
+                logger.error(f"PyIQA did not return a score for {image_path}")
+                return (image_path, None)
+            scaled_score = pyiqa_backend.convert_score(score_value)
+            response_metadata = build_pyiqa_metadata(score_value, scaled_score, pyiqa_backend.model_name, pyiqa_backend.score_shift)
+        except Exception as e:
+            logger.error(f"PyIQA evaluation failed for {image_path}: {e}")
+            return (image_path, None)
+
+        if cache_dir:
+            save_to_cache(image_path, model, response_metadata, cache_dir)
+
+        try:
+            embed_metadata(image_path, response_metadata, backup_dir, verify)
+            logger.info(f"PyIQA score for {image_path}: {response_metadata.get('score')}")
+            return (image_path, response_metadata)
+        except Exception as e:
+            logger.error(f"Error embedding PyIQA metadata for {image_path}: {e}")
             return (image_path, None)
 
     # Step 4: Retry logic for malformed responses (Ollama backend)
@@ -2117,6 +2284,91 @@ def process_images_with_nima_batches(
     return results
 
 
+def process_images_with_pyiqa(
+    image_paths: List[str],
+    model: str,
+    cache_dir: Optional[str],
+    backup_dir: Optional[str],
+    verify: bool,
+    pyiqa_backend: "PyIqaScorer",
+    min_score: Optional[int],
+    batch_size: int,
+    dry_run: bool
+) -> List[Tuple[str, Optional[Dict]]]:
+    results: List[Tuple[str, Optional[Dict]]] = []
+    pending: List[str] = []
+
+    def flush_pending() -> List[Tuple[str, Optional[Dict]]]:
+        if not pending:
+            return []
+        batch = pending.copy()
+        pending.clear()
+        scores = pyiqa_backend.score_batch(batch)
+        batch_results: List[Tuple[str, Optional[Dict]]] = []
+        for image_path in batch:
+            score_value = scores.get(image_path)
+            if score_value is None:
+                batch_results.append((image_path, None))
+                continue
+            scaled_score = pyiqa_backend.convert_score(score_value)
+            response_metadata = build_pyiqa_metadata(score_value, scaled_score, pyiqa_backend.model_name, pyiqa_backend.score_shift)
+            if cache_dir:
+                save_to_cache(image_path, model, response_metadata, cache_dir)
+            try:
+                embed_metadata(image_path, response_metadata, backup_dir, verify)
+                logger.info(f"PyIQA score for {image_path}: {response_metadata.get('score')}")
+                batch_results.append((image_path, response_metadata))
+            except Exception as exc:
+                logger.error(f"Failed to embed PyIQA metadata for {image_path}: {exc}")
+                batch_results.append((image_path, None))
+        return batch_results
+
+    with tqdm(total=len(image_paths), desc="Processing images", unit="img") as pbar:
+        for image_path in image_paths:
+            immediate = _handle_cached_or_dry_run(image_path, cache_dir, model, backup_dir, verify, dry_run=dry_run)
+            if immediate:
+                path, metadata = immediate
+                if min_score is None or metadata is None:
+                    results.append((path, metadata))
+                else:
+                    try:
+                        score = int(validate_score(metadata.get('score', '0')) or 0)
+                        if score >= min_score:
+                            results.append((path, metadata))
+                    except (ValueError, TypeError):
+                        results.append((path, metadata))
+                pbar.update(1)
+                continue
+
+            pending.append(image_path)
+            if len(pending) >= batch_size:
+                batch_results = flush_pending()
+                pbar.update(len(batch_results))
+                for path, metadata in batch_results:
+                    if min_score is not None and metadata is not None:
+                        try:
+                            score = int(validate_score(metadata.get('score', '0')) or 0)
+                            if score < min_score:
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+                    results.append((path, metadata))
+
+        batch_results = flush_pending()
+        pbar.update(len(batch_results))
+        for path, metadata in batch_results:
+            if min_score is not None and metadata is not None:
+                try:
+                    score = int(validate_score(metadata.get('score', '0')) or 0)
+                    if score < min_score:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            results.append((path, metadata))
+
+    return results
+
+
 def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers: int = 4, 
                             model: str = DEFAULT_MODEL, prompt: str = DEFAULT_PROMPT,
                             file_types: Optional[List[str]] = None, skip_existing: bool = True,
@@ -2128,7 +2380,9 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
                             scoring_engine: str = 'ollama',
                             nima_backend: Optional[NimaScorer] = None,
                             nima_technical_backend: Optional[NimaScorer] = None,
-                            nima_batch_size: int = 16) -> List[Tuple[str, Optional[Dict]]]:
+                            nima_batch_size: int = 16,
+                            pyiqa_backend: Optional[PyIqaScorer] = None,
+                            pyiqa_batch_size: int = 16) -> List[Tuple[str, Optional[Dict]]]:
     """Process images with parallel execution and progress bar."""
     # Collect all images to process
     image_paths = collect_images(folder_path, file_types=file_types, skip_existing=skip_existing)
@@ -2156,6 +2410,21 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
             nima_batch_size=nima_batch_size,
             dry_run=dry_run
         )
+    if scoring_engine == 'pyiqa':
+        if pyiqa_backend is None:
+            logger.error("PyIQA backend selected but not initialized.")
+            return []
+        return process_images_with_pyiqa(
+            image_paths=image_paths,
+            model=model,
+            cache_dir=cache_dir,
+            backup_dir=backup_dir,
+            verify=verify,
+            pyiqa_backend=pyiqa_backend,
+            min_score=min_score,
+            batch_size=pyiqa_batch_size,
+            dry_run=dry_run
+        )
 
     results: List[Tuple[str, Optional[Dict]]] = []
     
@@ -2178,7 +2447,8 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
                 skip_context_classification,
                 scoring_engine,
                 nima_backend,
-                nima_technical_backend
+                nima_technical_backend,
+                pyiqa_backend
             ): path 
             for path in image_paths
         }
@@ -2391,13 +2661,17 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
     
     # Calculate score distribution (bins of 5)
     distribution = {}
-    tech_distribution = {}
     for i in range(0, 100, 5):
         bin_label = f"{i}-{i+4}"
         distribution[bin_label] = sum(1 for s in scores if i <= s < i+5)
-        tech_distribution[bin_label] = sum(1 for s in tech_scores if i <= s < i+5)
     distribution["95-100"] = sum(1 for s in scores if 95 <= s <= 100)
-    tech_distribution["95-100"] = sum(1 for s in tech_scores if 95 <= s <= 100)
+
+    tech_distribution: Dict[str, int] = {}
+    if tech_scores:
+        for i in range(0, 100, 5):
+            bin_label = f"{i}-{i+4}"
+            tech_distribution[bin_label] = sum(1 for s in tech_scores if i <= s < i+5)
+        tech_distribution["95-100"] = sum(1 for s in tech_scores if 95 <= s <= 100)
     
     # Calculate statistical measures
     avg_score = sum(scores) / len(scores) if scores else 0
@@ -2416,6 +2690,23 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
     q1 = sorted_scores[n // 4] if n >= 4 else sorted_scores[0]
     q3 = sorted_scores[(3 * n) // 4] if n >= 4 else sorted_scores[-1]
     
+    tech_avg = (sum(tech_scores) / len(tech_scores)) if tech_scores else None
+    tech_min = min(tech_scores) if tech_scores else None
+    tech_max = max(tech_scores) if tech_scores else None
+    if tech_scores:
+        sorted_tech = sorted(tech_scores)
+        tn = len(sorted_tech)
+        tech_median = sorted_tech[tn // 2] if tn % 2 == 1 else (sorted_tech[tn // 2 - 1] + sorted_tech[tn // 2]) / 2
+        tech_q1 = sorted_tech[tn // 4] if tn >= 4 else sorted_tech[0]
+        tech_q3 = sorted_tech[(3 * tn) // 4] if tn >= 4 else sorted_tech[-1]
+        if tn > 1:
+            tech_var = sum((s - tech_avg) ** 2 for s in tech_scores) / tn  # type: ignore
+            tech_std = tech_var ** 0.5
+        else:
+            tech_std = 0
+    else:
+        tech_median = tech_q1 = tech_q3 = tech_std = None
+
     return {
         'total_processed': len(results),
         'successful': len(scores),
@@ -2433,20 +2724,13 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
         'warning_images': warning_images,
         'avg_post_process_potential': sum(potentials)/len(potentials) if potentials else 0,
         'technical_score_distribution': tech_distribution,
-        'avg_technical_score': (sum(tech_scores) / len(tech_scores)) if tech_scores else 0,
-        'technical_min_score': min(tech_scores) if tech_scores else 0,
-        'technical_max_score': max(tech_scores) if tech_scores else 0,
-        'technical_median_score': (
-            sorted(tech_scores)[len(tech_scores) // 2] if tech_scores and len(tech_scores) % 2 == 1
-            else ((sorted(tech_scores)[len(tech_scores) // 2 - 1] + sorted(tech_scores)[len(tech_scores) // 2]) / 2)
-            if tech_scores else 0
-        ),
-        'technical_q1': (sorted(tech_scores)[len(tech_scores) // 4] if len(tech_scores) >= 4 else (sorted(tech_scores)[0] if tech_scores else 0)),
-        'technical_q3': (sorted(tech_scores)[(3 * len(tech_scores)) // 4] if len(tech_scores) >= 4 else (sorted(tech_scores)[-1] if tech_scores else 0)),
-        'technical_std_dev': (
-            (sum((s - ((sum(tech_scores)/len(tech_scores)) if tech_scores else 0)) ** 2 for s in tech_scores) / len(tech_scores)) ** 0.5
-            if tech_scores and len(tech_scores) > 1 else 0
-        )
+        'avg_technical_score': tech_avg,
+        'technical_min_score': tech_min,
+        'technical_max_score': tech_max,
+        'technical_median_score': tech_median,
+        'technical_q1': tech_q1,
+        'technical_q3': tech_q3,
+        'technical_std_dev': tech_std,
     }
 
 
@@ -2484,7 +2768,7 @@ def print_statistics(stats: Dict):
         print(f"Standard deviation: {stats.get('std_dev', 0):.2f}")
         print(f"Range: {stats['min_score']} - {stats['max_score']}")
         print(f"Quartiles (Q1/Q3): {stats.get('q1', 0):.0f} / {stats.get('q3', 0):.0f}")
-        if stats.get('technical_score_distribution'):
+        if stats.get('technical_score_distribution') and stats.get('avg_technical_score') is not None:
             print(f"\n{'-'*60}")
             print(f"TECHNICAL SCORE SUMMARY")
             print(f"{'-'*60}")
@@ -2510,7 +2794,7 @@ def print_statistics(stats: Dict):
             bar = '█' * max(1, int(count / scale_overall))
             print(f"{bin_range:>8}: {bar} ({count})")
         tech_dist = stats.get('technical_score_distribution')
-        if tech_dist:
+        if tech_dist and stats.get('avg_technical_score') is not None:
             print(f"\n{'='*60}")
             print(f"TECHNICAL SCORE DISTRIBUTION")
             print(f"{'='*60}")
@@ -2606,8 +2890,8 @@ if __name__ == "__main__":
     process_parser.add_argument('--csv', type=str, default=None, help='Path to save CSV report (default: auto-generated)')
     process_parser.add_argument('--model', type=str, default=DEFAULT_MODEL,
                                help=f'Model identifier (LLM name or custom label). Default: {DEFAULT_MODEL}')
-    process_parser.add_argument('--score-engine', choices=['ollama', 'nima'], default='ollama',
-                               help='Choose between Ollama (LLM) or local NIMA scoring')
+    process_parser.add_argument('--score-engine', choices=['ollama', 'nima', 'pyiqa'], default='pyiqa',
+                               help='Choose between Ollama (LLM), NIMA, or PyIQA scoring (default: PyIQA)')
     process_parser.add_argument('--nima-model-type', choices=['aesthetic', 'technical', 'both'], default='both',
                                help='NIMA head to use for overall scoring (technical head still runs by default)')
     process_parser.add_argument('--nima-base-model', type=str, default='MobileNet',
@@ -2622,6 +2906,16 @@ if __name__ == "__main__":
                                help='Additive adjustment (in 0-100 scale) applied to all NIMA scores (default: 27)')
     process_parser.add_argument('--nima-technical-score-shift', type=float, default=27.0,
                                help='Additive adjustment (0-100 scale) applied to all NIMA technical scores (default: 27)')
+    process_parser.add_argument('--pyiqa-model', type=str, default='clipiqa+_vitl14_512',
+                               help='PyIQA metric name to use when --score-engine pyiqa (default: clipiqa+_vitl14_512)')
+    process_parser.add_argument('--pyiqa-device', type=str, default=None,
+                               help='Device for PyIQA (e.g., cuda:0 or cpu). Defaults to CUDA if available.')
+    process_parser.add_argument('--pyiqa-score-shift', type=float, default=None,
+                               help='Additive adjustment (0-100 scale) applied to PyIQA scores (default: model-specific)')
+    process_parser.add_argument('--pyiqa-scale-factor', type=float, default=None,
+                               help='Optional multiplier applied to PyIQA raw scores before calibration (auto-detect if omitted)')
+    process_parser.add_argument('--pyiqa-batch-size', type=int, default=4,
+                               help='Images per batch for PyIQA evaluation (default: 4)')
     process_parser.add_argument('--prompt-file', type=str, default=None, help='Path to custom prompt file (overrides default prompt)')
     process_parser.add_argument('--skip-existing', action='store_true', default=True, help='Skip images with existing metadata (default: True)')
     process_parser.add_argument('--no-skip-existing', action='store_false', dest='skip_existing', help='Process all images, even with existing metadata')
@@ -2654,6 +2948,7 @@ if __name__ == "__main__":
     raw_cli_args = sys.argv[1:]
     normalized_args, inferred_command = prepare_cli_args(raw_cli_args)
     args = parser.parse_args(normalized_args)
+
     
     if inferred_command == 'implicit':
         print("No command supplied. Defaulting to 'process'.")
@@ -2719,6 +3014,7 @@ if __name__ == "__main__":
 
     nima_backend = None
     nima_technical_backend = None
+    pyiqa_backend = None
     nima_weights_path_str: Optional[str] = None
     nima_technical_weights_path_str: Optional[str] = None
     nima_context_forced = False
@@ -2785,6 +3081,25 @@ if __name__ == "__main__":
             args.no_context_classification = True
             nima_context_forced = True
             logger.info("NIMA mode: context classification disabled (override with --context or --no-context-classification).")
+    elif args.score_engine == 'pyiqa':
+        if not PYIQA_AVAILABLE:
+            logger.error("PyIQA backend requested but dependencies are missing. Install torch and pyiqa.")
+            sys.exit(1)
+        pyiqa_shift = args.pyiqa_score_shift
+        if pyiqa_shift is None:
+            pyiqa_shift = get_default_pyiqa_shift(args.pyiqa_model)
+        try:
+            pyiqa_backend = PyIqaScorer(
+                model_name=args.pyiqa_model,
+                device=args.pyiqa_device,
+                score_shift=pyiqa_shift,
+                scale_factor=args.pyiqa_scale_factor,
+                max_long_edge=PYIQA_MAX_LONG_EDGE,
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize PyIQA backend: {e}")
+            sys.exit(1)
+        args.model = f"pyiqa_{args.pyiqa_model}"
 
     # Load custom prompt if specified
     prompt = DEFAULT_PROMPT
@@ -2815,6 +3130,14 @@ if __name__ == "__main__":
             print(f"NIMA score shift: {args.nima_score_shift:+.2f}")
         if args.nima_technical_score_shift:
             print(f"NIMA technical score shift: {args.nima_technical_score_shift:+.2f}")
+    elif args.score_engine == 'pyiqa':
+        print(f"PyIQA model: {args.pyiqa_model}")
+        print(f"PyIQA device: {pyiqa_backend.device if pyiqa_backend else args.pyiqa_device}")
+        print(f"PyIQA batch size: {args.pyiqa_batch_size}")
+        if args.pyiqa_scale_factor:
+            print(f"PyIQA scale factor: {args.pyiqa_scale_factor}")
+        if pyiqa_backend:
+            print(f"PyIQA score shift: {pyiqa_backend.score_shift:+.2f}")
     print(f"Workers: {args.workers}")
     if args.score_engine == 'nima' and args.workers > 1:
         print("Note: NIMA backend runs sequentially; worker count will be limited to 1.")
@@ -2866,7 +3189,9 @@ if __name__ == "__main__":
         scoring_engine=args.score_engine,
         nima_backend=nima_backend,
         nima_technical_backend=nima_technical_backend,
-        nima_batch_size=args.nima_batch_size
+        nima_batch_size=args.nima_batch_size,
+        pyiqa_backend=pyiqa_backend,
+        pyiqa_batch_size=args.pyiqa_batch_size
     )
     elapsed_time = time.time() - start_time
     logger.info(f"Completed processing {len(results)} images in {elapsed_time:.2f} seconds")
