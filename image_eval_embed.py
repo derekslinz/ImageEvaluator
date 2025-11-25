@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import base64
 import csv
@@ -77,35 +79,8 @@ PYIQA_MAX_LONG_EDGE = 2048
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Optional NIMA backend support
-NIMA_SRC_DIR = Path(__file__).parent / "image-quality-assessment" / "src"
-if NIMA_SRC_DIR.exists():
-    nima_src_path = str(NIMA_SRC_DIR)
-    if nima_src_path not in sys.path:
-        sys.path.append(nima_src_path)
-
-try:
-    from handlers.model_builder import Nima as NimaModel  # type: ignore
-    from utils import utils as nima_utils  # type: ignore
-    NIMA_AVAILABLE = True
-except Exception as nima_import_error:  # pragma: no cover - optional dependency
-    NIMA_AVAILABLE = False
-    NimaModel = None  # type: ignore
-    nima_utils = None  # type: ignore
-    logger.debug(f"NIMA backend unavailable: {nima_import_error}")
-
-DEFAULT_NIMA_WEIGHTS = {
-    'aesthetic': Path(__file__).parent / 'image-quality-assessment' / 'models' / 'MobileNet' / 'weights_mobilenet_aesthetic_0.07.hdf5',
-    'technical': Path(__file__).parent / 'image-quality-assessment' / 'models' / 'MobileNet' / 'weights_mobilenet_technical_0.11.hdf5',
-}
 
 
-def get_default_nima_weights(model_type: str) -> Optional[Path]:
-    """Return the bundled weights path for the requested NIMA model type, if available."""
-    weights_path = DEFAULT_NIMA_WEIGHTS.get(model_type.lower())
-    if weights_path and weights_path.exists():
-        return weights_path
-    return None
 
 
 def load_image_tensor_with_max_edge(image_path: str, max_long_edge: int) -> Optional["torch.Tensor"]:
@@ -119,95 +94,13 @@ def load_image_tensor_with_max_edge(image_path: str, max_long_edge: int) -> Opti
             if long_edge > max_long_edge and max_long_edge > 0:
                 scale = max_long_edge / float(long_edge)
                 new_size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
-                img = img.resize(new_size, Image.LANCZOS)
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
             np_img = np.asarray(img).astype('float32') / 255.0
     except Exception as exc:
         logger.error(f'Failed to load image for PyIQA preprocessing {image_path}: {exc}')
         return None
     tensor = torch.from_numpy(np_img).permute(2, 0, 1).unsqueeze(0)
     return tensor
-
-
-class NimaScorer:
-    """Lightweight wrapper around the bundled NIMA models for local inference."""
-
-    def __init__(self, base_model_name: str, weights_path: Union[str, Path], model_type: str = 'aesthetic',
-                 score_shift: float = 0.0):
-        if not NIMA_AVAILABLE:
-            raise RuntimeError("NIMA backend is unavailable. Ensure TensorFlow/Keras dependencies are installed.")
-
-        self.base_model_name = base_model_name
-        self.model_type = model_type.lower()
-        self.weights_path = Path(weights_path)
-        if not self.weights_path.exists():
-            raise FileNotFoundError(f"NIMA weights not found at {self.weights_path}")
-
-        self.input_size = (224, 224)
-        self.model_label = f"nima_{self.model_type}_{self.base_model_name.lower()}"
-        self.score_shift = score_shift
-        self._build_model()
-
-    def _build_model(self) -> None:
-        assert NimaModel is not None and nima_utils is not None  # for type checkers
-        self.nima = NimaModel(self.base_model_name, weights=None)
-        self.nima.build()
-        self.nima.nima_model.load_weights(str(self.weights_path))
-        self.preprocess_fn = self.nima.preprocessing_function()
-
-    def score_image(self, image_path: str) -> Dict[str, Any]:
-        """Return the mean score (1-10) and raw distribution for a single image."""
-        assert nima_utils is not None
-        image_array = nima_utils.load_image(image_path, self.input_size)
-        if image_array is None:
-            raise ValueError(f"Unable to load image for NIMA scoring: {image_path}")
-
-        batch = np.expand_dims(image_array, axis=0)
-        batch = self.preprocess_fn(batch)
-        predictions = self.nima.nima_model.predict(batch, verbose=0)
-
-        if predictions.size == 0:
-            raise RuntimeError("NIMA returned empty predictions.")
-
-        score_distribution = predictions[0]
-        mean_score = float(nima_utils.calc_mean_score(score_distribution))
-        return {
-            'mean_score': mean_score,
-            'score_distribution': score_distribution.tolist(),
-        }
-
-    def score_batch(self, image_paths: List[str]) -> Dict[str, Dict[str, Any]]:
-        """Score a batch of images efficiently. Returns mapping of path -> score info."""
-        assert nima_utils is not None
-        batch_arrays: List[np.ndarray] = []
-        valid_paths: List[str] = []
-        for image_path in image_paths:
-            try:
-                image_array = nima_utils.load_image(image_path, self.input_size)
-            except Exception as exc:  # pragma: no cover - depends on TF
-                logger.error(f"Failed to load image for NIMA scoring ({image_path}): {exc}")
-                continue
-            if image_array is None:
-                logger.error(f"NIMA scoring skipped (empty image array) for {image_path}")
-                continue
-            batch_arrays.append(image_array)
-            valid_paths.append(image_path)
-
-        if not batch_arrays:
-            return {}
-
-        batch = np.stack(batch_arrays, axis=0)
-        batch = self.preprocess_fn(batch)
-        predictions = self.nima.nima_model.predict(batch, verbose=0)
-
-        results: Dict[str, Dict[str, Any]] = {}
-        for idx, image_path in enumerate(valid_paths):
-            score_distribution = predictions[idx]
-            mean_score = float(nima_utils.calc_mean_score(score_distribution))
-            results[image_path] = {
-                'mean_score': mean_score,
-                'score_distribution': score_distribution.tolist(),
-            }
-        return results
 
 
 class PyIqaScorer:
@@ -244,7 +137,11 @@ class PyIqaScorer:
 
     def score_batch(self, image_paths: List[str]) -> Dict[str, float]:
         results: Dict[str, float] = {}
-        autocast_ctx = (lambda: torch.amp.autocast('cuda')) if self.use_amp and torch is not None else nullcontext
+        if self.use_amp and torch is not None:
+            autocast_ctx = lambda: torch.amp.autocast('cuda')
+        else:
+            autocast_ctx = nullcontext
+        assert torch is not None, "PyTorch is required for PyIQA scoring but was not imported."
         with torch.no_grad():
             for image_path in image_paths:
                 try:
@@ -1398,57 +1295,6 @@ def create_enhanced_prompt(base_prompt: str, exif_data: Dict, technical_metrics:
     return base_prompt
 
 
-def build_nima_metadata(
-    aesthetic_scores: Dict[str, Any],
-    technical_scores: Optional[Dict[str, Any]],
-    aesthetic_model_type: str,
-    score_shift: float = 0.0,
-    technical_shift: float = 0.0
-) -> Dict[str, Any]:
-    """Convert NIMA outputs into the metadata structure used throughout the pipeline."""
-    mean_score = float(aesthetic_scores.get('mean_score', 0.0))
-    overall_score = mean_score * 10.0 + score_shift
-    overall_score = max(1, min(100, int(round(overall_score))))
-    distribution = aesthetic_scores.get('score_distribution', [])
-    distribution_str = json.dumps(distribution) if isinstance(distribution, (list, tuple)) else str(distribution)
-    
-    metadata: Dict[str, Any] = {
-        'overall_score': str(overall_score),
-        'composition_score': str(overall_score),
-        'lighting_score': str(overall_score),
-        'creativity_score': str(overall_score),
-        'score': str(overall_score),
-        'title': f"NIMA {aesthetic_model_type.title()} Score",
-        'description': f"NIMA {aesthetic_model_type} mean score {mean_score:.2f}/10 (overall {overall_score}/100)",
-        'keywords': f"nima,{aesthetic_model_type},automated score",
-        'nima_mean_score': f"{mean_score:.3f}",
-        'nima_distribution': distribution_str,
-        'nima_model_type': aesthetic_model_type.lower(),
-        'technical_warnings': [],
-    }
-    
-    technical_metrics: Dict[str, Any] = {}
-    if technical_scores is not None:
-        tech_mean = float(technical_scores.get('mean_score', 0.0))
-        tech_score = tech_mean * 10.0 + technical_shift
-        tech_score = max(1, min(100, int(round(tech_score))))
-        metadata['technical_score'] = str(tech_score)
-        metadata['nima_technical_mean_score'] = f"{tech_mean:.3f}"
-        metadata['nima_technical_model_type'] = 'technical'
-        technical_metrics = {
-            'context': 'nima_technical',
-            'nima_technical_mean_score': f"{tech_mean:.3f}",
-            'nima_technical_score': tech_score,
-        }
-        metadata['post_process_potential'] = tech_score
-    else:
-        metadata['technical_score'] = str(overall_score)
-        metadata['post_process_potential'] = overall_score
-    
-    metadata['technical_metrics'] = technical_metrics
-    return metadata
-
-
 def build_pyiqa_metadata(raw_score: float, calibrated_score: float, model_name: str, score_shift: float = 0.0) -> Dict[str, Any]:
     """Build metadata entries for PyIQA-based scoring."""
     overall_score = max(1, min(100, int(round(calibrated_score + score_shift))))
@@ -2004,8 +1850,7 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
                         dry_run: bool = False, backup_dir: Optional[str] = None, verify: bool = False,
                         cache_dir: Optional[str] = None, ensemble_passes: int = 1,
                         context_override: Optional[str] = None, skip_context_classification: bool = False,
-                        scoring_engine: str = 'ollama', nima_backend: Optional[NimaScorer] = None,
-                        nima_technical_backend: Optional[NimaScorer] = None,
+                        scoring_engine: str = 'ollama',
                         pyiqa_backend: Optional[PyIqaScorer] = None) -> Tuple[str, Optional[Dict]]:
     """Process a single image using the selected scoring engine and return result."""
     logger.debug(f"Processing image: {image_path}")
@@ -2047,40 +1892,6 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
     enhanced_prompt = prompt
     if scoring_engine == 'ollama':
         enhanced_prompt = create_enhanced_prompt(prompt, exif_data, technical_metrics)
-    
-    # Step 4 (NIMA backend): short-circuit with local inference
-    if scoring_engine == 'nima':
-        if not nima_backend or not nima_technical_backend:
-            logger.error("NIMA backend requested but not initialized.")
-            return (image_path, None)
-        try:
-            aesthetic_scores = nima_backend.score_image(image_path)
-            technical_scores = nima_technical_backend.score_image(image_path)
-            response_metadata = build_nima_metadata(
-                aesthetic_scores,
-                technical_scores,
-                nima_backend.model_type,
-                score_shift=getattr(nima_backend, "score_shift", 0.0),
-                technical_shift=getattr(nima_technical_backend, "score_shift", 0.0),
-            )
-        except Exception as e:
-            logger.error(f"NIMA evaluation failed for {image_path}: {e}")
-            return (image_path, None)
-
-        if cache_dir:
-            save_to_cache(image_path, model, response_metadata, cache_dir)
-            logger.debug(f"Saved NIMA response to cache for {image_path}")
-
-        try:
-            embed_metadata(image_path, response_metadata, backup_dir, verify)
-            logger.info(
-                f"NIMA scores for {image_path}: overall {response_metadata.get('score')} / "
-                f"technical {response_metadata.get('technical_score')}"
-            )
-            return (image_path, response_metadata)
-        except Exception as e:
-            logger.error(f"Error embedding NIMA metadata for {image_path}: {e}")
-            return (image_path, None)
 
     if scoring_engine == 'pyiqa':
         if not pyiqa_backend:
@@ -2178,112 +1989,6 @@ def _handle_cached_or_dry_run(image_path: str, cache_dir: Optional[str], model: 
     return None
 
 
-def process_images_with_nima_batches(
-    image_paths: List[str],
-    ollama_host_url: str,
-    model: str,
-    cache_dir: Optional[str],
-    backup_dir: Optional[str],
-    verify: bool,
-    context_override: Optional[str],
-    skip_context_classification: bool,
-    nima_backend: NimaScorer,
-    nima_technical_backend: NimaScorer,
-    min_score: Optional[int],
-    nima_batch_size: int,
-    dry_run: bool
-) -> List[Tuple[str, Optional[Dict]]]:
-    """Process images using local NIMA scoring with batching."""
-    batch_size = max(1, nima_batch_size)
-    results: List[Tuple[str, Optional[Dict]]] = []
-    pending: List[Dict[str, Any]] = []
-
-    def flush_pending() -> List[Tuple[str, Optional[Dict]]]:
-        if not pending:
-            return []
-        batch = pending.copy()
-        pending.clear()
-        batch_paths = [item['image_path'] for item in batch]
-        scores = nima_backend.score_batch(batch_paths)
-        technical_scores = nima_technical_backend.score_batch(batch_paths)
-        batch_results: List[Tuple[str, Optional[Dict]]] = []
-        for item in batch:
-            image_path = item['image_path']
-            score_payload = scores.get(image_path)
-            if not score_payload:
-                logger.error(f"NIMA did not return a score for {image_path}")
-                batch_results.append((image_path, None))
-                continue
-            technical_payload = technical_scores.get(image_path)
-            response_metadata = build_nima_metadata(
-                score_payload,
-                technical_payload,
-                nima_backend.model_type,
-                score_shift=nima_backend.score_shift,
-                technical_shift=nima_technical_backend.score_shift,
-            )
-            if cache_dir:
-                save_to_cache(image_path, model, response_metadata, cache_dir)
-            try:
-                embed_metadata(image_path, response_metadata, backup_dir, verify)
-                logger.info(
-                    f"NIMA scores for {image_path}: overall {response_metadata.get('score')} / "
-                    f"technical {response_metadata.get('technical_score')}"
-                )
-            except Exception as e:
-                logger.error(f"Error embedding NIMA metadata for {image_path}: {e}")
-                batch_results.append((image_path, None))
-                continue
-            batch_results.append((image_path, response_metadata))
-        return batch_results
-
-    with tqdm(total=len(image_paths), desc="Processing images", unit="img") as pbar:
-        for image_path in image_paths:
-            immediate = _handle_cached_or_dry_run(image_path, cache_dir, model, backup_dir, verify, dry_run=dry_run)
-            if immediate:
-                path, metadata = immediate
-                if min_score is None or metadata is None:
-                    results.append((path, metadata))
-                else:
-                    try:
-                        score = int(validate_score(metadata.get('score', '0')) or 0)
-                        if score >= min_score:
-                            results.append((path, metadata))
-                    except (ValueError, TypeError):
-                        results.append((path, metadata))
-                pbar.update(1)
-                continue
-
-            pending.append({'image_path': image_path})
-            if len(pending) >= batch_size:
-                batch_results = flush_pending()
-                pbar.update(len(batch_results))
-                for path, metadata in batch_results:
-                    if min_score is not None and metadata is not None:
-                        try:
-                            score = int(validate_score(metadata.get('score', '0')) or 0)
-                            if score < min_score:
-                                continue
-                        except (ValueError, TypeError):
-                            pass
-                    results.append((path, metadata))
-
-        # Flush leftovers
-        batch_results = flush_pending()
-        pbar.update(len(batch_results))
-        for path, metadata in batch_results:
-            if min_score is not None and metadata is not None:
-                try:
-                    score = int(validate_score(metadata.get('score', '0')) or 0)
-                    if score < min_score:
-                        continue
-                except (ValueError, TypeError):
-                    pass
-            results.append((path, metadata))
-
-    return results
-
-
 def process_images_with_pyiqa(
     image_paths: List[str],
     model: str,
@@ -2377,12 +2082,9 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
                             cache_dir: Optional[str] = None, ensemble_passes: int = 1,
                             context_override: Optional[str] = None,
                             skip_context_classification: bool = False,
-                            scoring_engine: str = 'ollama',
-                            nima_backend: Optional[NimaScorer] = None,
-                            nima_technical_backend: Optional[NimaScorer] = None,
-                            nima_batch_size: int = 16,
+                            scoring_engine: str = 'pyiqa',
                             pyiqa_backend: Optional[PyIqaScorer] = None,
-                            pyiqa_batch_size: int = 16) -> List[Tuple[str, Optional[Dict]]]:
+                            pyiqa_batch_size: int = 4) -> List[Tuple[str, Optional[Dict]]]:
     """Process images with parallel execution and progress bar."""
     # Collect all images to process
     image_paths = collect_images(folder_path, file_types=file_types, skip_existing=skip_existing)
@@ -2391,29 +2093,10 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
         logger.warning("No images found to process")
         return []
     
-    if scoring_engine == 'nima':
-        if nima_backend is None or nima_technical_backend is None:
-            logger.error("NIMA backend selected but not fully initialized.")
-            return []
-        return process_images_with_nima_batches(
-            image_paths=image_paths,
-            ollama_host_url=ollama_host_url,
-            model=model,
-            cache_dir=cache_dir,
-            backup_dir=backup_dir,
-            verify=verify,
-            context_override=context_override,
-            skip_context_classification=skip_context_classification,
-            nima_backend=nima_backend,
-            nima_technical_backend=nima_technical_backend,
-            min_score=min_score,
-            nima_batch_size=nima_batch_size,
-            dry_run=dry_run
-        )
-    if scoring_engine == 'pyiqa':
-        if pyiqa_backend is None:
-            logger.error("PyIQA backend selected but not initialized.")
-            return []
+    results: List[Tuple[str, Optional[Dict]]] = []
+
+    # Use PyIQA batch processing if that engine is selected
+    if scoring_engine == 'pyiqa' and pyiqa_backend is not None:
         return process_images_with_pyiqa(
             image_paths=image_paths,
             model=model,
@@ -2426,49 +2109,34 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
             dry_run=dry_run
         )
 
-    results: List[Tuple[str, Optional[Dict]]] = []
-    
-    # Process images in parallel with progress bar
+    # Ollama processing with ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        future_to_path = {
+        futures = {
             executor.submit(
-                process_single_image,
-                path,
-                ollama_host_url,
-                model,
-                prompt,
-                dry_run,
-                backup_dir,
-                verify,
-                cache_dir,
-                ensemble_passes,
-                context_override,
-                skip_context_classification,
-                scoring_engine,
-                nima_backend,
-                nima_technical_backend,
-                pyiqa_backend
-            ): path 
-            for path in image_paths
+                process_single_image, image_path, ollama_host_url, model, prompt,
+                dry_run, backup_dir, verify, cache_dir, ensemble_passes,
+                context_override, skip_context_classification, scoring_engine, pyiqa_backend
+            ): image_path
+            for image_path in image_paths
         }
         
-        # Process completed tasks with progress bar
         with tqdm(total=len(image_paths), desc="Processing images", unit="img") as pbar:
-            for future in as_completed(future_to_path):
-                result = future.result()
-                
-                # Filter by min_score if specified
-                if min_score is not None and result[1] is not None:
-                    try:
-                        score = int(validate_score(result[1].get('score', '0')) or 0)
-                        if score < min_score:
-                            pbar.update(1)
-                            continue  # Skip images below minimum score
-                    except (ValueError, TypeError):
-                        pass
-                
-                results.append(result)
+            for future in as_completed(futures):
+                image_path = futures[future]
+                try:
+                    result = future.result()
+                    if min_score is not None and result[1] is not None:
+                        try:
+                            score = int(validate_score(result[1].get('score', '0')) or 0)
+                            if score < min_score:
+                                pbar.update(1)
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+                    results.append(result)
+                except Exception as e:
+                    logger.error(f"Error processing {image_path}: {e}")
+                    results.append((image_path, None))
                 pbar.update(1)
     
     return results
@@ -2483,7 +2151,6 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
             'keywords', 'status', 'context', 'context_profile', 'sharpness', 'brightness', 'contrast',
             'histogram_clipping_highlights', 'histogram_clipping_shadows',
             'color_cast', 'noise_sigma', 'noise_score', 'technical_warnings', 'post_process_potential',
-            'nima_mean_score', 'nima_distribution', 'nima_model_type'
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
@@ -2515,9 +2182,6 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'noise_score': technical_metrics.get('noise_score', ''),
                     'technical_warnings': warnings_str,
                     'post_process_potential': metadata.get('post_process_potential', ''),
-                    'nima_mean_score': metadata.get('nima_mean_score', ''),
-                    'nima_distribution': metadata.get('nima_distribution', ''),
-                    'nima_model_type': metadata.get('nima_model_type', ''),
                     'status': 'success'
                 })
             else:
@@ -2544,9 +2208,6 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'noise_score': '',
                     'technical_warnings': '',
                     'post_process_potential': '',
-                    'nima_mean_score': '',
-                    'nima_distribution': '',
-                    'nima_model_type': ''
                 })
 
 
@@ -2572,9 +2233,6 @@ def load_results_from_csv(csv_path: str) -> List[Tuple[str, Optional[Dict]]]:
                     'keywords': row.get('keywords', ''),
                     'technical_warnings': row.get('technical_warnings', '').split('; ') if row.get('technical_warnings') else [],
                     'post_process_potential': row.get('post_process_potential', ''),
-                    'nima_mean_score': row.get('nima_mean_score', ''),
-                    'nima_distribution': row.get('nima_distribution', ''),
-                    'nima_model_type': row.get('nima_model_type', ''),
                 }
             results.append((row.get('file_path', ''), metadata))
     return results
@@ -2890,22 +2548,8 @@ if __name__ == "__main__":
     process_parser.add_argument('--csv', type=str, default=None, help='Path to save CSV report (default: auto-generated)')
     process_parser.add_argument('--model', type=str, default=DEFAULT_MODEL,
                                help=f'Model identifier (LLM name or custom label). Default: {DEFAULT_MODEL}')
-    process_parser.add_argument('--score-engine', choices=['ollama', 'nima', 'pyiqa'], default='pyiqa',
-                               help='Choose between Ollama (LLM), NIMA, or PyIQA scoring (default: PyIQA)')
-    process_parser.add_argument('--nima-model-type', choices=['aesthetic', 'technical', 'both'], default='both',
-                               help='NIMA head to use for overall scoring (technical head still runs by default)')
-    process_parser.add_argument('--nima-base-model', type=str, default='MobileNet',
-                               help='Base CNN used for the NIMA model (default: MobileNet)')
-    process_parser.add_argument('--nima-weights', type=str, default=None,
-                               help='Override path to NIMA aesthetic weight file (.hdf5). Defaults to bundled weights if available')
-    process_parser.add_argument('--nima-technical-weights', type=str, default=None,
-                               help='Override path to NIMA technical weight file (.hdf5). Defaults to bundled weights if available')
-    process_parser.add_argument('--nima-batch-size', type=int, default=16,
-                               help='Number of images to score per NIMA batch (default: 16)')
-    process_parser.add_argument('--nima-score-shift', type=float, default=27.0,
-                               help='Additive adjustment (in 0-100 scale) applied to all NIMA scores (default: 27)')
-    process_parser.add_argument('--nima-technical-score-shift', type=float, default=27.0,
-                               help='Additive adjustment (0-100 scale) applied to all NIMA technical scores (default: 27)')
+    process_parser.add_argument('--score-engine', choices=['ollama', 'pyiqa'], default='pyiqa',
+                               help='Choose between Ollama (LLM) or PyIQA scoring (default: PyIQA)')
     process_parser.add_argument('--pyiqa-model', type=str, default='clipiqa+_vitl14_512',
                                help='PyIQA metric name to use when --score-engine pyiqa (default: clipiqa+_vitl14_512)')
     process_parser.add_argument('--pyiqa-device', type=str, default=None,
@@ -3012,12 +2656,7 @@ if __name__ == "__main__":
         os.makedirs(cache_dir, exist_ok=True)
         logger.info(f"API response caching enabled: {cache_dir}")
 
-    nima_backend = None
-    nima_technical_backend = None
     pyiqa_backend = None
-    nima_weights_path_str: Optional[str] = None
-    nima_technical_weights_path_str: Optional[str] = None
-    nima_context_forced = False
 
     # Validate folder path
     if not os.path.exists(args.folder_path):
@@ -3038,50 +2677,7 @@ if __name__ == "__main__":
         logger.error(f"No image files found in the directory '{args.folder_path}' or its subdirectories.")
         sys.exit(1)
 
-    # Initialize NIMA backend if requested
-    if args.score_engine == 'nima':
-        if not NIMA_AVAILABLE:
-            logger.error("NIMA backend requested but dependencies are missing. Install TensorFlow/Keras per image-quality-assessment requirements.")
-            sys.exit(1)
-        nima_overall_model_type = 'aesthetic' if args.nima_model_type in (None, 'both') else args.nima_model_type
-        weights_path = args.nima_weights or get_default_nima_weights(nima_overall_model_type)
-        if not weights_path:
-            logger.error("Could not locate NIMA weights. Provide --nima-weights pointing to an .hdf5 file.")
-            sys.exit(1)
-        try:
-            nima_backend = NimaScorer(
-                base_model_name=args.nima_base_model,
-                weights_path=weights_path,
-                model_type=nima_overall_model_type,
-                score_shift=args.nima_score_shift,
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize NIMA backend: {e}")
-            sys.exit(1)
-        tech_weights_path = args.nima_technical_weights or get_default_nima_weights('technical')
-        if not tech_weights_path:
-            logger.error("Could not locate NIMA technical weights. Provide --nima-technical-weights pointing to an .hdf5 file.")
-            sys.exit(1)
-        try:
-            nima_technical_backend = NimaScorer(
-                base_model_name=args.nima_base_model,
-                weights_path=tech_weights_path,
-                model_type='technical',
-                score_shift=args.nima_technical_score_shift,
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize NIMA technical backend: {e}")
-            sys.exit(1)
-        args.model = nima_backend.model_label
-        nima_weights_path_str = str(weights_path)
-        nima_technical_weights_path_str = str(tech_weights_path)
-        logger.info(f"Initialized NIMA backend ({nima_backend.model_label}) with weights: {nima_weights_path_str}")
-        logger.info(f"Initialized NIMA technical backend ({nima_technical_backend.model_label}) with weights: {nima_technical_weights_path_str}")
-        if not args.context and not args.no_context_classification:
-            args.no_context_classification = True
-            nima_context_forced = True
-            logger.info("NIMA mode: context classification disabled (override with --context or --no-context-classification).")
-    elif args.score_engine == 'pyiqa':
+    if args.score_engine == 'pyiqa':
         if not PYIQA_AVAILABLE:
             logger.error("PyIQA backend requested but dependencies are missing. Install torch and pyiqa.")
             sys.exit(1)
@@ -3112,25 +2708,10 @@ if __name__ == "__main__":
     if args.file_types:
         file_types = [ext.strip() for ext in args.file_types.split(',')]
         print(f"Filtering for file types: {', '.join(file_types)}")
-    
     print(f"\nProcessing images from: {Style.BRIGHT}{args.folder_path}{Style.RESET_ALL}")
     print(f"Model: {args.model}")
     print(f"Scoring engine: {args.score_engine}")
-    if args.score_engine == 'nima':
-        print(f"NIMA base model: {args.nima_base_model}")
-        print(f"NIMA overall head: {nima_overall_model_type}")
-        if nima_weights_path_str:
-            print(f"NIMA weights: {nima_weights_path_str}")
-        if nima_technical_weights_path_str:
-            print(f"NIMA technical weights: {nima_technical_weights_path_str}")
-        if nima_context_forced:
-            print("Context classification: disabled (NIMA default)")
-        print(f"NIMA batch size: {args.nima_batch_size}")
-        if args.nima_score_shift:
-            print(f"NIMA score shift: {args.nima_score_shift:+.2f}")
-        if args.nima_technical_score_shift:
-            print(f"NIMA technical score shift: {args.nima_technical_score_shift:+.2f}")
-    elif args.score_engine == 'pyiqa':
+    if args.score_engine == 'pyiqa':
         print(f"PyIQA model: {args.pyiqa_model}")
         print(f"PyIQA device: {pyiqa_backend.device if pyiqa_backend else args.pyiqa_device}")
         print(f"PyIQA batch size: {args.pyiqa_batch_size}")
@@ -3139,8 +2720,6 @@ if __name__ == "__main__":
         if pyiqa_backend:
             print(f"PyIQA score shift: {pyiqa_backend.score_shift:+.2f}")
     print(f"Workers: {args.workers}")
-    if args.score_engine == 'nima' and args.workers > 1:
-        print("Note: NIMA backend runs sequentially; worker count will be limited to 1.")
     print(f"Skip existing: {args.skip_existing}")
     if args.ensemble > 1:
         print(f"{Fore.CYAN}Ensemble mode: {args.ensemble} evaluation passes per image{Fore.RESET}")
@@ -3187,9 +2766,6 @@ if __name__ == "__main__":
         context_override=args.context,
         skip_context_classification=args.no_context_classification,
         scoring_engine=args.score_engine,
-        nima_backend=nima_backend,
-        nima_technical_backend=nima_technical_backend,
-        nima_batch_size=args.nima_batch_size,
         pyiqa_backend=pyiqa_backend,
         pyiqa_batch_size=args.pyiqa_batch_size
     )
