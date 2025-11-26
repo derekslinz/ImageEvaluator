@@ -2,13 +2,25 @@
 
 ## AI-Powered Image Evaluation Suite
 
-A toolkit for evaluating images using AI vision models (via Ollama) with two specialized tools:
-1. **Image Evaluator** - Artistic merit evaluation with EXIF metadata embedding
-2. **Stock Photo Evaluator** - Commercial stock photography suitability assessment
+A toolkit for evaluating images using multiple scoring backends:
+1. **PyIQA (default)** - State-of-the-art perceptual image quality metrics (CLIP-IQA+, MUSIQ, MANIQA, etc.)
+2. **Ollama (LLM)** - AI vision models for artistic merit evaluation with EXIF metadata embedding
+3. **Stock Photo Evaluator** - Commercial stock photography suitability assessment
 
 ### Features
 
 #### Image Evaluator (image_eval_embed.py)
+
+**Scoring Backends:**
+- **PyIQA (default)**: Fast GPU-accelerated scoring using state-of-the-art metrics
+  - CLIP-IQA+ (ViT-L/14): Best balance of speed and accuracy
+  - MUSIQ: Multi-scale image quality transformer
+  - MANIQA: Multi-dimension attention network
+  - 40+ additional metrics available
+- **Ollama**: Full LLM-based evaluation with detailed feedback
+  - Multi-criteria scoring (technical, composition, lighting, creativity)
+  - Title, description, and keyword generation
+  - Ensemble scoring for consistency
 
 **Core Functionality:**
 - Multi-format support: JPEG, PNG, DNG, NEF, TIF/TIFF
@@ -91,8 +103,12 @@ A toolkit for evaluating images using AI vision models (via Ollama) with two spe
 ### Requirements
 
 - Python 3.8 or higher
-- Ollama server with vision model (recommended: `qwen3-vl:8b`, also supports `llama3.2-vision`)
 - `exiftool` for RAW file metadata embedding
+- **For PyIQA backend (default):**
+  - `torch` - PyTorch for GPU acceleration
+  - `pyiqa` - Image quality assessment metrics
+- **For Ollama backend:**
+  - Ollama server with vision model (recommended: `qwen3-vl:8b`)
 - Required Python libraries (see `requirements.txt`):
   - `Pillow` - Image processing
   - `numpy` - Numerical operations
@@ -111,7 +127,20 @@ pip install -r requirements.txt
 
 ### Quick Start
 
-#### Image Evaluator (Artistic Merit)
+#### PyIQA Scoring (Default - Fastest)
+
+```bash
+# Basic usage with CLIP-IQA+ (default)
+python image_eval_embed.py process /path/to/images
+
+# Use a different PyIQA metric
+python image_eval_embed.py process /path/to/images --pyiqa-model musiq
+
+# Adjust batch size for memory constraints
+python image_eval_embed.py process /path/to/images --pyiqa-batch-size 8
+```
+
+#### Ollama LLM Scoring (Most Detailed)
 
 1. **Start Ollama server:**
    ```bash
@@ -121,7 +150,7 @@ pip install -r requirements.txt
 
 2. **Evaluate images:**
    ```bash
-   python image_eval_embed.py process /path/to/images http://localhost:11434/api/generate
+   python image_eval_embed.py process /path/to/images --score-engine ollama
    ```
 
 3. **View results:**
@@ -147,31 +176,51 @@ pip install -r requirements.txt
 
 Basic syntax:
 ```bash
-python image_eval_embed.py process <folder_path> <ollama_url> [OPTIONS]
+python image_eval_embed.py process <folder_path> [OPTIONS]
 ```
 
-Quick start with defaults:
+Quick start with defaults (uses PyIQA with CLIP-IQA+):
 ```bash
 python image_eval_embed.py
 ```
-Running without arguments now assumes the `process` command, uses your current working directory (or `IMAGE_EVAL_DEFAULT_FOLDER`) as the image source, and talks to `http://localhost:11434/api/generate` (or `IMAGE_EVAL_OLLAMA_URL`).
+Running without arguments assumes the `process` command, uses your current working directory (or `IMAGE_EVAL_DEFAULT_FOLDER`) as the image source.
 
 **Environment overrides for defaults:**
-- `IMAGE_EVAL_DEFAULT_FOLDER` – absolute path to use when a folder isn’t provided
-- `IMAGE_EVAL_OLLAMA_URL` – Ollama endpoint to use when omitted
-- `IMAGE_EVAL_WORKERS` – worker count used when `--workers` isn’t supplied
+- `IMAGE_EVAL_DEFAULT_FOLDER` - absolute path to use when a folder is not provided
+- `IMAGE_EVAL_OLLAMA_URL` - Ollama endpoint to use when omitted (for Ollama backend)
+- `IMAGE_EVAL_WORKERS` - worker count used when `--workers` is not supplied
 
 **Arguments:**
 - `folder_path`: Directory containing images (processes recursively); defaults to current working directory or `IMAGE_EVAL_DEFAULT_FOLDER` when omitted
-- `ollama_url`: Full Ollama API endpoint (e.g., `http://localhost:11434/api/generate`); defaults to `IMAGE_EVAL_OLLAMA_URL` or `http://localhost:11434/api/generate`
+- `ollama_url`: Full Ollama API endpoint (only needed for `--score-engine ollama`)
 
-**Options:**
+**Scoring Engine Options:**
 ```bash
---workers N              # Parallel workers (default: IMAGE_EVAL_WORKERS or 4)
+--score-engine ENGINE    # Choose: pyiqa (default) or ollama
+```
+
+**PyIQA Options:**
+```bash
+--pyiqa-model NAME       # PyIQA metric (default: clipiqa+_vitl14_512)
+--pyiqa-device DEVICE    # Device: cuda:0, cpu (default: auto-detect)
+--pyiqa-score-shift N    # Score adjustment (default: model-specific)
+--pyiqa-scale-factor N   # Raw score multiplier (default: auto-detect)
+--pyiqa-batch-size N     # Images per batch (default: 4)
+```
+
+**Ollama Options:**
+```bash
 --model NAME             # Ollama model (default: qwen3-vl:8b)
 --ensemble N             # Evaluation passes for consistency (default: 1)
---csv PATH               # Custom CSV output path
 --prompt-file FILE       # Custom prompt template file
+--context NAME           # Manual context override (e.g., landscape, portrait)
+--no-context-classification  # Skip auto context classification
+```
+
+**General Options:**
+```bash
+--workers N              # Parallel workers (default: 4)
+--csv PATH               # Custom CSV output path
 --skip-existing          # Skip images with metadata (default: True)
 --no-skip-existing       # Process all images
 --min-score N            # Only save results >= N
@@ -179,36 +228,34 @@ Running without arguments now assumes the `process` command, uses your current w
 --dry-run                # Preview without changes
 --backup-dir DIR         # Store backups separately
 --verify                 # Verify metadata after embedding
---cache-dir DIR          # Enable caching for repeat evaluations
+--cache                  # Enable API response caching
+--cache-dir DIR          # Cache directory location
+--verbose, -v            # Enable debug output
 ```
 
 **Examples:**
 ```bash
-# Basic usage (4 workers, default model)
-python image_eval_embed.py process /photos http://localhost:11434/api/generate
+# PyIQA with CLIP-IQA+ (fastest, default)
+python image_eval_embed.py process /photos
 
-# High-performance setup with ensemble scoring
-python image_eval_embed.py process /photos http://localhost:11434/api/generate \
-  --workers 8 \
+# PyIQA with MUSIQ metric
+python image_eval_embed.py process /photos --pyiqa-model musiq
+
+# Ollama LLM with ensemble scoring
+python image_eval_embed.py process /photos --score-engine ollama \
   --ensemble 3 \
   --backup-dir /backups/photos
 
 # Only top-quality JPEGs
-python image_eval_embed.py process /photos http://localhost:11434/api/generate \
+python image_eval_embed.py process /photos \
   --file-types jpg,jpeg \
   --min-score 80
 
-# Custom model and prompt
-python image_eval_embed.py process /photos http://localhost:11434/api/generate \
-  --model llama3.2-vision \
-  --prompt-file custom_critic.txt
-
 # Preview without changes
-python image_eval_embed.py process /photos http://localhost:11434/api/generate \
-  --dry-run
+python image_eval_embed.py process /photos --dry-run
 
 # Reprocess everything with verification
-python image_eval_embed.py process /photos http://localhost:11434/api/generate \
+python image_eval_embed.py process /photos \
   --no-skip-existing \
   --verify
 ```
@@ -229,9 +276,13 @@ python image_eval_embed.py rollback /photos
 python image_eval_embed.py rollback /photos --backup-dir /backups/photos
 ```
 
-#### Stock Photo Evaluator Command
+#### Stats Command
 
-Basic syntax:
+Print statistics for an existing CSV report:
+```bash
+python image_eval_embed.py stats /path/to/results.csv
+```
+
 ```bash
 python stock_photo_evaluator.py <directory> <api_url> [OPTIONS]
 ```
@@ -432,6 +483,71 @@ Note: JPEG/PNG use PIL, RAW/TIFF use exiftool for metadata embedding
 2025-11-21 05:58:38,600 - INFO - Results saved to CSV: Lightroom Test Export.csv
 Log file: image_evaluator_20251121_032727.log
 ```
+
+#### Example Output: PyIQA with CLIP-IQA+ on RTX 3090 (2400 images in ~2.5 minutes)
+```bash
+$ python image_eval_embed.py process ~/gurushots_facebook_challenge_winners/ --score-engine pyiqa --pyiqa-model clipiqa+_vitL14_512 --pyiqa-score-shift 14 --no-skip-existing --csv clipiqa+_vitL14_512_shift_14_gurushots.csv
+
+2025-11-25 18:09:55,768 - INFO - Completed processing 2400 images in 153.80 seconds
+
+============================================================
+PROCESSING SUMMARY
+============================================================
+Total images processed: 2400
+Successful: 2400
+Failed: 0
+RAW formats (exiftool): 0
+Standard formats (PIL): 2400
+
+============================================================
+TIMING STATISTICS
+============================================================
+Total processing time: 153.80 seconds (2.56 minutes)
+Time per image: 0.06 seconds
+Time per successful image: 0.06 seconds
+
+============================================================
+SCORE STATISTICS
+============================================================
+Average score: 70.40
+Median score: 71.00
+Standard deviation: 9.29
+Range: 33 - 97
+Quartiles (Q1/Q3): 64 / 77
+Average post-process potential: 70.4/100
+
+============================================================
+SCORE DISTRIBUTION
+============================================================
+     0-4: █ (0)
+     5-9: █ (0)
+   10-14: █ (0)
+   15-19: █ (0)
+   20-24: █ (0)
+   25-29: █ (0)
+   30-34: █ (1)
+   35-39: █ (2)
+   40-44: █ (6)
+   45-49: ██████ (44)
+   50-54: ████████████ (82)
+   55-59: █████████████████████████ (162)
+   60-64: █████████████████████████████████████████████████ (310)
+   65-69: ██████████████████████████████████████████████████████████████████████ (448)
+   70-74: ████████████████████████████████████████████████████████████████████████████████ (505)
+   75-79: ██████████████████████████████████████████████████████████████████████ (447)
+   80-84: ███████████████████████████████████████████ (273)
+   85-89: ████████████████ (104)
+   90-94: ██ (15)
+   95-99: █ (1)
+  95-100: █ (1)
+
+============================================================
+Note: JPEG/PNG use PIL, RAW/TIFF use exiftool for metadata embedding
+============================================================
+
+2025-11-25 18:09:55,791 - INFO - Results saved to CSV: clipiqa+_vitL14_512_shift_14_gurushots.csv
+```
+
 #### Example Results
 ```bash
 XP Title                        : Intimate Portrait with Wooden Pole

@@ -5,3 +5,4 @@
 *.jpg
 __pycache__
 stock-parse.sh
+image-quality-assessment
