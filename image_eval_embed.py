@@ -1315,10 +1315,13 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
         "images": [encoded_image],
         "prompt": IMAGE_CONTEXT_CLASSIFIER_PROMPT,
         "options": {
-            "temperature": 0.3,
-            "num_predict": 100,
-            "top_p": 0.9,
-            "repeat_penalty": 1.1
+            "temperature": 0.0,
+            "top_k": 1,
+            "top_p": 1.0,
+            "min_p": 0.0,
+            "num_predict": 16,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0
         }
     }
     
