@@ -13,6 +13,7 @@ Evaluates images for stock photography requirements including:
 """
 
 import argparse
+import base64
 import csv
 import json
 import logging
@@ -36,8 +37,9 @@ from colorama import Fore, Style, init
 # Initialize colorama
 init(autoreset=True)
 
-# Remove PIL pixel limit protection so large exports load reliably
-Image.MAX_IMAGE_PIXELS = None
+# Set a reasonable PIL pixel limit to protect against decompression bombs
+# while still allowing large stock photography files (~300MP)
+Image.MAX_IMAGE_PIXELS = 300_000_000
 
 # Configure logging
 logging.basicConfig(
@@ -403,52 +405,52 @@ def analyze_technical_quality(image_path: str) -> TechnicalData:
         
     except (IOError, OSError) as e:
         logger.error(f"File access error analyzing {image_path}: {e}")
-        return TechnicalData(
-            megapixels=0.0,
-            dimensions='unknown',
-            sharpness=0.0,
-            noise=0.0,
-            brightness=0.0,
-            contrast=0.0,
-            highlight_clip=0.0,
-            shadow_clip=0.0,
-            dpi=0.0,
-            aspect_ratio=0.0,
-            notes=[f"File error: {str(e)}"],
-            fixable_issues=[]
-        )
+        return {
+            'megapixels': 0.0,
+            'dimensions': 'unknown',
+            'sharpness': 0.0,
+            'noise': 0.0,
+            'brightness': 0.0,
+            'contrast': 0.0,
+            'highlight_clip': 0.0,
+            'shadow_clip': 0.0,
+            'dpi': 0.0,
+            'aspect_ratio': 0.0,
+            'notes': [f"File error: {str(e)}"],
+            'fixable_issues': []
+        }
     except (cv2.error, ValueError) as e:
         logger.error(f"Image processing error analyzing {image_path}: {e}")
-        return TechnicalData(
-            megapixels=0.0,
-            dimensions='unknown',
-            sharpness=0.0,
-            noise=0.0,
-            brightness=0.0,
-            contrast=0.0,
-            highlight_clip=0.0,
-            shadow_clip=0.0,
-            dpi=0.0,
-            aspect_ratio=0.0,
-            notes=[f"Processing error: {str(e)}"],
-            fixable_issues=[]
-        )
+        return {
+            'megapixels': 0.0,
+            'dimensions': 'unknown',
+            'sharpness': 0.0,
+            'noise': 0.0,
+            'brightness': 0.0,
+            'contrast': 0.0,
+            'highlight_clip': 0.0,
+            'shadow_clip': 0.0,
+            'dpi': 0.0,
+            'aspect_ratio': 0.0,
+            'notes': [f"Processing error: {str(e)}"],
+            'fixable_issues': []
+        }
     except Exception as e:
         logger.error(f"Unexpected error analyzing {image_path}: {e}")
-        return TechnicalData(
-            megapixels=0.0,
-            dimensions='unknown',
-            sharpness=0.0,
-            noise=0.0,
-            brightness=0.0,
-            contrast=0.0,
-            highlight_clip=0.0,
-            shadow_clip=0.0,
-            dpi=0.0,
-            aspect_ratio=0.0,
-            notes=[f"Error: {str(e)}"],
-            fixable_issues=[]
-        )
+        return {
+            'megapixels': 0.0,
+            'dimensions': 'unknown',
+            'sharpness': 0.0,
+            'noise': 0.0,
+            'brightness': 0.0,
+            'contrast': 0.0,
+            'highlight_clip': 0.0,
+            'shadow_clip': 0.0,
+            'dpi': 0.0,
+            'aspect_ratio': 0.0,
+            'notes': [f"Error: {str(e)}"],
+            'fixable_issues': []
+        }
 
 
 def create_stock_prompt(base_prompt: str, technical_data: TechnicalData) -> str:
@@ -537,7 +539,6 @@ def evaluate_image_for_stock(
         enhanced_prompt = create_stock_prompt(prompt, technical_data)
         
         # Encode image to base64
-        import base64
         with open(image_path, 'rb') as f:
             image_data = base64.b64encode(f.read()).decode('utf-8')
         
@@ -555,14 +556,23 @@ def evaluate_image_for_stock(
         }
         
         logger.debug(f"Sending request to {api_url}")
-        try:
-            response = requests.post(api_url, json=payload, timeout=timeout)
-            response.raise_for_status()
-        except requests.exceptions.Timeout:
-            logger.warning(f"Request timeout for {image_path}, retrying...")
-            time.sleep(2)
-            response = requests.post(api_url, json=payload, timeout=timeout)
-            response.raise_for_status()
+        max_retries = 3
+        base_delay = 2  # seconds
+        response = None
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(api_url, json=payload, timeout=timeout)
+                response.raise_for_status()
+                break  # Success, exit retry loop
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff: 2, 4, 8 seconds
+                    logger.warning(f"Request timeout for {image_path} (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Request timeout for {image_path} after {max_retries} attempts")
+                    raise
         
         if response and response.status_code == 200:
             result = response.json()

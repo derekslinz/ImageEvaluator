@@ -5,13 +5,18 @@ Simple CLI to reuse the stock evaluator's technical analysis helper for a single
 
 import argparse
 import json
+import logging
 import os
 import sys
 
 from stock_photo_evaluator import analyze_technical_quality
 
 
-def main():
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="Print technical metadata for one image.")
     parser.add_argument("image_path", help="Path to the image to analyze")
     parser.add_argument(
@@ -24,7 +29,7 @@ def main():
     args = parser.parse_args()
 
     if not os.path.exists(args.image_path):
-        print(f"Error: file not found: {args.image_path}", file=sys.stderr)
+        logger.error("File not found: %s", args.image_path)
         sys.exit(1)
 
     metrics = analyze_technical_quality(args.image_path)
