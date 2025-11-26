@@ -1896,6 +1896,7 @@ def process_images_with_pyiqa(
     cache_model_label: str,
     classification_model: str,
     context_host_url: str,
+    metadata_host_url: Optional[str],
     cache_dir: Optional[str],
     backup_dir: Optional[str],
     verify: bool,
@@ -1904,7 +1905,8 @@ def process_images_with_pyiqa(
     dry_run: bool,
     context_override: Optional[str],
     skip_context_classification: bool,
-    args
+    args,
+    use_ollama_metadata: bool = False
 ) -> List[Tuple[str, Optional[Dict]]]:
     """Profile-aware PyIQA pipeline with context detection and rule weighting."""
     results: List[Tuple[str, Optional[Dict]]] = []
@@ -2009,79 +2011,44 @@ def process_images_with_pyiqa(
 
 
 def process_images_in_folder(folder_path: str, ollama_host_url: str, context_host_url: Optional[str] = None,
-                            max_workers: int = 4, 
-                            model: str = DEFAULT_MODEL, prompt: str = DEFAULT_PROMPT,
+                            model: str = DEFAULT_MODEL,
                             file_types: Optional[List[str]] = None, skip_existing: bool = True,
                             dry_run: bool = False, min_score: Optional[int] = None,
                             backup_dir: Optional[str] = None, verify: bool = False,
-                            cache_dir: Optional[str] = None, ensemble_passes: int = 1,
+                            cache_dir: Optional[str] = None,
                             context_override: Optional[str] = None,
                             skip_context_classification: bool = False,
-                            scoring_engine: str = 'pyiqa',
                             pyiqa_manager: Optional[PyiqaManager] = None,
                             pyiqa_cache_label: Optional[str] = None,
                             cli_args: Optional[argparse.Namespace] = None,
-                            pyiqa_batch_size: int = 4) -> List[Tuple[str, Optional[Dict]]]:
-    """Process images with parallel execution and progress bar."""
-    # Collect all images to process
+                            use_ollama_metadata: bool = False) -> List[Tuple[str, Optional[Dict]]]:
+    """Process images end-to-end using the PyIQA composite pipeline."""
+    if pyiqa_manager is None:
+        raise ValueError("PyIQA manager must be initialized before processing images.")
+
     image_paths = collect_images(folder_path, file_types=file_types, skip_existing=skip_existing)
-    
     if not image_paths:
         logger.warning("No images found to process")
         return []
-    
-    results: List[Tuple[str, Optional[Dict]]] = []
 
-    # Use PyIQA batch processing if that engine is selected
-    if scoring_engine == 'pyiqa' and pyiqa_manager is not None:
-        cache_label = pyiqa_cache_label or "pyiqa_profiles"
-        return process_images_with_pyiqa(
-            image_paths=image_paths,
-            cache_model_label=cache_label,
-            classification_model=model,
-            context_host_url=context_host_url or ollama_host_url,
-            cache_dir=cache_dir,
-            backup_dir=backup_dir,
-            verify=verify,
-            pyiqa_manager=pyiqa_manager,
-            min_score=min_score,
-            dry_run=dry_run,
-            context_override=context_override,
-            skip_context_classification=skip_context_classification,
-            args=cli_args
-        )
-
-    # Ollama processing with ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                process_single_image, image_path, ollama_host_url, context_host_url, model, prompt,
-                dry_run, backup_dir, verify, cache_dir, ensemble_passes,
-                context_override, skip_context_classification, scoring_engine
-            ): image_path
-            for image_path in image_paths
-        }
-        
-        with tqdm(total=len(image_paths), desc="Processing images", unit="img") as pbar:
-            for future in as_completed(futures):
-                image_path = futures[future]
-                try:
-                    result = future.result()
-                    if min_score is not None and result[1] is not None:
-                        try:
-                            score = int(validate_score(result[1].get('score', '0')) or 0)
-                            if score < min_score:
-                                pbar.update(1)
-                                continue
-                        except (ValueError, TypeError):
-                            pass
-                    results.append(result)
-                except Exception as e:
-                    logger.error(f"Error processing {image_path}: {e}")
-                    results.append((image_path, None))
-                pbar.update(1)
-    
-    return results
+    cache_label = pyiqa_cache_label or "pyiqa_profiles"
+    return process_images_with_pyiqa(
+        image_paths=image_paths,
+        cache_model_label=cache_label,
+        classification_model=model,
+        context_host_url=context_host_url or ollama_host_url,
+        metadata_host_url=ollama_host_url,
+        cache_dir=cache_dir,
+        backup_dir=backup_dir,
+        verify=verify,
+        pyiqa_manager=pyiqa_manager,
+        min_score=min_score,
+        dry_run=dry_run,
+        context_override=context_override,
+        skip_context_classification=skip_context_classification,
+        args=cli_args,
+        use_ollama_metadata=use_ollama_metadata
+    )
 
 
 def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: str):
