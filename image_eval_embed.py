@@ -2063,9 +2063,11 @@ def embed_metadata_exiftool(image_path: str, metadata: Dict, backup_dir: Optiona
             f'-XPComment={metadata.get("description", "")}',
             f'-XPKeywords={metadata.get("keywords", "")}',
             f'-XPSubject={technical_str}',
-            f'-ImageDescription={sanitize_string(metadata.get("context_label", ""))}',
-            image_path
         ]
+        context_label = sanitize_string(metadata.get("context_label", ""))
+        if context_label:
+            cmd.append(f'-ImageDescription={context_label}')
+        cmd.append(image_path)
         
         # Create manual backup before modifying
         if not os.path.exists(backup_image_path):
