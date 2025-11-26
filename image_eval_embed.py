@@ -2159,7 +2159,7 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, context_hos
         cache_model_label=cache_label,
         classification_model=model,
         context_host_url=context_host_url or ollama_host_url,
-        metadata_host_url=ollama_host_url,
+        metadata_host_url=ollama_host_url if use_ollama_metadata else None,
         cache_dir=cache_dir,
         backup_dir=backup_dir,
         verify=verify,
