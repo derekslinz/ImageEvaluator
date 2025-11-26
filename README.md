@@ -98,6 +98,12 @@ Most flows only need the defaults. Add `--ollama-metadata` if you want the visio
 --no-context-classification  Skip auto context detection
 ```
 
+**Recommended Vision Model:**  
+For profile determination, `ingu627/Qwen2.5-VL-7B-Instruct-Q5_K_M` provides excellent classification accuracy with good performance. Install via:
+```bash
+ollama pull ingu627/Qwen2.5-VL-7B-Instruct-Q5_K_M
+```
+
 **General:**
 ```
 --workers N               Parallel workers (default: 4)
