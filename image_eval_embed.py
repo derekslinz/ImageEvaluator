@@ -87,10 +87,15 @@ def list_pyiqa_metrics() -> List[str]:
 Image.MAX_IMAGE_PIXELS = None  # Remove limit entirely (or set to a higher value like 500000000)
 
 
+# =============================================================================
+# Constants
+# =============================================================================
+
+# PyIQA configuration
 PYIQA_MAX_LONG_EDGE = 2048
 DEFAULT_CLIPIQ_MODEL = "clipiqa+_vitL14_512"
 
-# Stock evaluation constants
+# Stock evaluation thresholds
 STOCK_MIN_RESOLUTION_MP = 4.0
 STOCK_RECOMMENDED_MP = 12.0
 STOCK_MIN_DPI = 300
@@ -100,6 +105,14 @@ STOCK_SHARPNESS_OPTIMAL = 60.0
 STOCK_NOISE_WARN = 45.0
 STOCK_NOISE_HIGH = 65.0
 STOCK_CLIPPING_THRESHOLD = 12.0  # percent
+
+# Score validation bounds
+SCORE_MIN = 1
+SCORE_MAX = 100
+
+# Histogram analysis thresholds
+HISTOGRAM_HIGHLIGHT_START = 250
+HISTOGRAM_SHADOW_END = 6
 
 STOCK_EVALUATION_PROMPT = """You are a senior stock photography reviewer for major agencies (Adobe Stock, Shutterstock, Getty).
 Given the attached image and technical summary, output STRICT JSON with these keys:
@@ -1123,10 +1136,10 @@ def validate_image(image_path: str) -> bool:
 
 
 def validate_score(score_input) -> Optional[int]:
-    """Extract and validate score is between 1-100. Accepts int, str, or other types."""
+    """Extract and validate score is between SCORE_MIN-SCORE_MAX. Accepts int, str, or other types."""
     # Handle integer input directly
     if isinstance(score_input, int):
-        if 1 <= score_input <= 100:
+        if SCORE_MIN <= score_input <= SCORE_MAX:
             return score_input
         else:
             logger.warning(f"Integer score out of range: {score_input}")
@@ -1136,7 +1149,7 @@ def validate_score(score_input) -> Optional[int]:
     try:
         # Try direct conversion first
         score = int(score_input)
-        if 1 <= score <= 100:
+        if SCORE_MIN <= score <= SCORE_MAX:
             return score
     except (ValueError, TypeError):
         pass
@@ -1146,19 +1159,19 @@ def validate_score(score_input) -> Optional[int]:
     matches = re.findall(r'\b(\d{1,3})\b', str(score_input))
     for match in matches:
         score = int(match)
-        if 1 <= score <= 100:
+        if SCORE_MIN <= score <= SCORE_MAX:
             return score
     
     # Fallback: try to find any number
     match = re.search(r'\d+', str(score_input))
     if match:
         score = int(match.group())
-        if 1 <= score <= 100:
+        if SCORE_MIN <= score <= SCORE_MAX:
             return score
     
     # Truncate long error messages
     score_preview = str(score_input)[:100] + '...' if len(str(score_input)) > 100 else str(score_input)
-    logger.warning(f"Invalid score (no valid number 1-100 found): {score_preview}")
+    logger.warning(f"Invalid score (no valid number {SCORE_MIN}-{SCORE_MAX} found): {score_preview}")
     return None
 
 
@@ -2482,14 +2495,14 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
                 match = re.search(r'\d+', score_str)
                 if match:
                     score = int(match.group())
-                    if 1 <= score <= 100:
+                    if SCORE_MIN <= score <= SCORE_MAX:
                         scores.append(score)
             except (ValueError, AttributeError):
                 continue
         if metadata and metadata.get('technical_score'):
             try:
                 tech_val = int(str(metadata['technical_score']))
-                if 1 <= tech_val <= 100:
+                if SCORE_MIN <= tech_val <= SCORE_MAX:
                     tech_scores.append(tech_val)
             except (ValueError, TypeError):
                 pass
