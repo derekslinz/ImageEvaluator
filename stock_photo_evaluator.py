@@ -267,7 +267,7 @@ def ensure_resolution_metadata(image_path: str) -> None:
         logger.debug(f"ExifTool failed on {image_path}: {exc}")
 
 
-def analyze_technical_quality(image_path: str) -> TechnicalData:
+def analyze_technical_quality(image_path: str) -> Dict[str, Union[float, str, List[str]]]:
     """Analyze technical aspects for stock photography standards.
     
     Args:
@@ -558,6 +558,7 @@ def evaluate_image_for_stock(
         logger.debug(f"Sending request to {api_url}")
         max_retries = 3
         base_delay = 2  # seconds
+        last_exception: Optional[Exception] = None
         response = None
         
         for attempt in range(max_retries):
@@ -565,7 +566,8 @@ def evaluate_image_for_stock(
                 response = requests.post(api_url, json=payload, timeout=timeout)
                 response.raise_for_status()
                 break  # Success, exit retry loop
-            except requests.exceptions.Timeout:
+            except requests.exceptions.Timeout as e:
+                last_exception = e
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)  # Exponential backoff: 2, 4, 8 seconds
                     logger.warning(f"Request timeout for {image_path} (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...")
@@ -573,6 +575,10 @@ def evaluate_image_for_stock(
                 else:
                     logger.error(f"Request timeout for {image_path} after {max_retries} attempts")
                     raise
+        else:
+            # Loop completed without break (all retries exhausted)
+            if last_exception:
+                raise last_exception
         
         if response and response.status_code == 200:
             result = response.json()
