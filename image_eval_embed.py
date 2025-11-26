@@ -2621,30 +2621,23 @@ if __name__ == "__main__":
         logger.error(f"No image files found in the directory '{args.folder_path}' or its subdirectories.")
         sys.exit(1)
 
-    if args.score_engine == 'pyiqa':
-        if not PYIQA_AVAILABLE:
-            logger.error("PyIQA backend requested but dependencies are missing. Install torch and pyiqa.")
-            sys.exit(1)
-        shift_overrides = {}
-        if args.pyiqa_score_shift is not None:
-            shift_overrides[args.pyiqa_model.lower()] = args.pyiqa_score_shift
-        try:
-            pyiqa_manager = PyiqaManager(
-                device=args.pyiqa_device,
-                scale_factor=args.pyiqa_scale_factor,
-                shift_overrides=shift_overrides,
-                max_cached_models=args.pyiqa_max_models,
-            )
-            pyiqa_cache_label = f"pyiqa_profiles_{args.pyiqa_model.lower()}"
-        except Exception as e:
-            logger.error(f"Failed to initialize PyIQA manager: {e}")
-            sys.exit(1)
-
-    # Load custom prompt if specified
-    prompt = DEFAULT_PROMPT
-    if args.prompt_file:
-        prompt = load_prompt_from_file(args.prompt_file)
-        print(f"Loaded custom prompt from: {args.prompt_file}")
+    if not PYIQA_AVAILABLE:
+        logger.error("PyIQA backend is required but torch/pyiqa are missing.")
+        sys.exit(1)
+    shift_overrides: Dict[str, float] = {}
+    if args.pyiqa_score_shift is not None:
+        shift_overrides[args.pyiqa_model.lower()] = args.pyiqa_score_shift
+    try:
+        pyiqa_manager = PyiqaManager(
+            device=args.pyiqa_device,
+            scale_factor=args.pyiqa_scale_factor,
+            shift_overrides=shift_overrides,
+            max_cached_models=args.pyiqa_max_models,
+        )
+        pyiqa_cache_label = f"pyiqa_profiles_{args.pyiqa_model.lower()}"
+    except Exception as e:
+        logger.error(f"Failed to initialize PyIQA manager: {e}")
+        sys.exit(1)
     
     # Parse file types if specified
     file_types = None
@@ -2652,19 +2645,17 @@ if __name__ == "__main__":
         file_types = [ext.strip() for ext in args.file_types.split(',')]
         print(f"Filtering for file types: {', '.join(file_types)}")
     print(f"\nProcessing images from: {Style.BRIGHT}{args.folder_path}{Style.RESET_ALL}")
-    print(f"Model: {args.model}")
-    print(f"Scoring engine: {args.score_engine}")
+    print(f"Ollama model: {args.model}")
     if args.context_host_url and args.context_host_url != args.ollama_host_url:
         print(f"Context classifier endpoint: {args.context_host_url}")
-    if args.score_engine == 'pyiqa':
-        print(f"PyIQA model: {args.pyiqa_model}")
-        print(f"PyIQA device: {pyiqa_manager.device if pyiqa_manager else args.pyiqa_device}")
-        print(f"PyIQA max cached models: {args.pyiqa_max_models}")
-        if args.pyiqa_scale_factor:
-            print(f"PyIQA scale factor: {args.pyiqa_scale_factor}")
-        if args.pyiqa_score_shift is not None:
-            print(f"PyIQA custom score shift: {args.pyiqa_score_shift:+.2f}")
-        print("PyIQA composite models: clipiqa_z, laion_aes_z, musiq_ava_z, musiq_paq2piq_z, maniqa_z")
+    print(f"PyIQA model (clipiqa_z): {args.pyiqa_model}")
+    print(f"PyIQA device: {pyiqa_manager.device if pyiqa_manager else args.pyiqa_device}")
+    print(f"PyIQA max cached models: {args.pyiqa_max_models}")
+    if args.pyiqa_scale_factor:
+        print(f"PyIQA scale factor: {args.pyiqa_scale_factor}")
+    if args.pyiqa_score_shift is not None:
+        print(f"PyIQA custom score shift: {args.pyiqa_score_shift:+.2f}")
+    print("PyIQA composite models: clipiqa+_vitL14_512, laion_aes, musiq-ava, musiq-paq2piq, maniqa, disagreement penalty")
     print(f"Workers: {args.workers}")
     print(f"Skip existing: {args.skip_existing}")
     if args.min_score:
