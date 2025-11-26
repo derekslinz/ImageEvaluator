@@ -9,7 +9,7 @@ import csv
 import logging
 import os
 import re
-from typing import List
+from typing import List, Tuple
 
 import psycopg2
 from psycopg2 import sql
@@ -59,7 +59,7 @@ def insert_rows(conn, table: str, columns: List[str], rows: List[List[str]]) -> 
     conn.commit()
 
 
-def load_csv(path: str):
+def load_csv(path: str) -> Tuple[List[str], List[List[str]]]:
     with open(path, newline='', encoding='utf-8') as csvfile:
         reader = csv.reader(csvfile)
         header = next(reader)
@@ -68,7 +68,7 @@ def load_csv(path: str):
         return columns, rows
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Load evaluation CSV into PostgreSQL")
     parser.add_argument(
         'csv_path',
@@ -76,8 +76,8 @@ def main():
     )
     parser.add_argument(
         '--db-url',
-        default="postgres://postgres@localhost:5432/photos",
-        help="PostgreSQL connection URL (default: %(default)s)"
+        default=os.environ.get("DATABASE_URL", "postgres://postgres@localhost:5432/photos"),
+        help="PostgreSQL connection URL (default: DATABASE_URL env var or postgres://postgres@localhost:5432/photos)"
     )
     parser.add_argument(
         '--table',
@@ -107,19 +107,21 @@ def main():
         return
 
     logger.info("Connecting to %s", args.db_url)
-    conn = psycopg2.connect(args.db_url)
+    try:
+        with psycopg2.connect(args.db_url) as conn:
+            if args.truncate:
+                with conn.cursor() as cur:
+                    cur.execute(sql.SQL("TRUNCATE TABLE {}").format(sql.Identifier(args.table)))
+                conn.commit()
+                logger.info("Truncated table %s", args.table)
 
-    if args.truncate:
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL("TRUNCATE TABLE {}").format(sql.Identifier(args.table)))
-        conn.commit()
-        logger.info("Truncated table %s", args.table)
+            create_table_if_needed(conn, args.table, columns)
+            insert_rows(conn, args.table, columns, rows)
 
-    create_table_if_needed(conn, args.table, columns)
-    insert_rows(conn, args.table, columns, rows)
-
-    logger.info("Inserted %d rows into %s.%s", len(rows), conn.get_dsn_parameters().get("dbname"), args.table)
-    conn.close()
+            logger.info("Inserted %d rows into %s.%s", len(rows), conn.get_dsn_parameters().get("dbname"), args.table)
+    except psycopg2.OperationalError as e:
+        logger.error("Failed to connect to database: %s", e)
+        return
 
 
 if __name__ == "__main__":

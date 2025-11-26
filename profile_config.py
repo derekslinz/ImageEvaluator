@@ -1,4 +1,70 @@
-PROFILE_CONFIG = {
+"""
+Profile configuration for image quality evaluation.
+
+This module defines evaluation profiles for different photography genres.
+Each profile contains model weights and rule thresholds tuned for specific use cases.
+
+Model Weights Note:
+    The model_weights in each profile are relative importance weights, NOT probability
+    distributions. They do NOT need to sum to 1.0. During scoring, these weights are
+    applied to z-scored model outputs and combined. Higher weights mean that model's
+    opinion matters more for that profile. The weights are normalized internally
+    when computing final scores.
+    
+    For example, in "macro_food", maniqa_z has weight 0.55 while clipiqa_z has 0.15,
+    meaning technical quality (maniqa) is ~3.7x more important than semantic quality
+    (clipiqa) for food photography evaluation.
+
+Available Profiles:
+    - stock_product: Commercial/stock photography
+    - macro_food: Close-up food photography
+    - portrait_neutral: Studio/neutral portraits
+    - portrait_highkey: Bright, airy portraits
+    - landscape: Landscape/nature photography
+    - street_documentary: Street/documentary style
+    - sports_action: Sports/action/wildlife
+    - concert_night: Low-light/concert photography
+    - architecture_realestate: Architecture/real estate
+    - fineart_creative: Fine art/experimental
+"""
+
+from typing import Dict, Any, Optional, List
+
+
+def get_available_profiles() -> List[str]:
+    """Return a list of available profile names.
+    
+    Returns:
+        List of valid profile name strings.
+    """
+    return list(PROFILE_CONFIG.keys())
+
+
+def get_profile(name: str) -> Optional[Dict[str, Any]]:
+    """Get a profile configuration by name.
+    
+    Args:
+        name: The profile name (e.g., 'stock_product', 'landscape').
+        
+    Returns:
+        The profile configuration dict if found, None otherwise.
+    """
+    return PROFILE_CONFIG.get(name)
+
+
+def validate_profile_name(name: str) -> bool:
+    """Check if a profile name is valid.
+    
+    Args:
+        name: The profile name to validate.
+        
+    Returns:
+        True if the profile name exists, False otherwise.
+    """
+    return name in PROFILE_CONFIG
+
+
+PROFILE_CONFIG: Dict[str, Dict[str, Any]] = {
     # 1. Stock / Product
     "stock_product": {
         "model_weights": {
