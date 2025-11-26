@@ -1259,75 +1259,74 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
     
     headers = {'Content-Type': 'application/json'}
     payload = {
-            "model": model,
-            "stream": False,
-            "images": [encoded_image],
-            "prompt": IMAGE_CONTEXT_CLASSIFIER_PROMPT,
-            "options": {
-                "temperature": 0.3,
-                "num_predict": 100,
-                "top_p": 0.9,
-                "repeat_penalty": 1.1
-            }
+        "model": model,
+        "stream": False,
+        "images": [encoded_image],
+        "prompt": IMAGE_CONTEXT_CLASSIFIER_PROMPT,
+        "options": {
+            "temperature": 0.3,
+            "num_predict": 100,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1
         }
-        
-        logger.debug(f"Sending classification request for {image_path}")
-        response = requests.post(ollama_host_url, json=payload, headers=headers, timeout=120)
-        response.raise_for_status()
-        result = response.json()
-        
-        # Log full result for debugging
-        logger.debug(f"Classification API response keys: {result.keys()}")
-        
-        raw_response = result.get('response', '')
-        context_label = raw_response.strip().lower()
-        
-        # Log raw response for debugging
-        logger.debug(f"Context classification raw response: '{raw_response}' for {image_path}")
-        
-        # Check for empty response - this indicates the model doesn't support vision or has an issue
+    }
+    
+    logger.debug(f"Sending classification request for {image_path}")
+    response = requests.post(ollama_host_url, json=payload, headers=headers, timeout=120)
+    response.raise_for_status()
+    result = response.json()
+    
+    # Log full result for debugging
+    logger.debug(f"Classification API response keys: {result.keys()}")
+    
+    raw_response = result.get('response', '')
+    context_label = raw_response.strip().lower()
+    
+    # Log raw response for debugging
+    logger.debug(f"Context classification raw response: '{raw_response}' for {image_path}")
+    
+    # Check for empty response - this indicates the model doesn't support vision or has an issue
+    if not raw_response or not context_label:
+        # try alternate fields
+        fallback_response = (
+            result.get('text') or
+            result.get('message') or
+            (result.get('choices', [{}])[0].get('text') if isinstance(result.get('choices'), list) and result.get('choices') else '') or
+            result.get('thinking')
+        )
+        if fallback_response:
+            raw_response = fallback_response
+            context_label = raw_response.strip().lower()
+            logger.debug(f"Context classification fallback response: '{raw_response}' for {image_path}")
         if not raw_response or not context_label:
-            # try alternate fields
-            fallback_response = (
-                result.get('text') or
-                result.get('message') or
-                (result.get('choices', [{}])[0].get('text') if isinstance(result.get('choices'), list) and result.get('choices') else '') or
-                result.get('thinking')
-            )
-            if fallback_response:
-                raw_response = fallback_response
-                context_label = raw_response.strip().lower()
-                logger.debug(f"Context classification fallback response: '{raw_response}' for {image_path}")
-            if not raw_response or not context_label:
-                logger.warning(f"Context classification returned empty response for {image_path}. Model payload: {result}")
-                return 'stock_product'
-        
-        # Handle numbered responses (e.g., "1", "1.", "5. landscape")
-        number_to_context = {
-            '1': 'landscape',
-            '2': 'portrait_neutral',
-            '3': 'portrait_highkey',
-            '4': 'macro_food',
-            '5': 'street_documentary',
-            '6': 'sports_action',
-            '7': 'concert_night',
-            '8': 'architecture_realestate',
-            '9': 'stock_product',
-            '10': 'fineart_creative'
-        }
-        
-        # Check if response starts with a number
-        first_word = context_label.split()[0] if context_label.split() else ''
-        clean_number = first_word.rstrip('.').strip()
-        if clean_number in number_to_context:
-            matched_context = number_to_context[clean_number]
-            logger.info(f"Context classification: {matched_context} (from number '{clean_number}') for {image_path}")
-            return matched_context
-        
-        # Explicit "category X" reference takes priority
-        import re
-        category_matches = re.findall(r'category\s*(\d+)', context_label)
-        if category_matches:
+            logger.warning(f"Context classification returned empty response for {image_path}. Model payload: {result}")
+            return ClassificationResult('stock_product', 'low', 'empty_response', '', 0)
+    
+    # Handle numbered responses (e.g., "1", "1.", "5. landscape")
+    number_to_context = {
+        '1': 'landscape',
+        '2': 'portrait_neutral',
+        '3': 'portrait_highkey',
+        '4': 'macro_food',
+        '5': 'street_documentary',
+        '6': 'sports_action',
+        '7': 'concert_night',
+        '8': 'architecture_realestate',
+        '9': 'stock_product',
+        '10': 'fineart_creative'
+    }
+    
+    # Check if response starts with a number
+    first_word = context_label.split()[0] if context_label.split() else ''
+    clean_number = first_word.rstrip('.').strip()
+    if clean_number in number_to_context:
+        matched_context = number_to_context[clean_number]
+        logger.info(f"Context classification: {matched_context} (from number '{clean_number}') for {image_path}")
+        return ClassificationResult(matched_context, 'high', 'number', raw_response, 0)
+    
+    # Explicit "category X" reference takes priority
+    category_matches = re.findall(r'category\s*(\d+)', context_label)
+    if category_matches:
             last_match = category_matches[-1]
             if last_match in number_to_context:
                 matched_context = number_to_context[last_match]
