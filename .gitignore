@@ -6,3 +6,4 @@
 __pycache__
 stock-parse.sh
 image-quality-assessment
+.env
