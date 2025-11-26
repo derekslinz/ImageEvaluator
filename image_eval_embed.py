@@ -2414,7 +2414,7 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, context_hos
         skip_context_classification=skip_context_classification,
         args=cli_args,
         use_ollama_metadata=use_ollama_metadata,
-        stock_eval=bool(cli_args.stock_eval) if cli_args else False
+        stock_eval=bool(getattr(cli_args, 'stock_eval', False))
     )
 
 
