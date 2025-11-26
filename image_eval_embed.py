@@ -80,6 +80,41 @@ Image.MAX_IMAGE_PIXELS = None  # Remove limit entirely (or set to a higher value
 PYIQA_MAX_LONG_EDGE = 2048
 DEFAULT_CLIPIQ_MODEL = "clipiqa+_vitL14_512"
 
+# Stock evaluation constants
+STOCK_MIN_RESOLUTION_MP = 4.0
+STOCK_RECOMMENDED_MP = 12.0
+STOCK_MIN_DPI = 300
+STOCK_DPI_FIXABLE = 240
+STOCK_SHARPNESS_CRITICAL = 30.0
+STOCK_SHARPNESS_OPTIMAL = 60.0
+STOCK_NOISE_WARN = 45.0
+STOCK_NOISE_HIGH = 65.0
+STOCK_CLIPPING_THRESHOLD = 12.0  # percent
+
+STOCK_EVALUATION_PROMPT = """You are a senior stock photography reviewer for major agencies (Adobe Stock, Shutterstock, Getty).
+Given the attached image and technical summary, output STRICT JSON with these keys:
+{"COMMERCIAL_VIABILITY": int, "TECHNICAL_QUALITY": int, "COMPOSITION_CLARITY": int, "KEYWORD_POTENTIAL": int,
+ "RELEASE_CONCERNS": int, "REJECTION_RISKS": int, "OVERALL_STOCK_SCORE": int,
+ "RECOMMENDATION": "EXCELLENT|GOOD|MARGINAL|REJECT", "PRIMARY_CATEGORY": "Business|Lifestyle|Nature|Food|Technology|Travel|Other",
+ "NOTES": "short sentence", "ISSUES": "comma list"}
+
+Guidelines:
+- Scores 0-100 integers. Be conservative; mediocre images cluster 50-65.
+- COMMERCIAL_VIABILITY: demand, versatility, timelessness.
+- TECHNICAL_QUALITY: exposure, sharpness, noise, DR.
+- COMPOSITION_CLARITY: subject readability, copy space, framing.
+- KEYWORD_POTENTIAL: count of accurate, high-demand concepts.
+- RELEASE_CONCERNS: legal risk (people/property/logos). 100 = safe.
+- REJECTION_RISKS: likelihood image passes review. 100 = very likely to pass (noise, focus, clichés).
+- OVERALL_STOCK_SCORE = 0.4*TQ + 0.25*CV + 0.2*CC + 0.1*KP + 0.05*(RC+RR)/2, then subtract 5 points for highlight or shadow clipping >12% and 5 points for sharpness<30 (stackable). Clamp 0-100.
+- RECOMMENDATION >=85=EXCELLENT, 70-84=GOOD, 50-69=MARGINAL, else REJECT.
+- PRIMARY_CATEGORY: pick the best single commercial category.
+- NOTES: <=120 chars mention decisive strengths/weaknesses. ISSUES: comma-separated short tags (e.g., "high noise, needs release").
+
+TECHNICAL SUMMARY:
+{technical_context}
+"""
+
 CONTEXT_PROFILE_MAP = {
     # Preferred contexts (1:1 mapping)
     "stock_product": "stock_product",
@@ -336,6 +371,49 @@ def build_profile_metadata(
     return metadata
 
 
+def compute_stock_notes(technical_metrics: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    """Derive stock-specific notes/fixable issues from technical metrics."""
+    notes: List[str] = []
+    fixable: List[str] = []
+
+    mp = technical_metrics.get('megapixels')
+    if isinstance(mp, (int, float)):
+        if mp < STOCK_MIN_RESOLUTION_MP:
+            notes.append(f"low resolution ({mp:.1f}MP < {STOCK_MIN_RESOLUTION_MP}MP)")
+        elif mp < STOCK_RECOMMENDED_MP:
+            notes.append(f"below recommended resolution ({mp:.1f}MP)")
+
+    sharpness = technical_metrics.get('sharpness')
+    if isinstance(sharpness, (int, float)):
+        if sharpness < STOCK_SHARPNESS_CRITICAL:
+            notes.append(f"soft focus (sharpness {sharpness:.1f})")
+        elif sharpness < STOCK_SHARPNESS_OPTIMAL:
+            notes.append(f"moderate softness (sharpness {sharpness:.1f})")
+
+    noise_score = technical_metrics.get('noise_score')
+    if isinstance(noise_score, (int, float)):
+        if noise_score > STOCK_NOISE_HIGH:
+            notes.append(f"high noise ({noise_score:.1f})")
+        elif noise_score > STOCK_NOISE_WARN:
+            notes.append(f"moderate noise ({noise_score:.1f})")
+
+    highlights = technical_metrics.get('histogram_clipping_highlights')
+    if isinstance(highlights, (int, float)) and highlights > STOCK_CLIPPING_THRESHOLD:
+        notes.append(f"highlight clipping {highlights:.1f}%")
+
+    shadows = technical_metrics.get('histogram_clipping_shadows')
+    if isinstance(shadows, (int, float)) and shadows > STOCK_CLIPPING_THRESHOLD:
+        notes.append(f"shadow clipping {shadows:.1f}%")
+
+    dpi_x = technical_metrics.get('dpi_x')
+    if isinstance(dpi_x, (int, float)) and dpi_x < STOCK_MIN_DPI:
+        notes.append(f"low DPI ({dpi_x:.0f})")
+        if dpi_x >= STOCK_DPI_FIXABLE:
+            fixable.append(f"DPI metadata: {dpi_x:.0f} → {STOCK_MIN_DPI}")
+
+    return notes, fixable
+
+
 def generate_ollama_metadata(
     image_path: str,
     ollama_host_url: str,
@@ -444,6 +522,144 @@ TECH SUMMARY:
     if keywords_str:
         result["keywords"] = keywords_str
     return result or None
+
+
+def build_stock_technical_context(
+    technical_metrics: Dict[str, Any],
+    technical_warnings: List[str],
+) -> str:
+    parts = []
+    mp = technical_metrics.get('megapixels')
+    dims = technical_metrics.get('dimensions')
+    if isinstance(mp, (int, float)) and dims:
+        parts.append(f"resolution: {mp:.1f}MP ({dims})")
+    sharpness = technical_metrics.get('sharpness')
+    if isinstance(sharpness, (int, float)):
+        parts.append(f"sharpness metric: {sharpness:.1f}")
+    noise = technical_metrics.get('noise_score')
+    if isinstance(noise, (int, float)):
+        parts.append(f"noise score: {noise:.1f}")
+    highlights = technical_metrics.get('histogram_clipping_highlights')
+    if isinstance(highlights, (int, float)):
+        parts.append(f"highlight clipping: {highlights:.1f}%")
+    shadows = technical_metrics.get('histogram_clipping_shadows')
+    if isinstance(shadows, (int, float)):
+        parts.append(f"shadow clipping: {shadows:.1f}%")
+    dpi = technical_metrics.get('dpi_x')
+    if isinstance(dpi, (int, float)):
+        parts.append(f"dpi: {dpi:.0f}")
+    stock_notes = technical_metrics.get('stock_notes') or []
+    if stock_notes:
+        parts.append("notes: " + "; ".join(stock_notes))
+    if technical_warnings:
+        parts.append("warnings: " + "; ".join(technical_warnings))
+    return "\n".join(parts)
+
+
+def generate_stock_assessment(
+    image_path: str,
+    ollama_host_url: str,
+    model: str,
+    technical_metrics: Dict[str, Any],
+    technical_warnings: List[str],
+) -> Optional[Dict[str, Any]]:
+    """Call Ollama to get stock suitability scores."""
+    try:
+        encoded_image = encode_image_for_classification(image_path)
+    except Exception as exc:
+        logger.error(f"Failed to encode image for stock assessment ({image_path}): {exc}")
+        return None
+
+    technical_context = build_stock_technical_context(technical_metrics, technical_warnings)
+    prompt = STOCK_EVALUATION_PROMPT.format(technical_context=technical_context)
+    payload = {
+        "model": model,
+        "stream": False,
+        "images": [encoded_image],
+        "prompt": prompt,
+        "format": {
+            "type": "object",
+            "properties": {
+                "COMMERCIAL_VIABILITY": {"type": ["integer", "string"]},
+                "TECHNICAL_QUALITY": {"type": ["integer", "string"]},
+                "COMPOSITION_CLARITY": {"type": ["integer", "string"]},
+                "KEYWORD_POTENTIAL": {"type": ["integer", "string"]},
+                "RELEASE_CONCERNS": {"type": ["integer", "string"]},
+                "REJECTION_RISKS": {"type": ["integer", "string"]},
+                "OVERALL_STOCK_SCORE": {"type": ["integer", "string"]},
+                "RECOMMENDATION": {"type": "string"},
+                "PRIMARY_CATEGORY": {"type": "string"},
+                "NOTES": {"type": "string"},
+                "ISSUES": {"type": "string"},
+            },
+            "required": [
+                "COMMERCIAL_VIABILITY",
+                "TECHNICAL_QUALITY",
+                "COMPOSITION_CLARITY",
+                "KEYWORD_POTENTIAL",
+                "RELEASE_CONCERNS",
+                "REJECTION_RISKS",
+                "OVERALL_STOCK_SCORE",
+                "RECOMMENDATION",
+                "PRIMARY_CATEGORY",
+            ],
+        },
+        "options": {
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1,
+        },
+    }
+
+    def make_request():
+        response = requests.post(ollama_host_url, json=payload, timeout=180)
+        response.raise_for_status()
+        return response
+
+    try:
+        response = retry_with_backoff(make_request)
+    except Exception as exc:
+        logger.error(f"Ollama stock evaluation failed for {image_path}: {exc}")
+        return None
+
+    data = response.json()
+    raw_json = data.get("response") or data.get("message") or data.get("text")
+    if not raw_json:
+        logger.error(f"Ollama returned no stock payload for {image_path}")
+        return None
+
+    try:
+        stock_obj = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+    except json.JSONDecodeError as exc:
+        logger.error(f"Failed to parse stock JSON for {image_path}: {exc}")
+        return None
+
+    result: Dict[str, Any] = {}
+    field_map = {
+        "COMMERCIAL_VIABILITY": "stock_commercial_viability",
+        "TECHNICAL_QUALITY": "stock_technical_quality",
+        "COMPOSITION_CLARITY": "stock_composition_clarity",
+        "KEYWORD_POTENTIAL": "stock_keyword_potential",
+        "RELEASE_CONCERNS": "stock_release_concerns",
+        "REJECTION_RISKS": "stock_rejection_risks",
+        "OVERALL_STOCK_SCORE": "stock_overall_score",
+    }
+    for field, out_key in field_map.items():
+        val = stock_obj.get(field)
+        if val is None:
+            val = stock_obj.get(field.lower())
+        try:
+            score = float(val)
+        except (TypeError, ValueError):
+            logger.error(f"Failed to parse {field}='{val}' as float for {image_path}")
+            return None
+        result[out_key] = int(max(0, min(100, round(score))))
+
+    result["stock_recommendation"] = str(stock_obj.get("RECOMMENDATION", "")).upper()
+    result["stock_primary_category"] = str(stock_obj.get("PRIMARY_CATEGORY", "")).title()
+    result["stock_llm_notes"] = str(stock_obj.get("NOTES", "")).strip()
+    result["stock_llm_issues"] = str(stock_obj.get("ISSUES", "")).strip()
+    return result
 
 
 def resolve_metric_model_name(metric_key: str, args) -> Optional[str]:
@@ -1364,6 +1580,16 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
         # Read image with PIL (or rawpy) for stats
         with open_image_for_analysis(image_path) as img:
             img_rgb = img if img.mode == 'RGB' else img.convert('RGB')
+            width, height = img_rgb.size
+            metrics['dimensions'] = f"{width}x{height}"
+            metrics['megapixels'] = float((width * height) / 1_000_000)
+            metrics['aspect_ratio'] = float(width / max(height, 1))
+            dpi_info = img.info.get('dpi', (72, 72))
+            if isinstance(dpi_info, tuple):
+                metrics['dpi_x'] = float(dpi_info[0])
+                metrics['dpi_y'] = float(dpi_info[1] if len(dpi_info) > 1 else dpi_info[0])
+            elif isinstance(dpi_info, (int, float)):
+                metrics['dpi_x'] = metrics['dpi_y'] = float(dpi_info)
             
             # --- Brightness / contrast ---
             stat = ImageStat.Stat(img_rgb)
@@ -1626,6 +1852,11 @@ def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str
     technical_warnings = assess_technical_metrics(technical_metrics, context=image_context)
     technical_metrics['warnings'] = technical_warnings
     technical_metrics['post_process_potential'] = compute_post_process_potential(technical_metrics, context=image_context)
+    stock_notes, stock_fixable = compute_stock_notes(technical_metrics)
+    technical_metrics['stock_notes'] = stock_notes
+    technical_metrics['stock_fixable'] = stock_fixable
+    if stock_notes:
+        technical_warnings.extend(stock_notes)
 
     return image_context, exif_data, technical_metrics, technical_warnings
 
@@ -2014,7 +2245,8 @@ def process_images_with_pyiqa(
     context_override: Optional[str],
     skip_context_classification: bool,
     args,
-    use_ollama_metadata: bool = False
+    use_ollama_metadata: bool = False,
+    stock_eval: bool = False
 ) -> List[Tuple[str, Optional[Dict]]]:
     """Profile-aware PyIQA pipeline with context detection and rule weighting."""
     results: List[Tuple[str, Optional[Dict]]] = []
@@ -2103,6 +2335,17 @@ def process_images_with_pyiqa(
                 if llm_fields:
                     metadata.update(llm_fields)
 
+            if stock_eval and metadata_host_url:
+                stock_fields = generate_stock_assessment(
+                    image_path=image_path,
+                    ollama_host_url=metadata_host_url,
+                    model=classification_model,
+                    technical_metrics=technical_metrics,
+                    technical_warnings=technical_warnings,
+                )
+                if stock_fields:
+                    metadata.update(stock_fields)
+
             if cache_dir:
                 save_to_cache(image_path, cache_model_label, metadata, cache_dir)
 
@@ -2153,12 +2396,15 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, context_hos
         return []
 
     cache_label = pyiqa_cache_label or "pyiqa_profiles"
+    metadata_host = None
+    if use_ollama_metadata or (cli_args and getattr(cli_args, 'stock_eval', False)):
+        metadata_host = ollama_host_url
     return process_images_with_pyiqa(
         image_paths=image_paths,
         cache_model_label=cache_label,
         classification_model=model,
         context_host_url=context_host_url or ollama_host_url,
-        metadata_host_url=ollama_host_url if use_ollama_metadata else None,
+        metadata_host_url=metadata_host,
         cache_dir=cache_dir,
         backup_dir=backup_dir,
         verify=verify,
@@ -2168,7 +2414,8 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, context_hos
         context_override=context_override,
         skip_context_classification=skip_context_classification,
         args=cli_args,
-        use_ollama_metadata=use_ollama_metadata
+        use_ollama_metadata=use_ollama_metadata,
+        stock_eval=bool(getattr(cli_args, 'stock_eval', False))
     )
 
 
@@ -2181,6 +2428,11 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
             'keywords', 'status', 'context', 'context_profile', 'sharpness', 'brightness', 'contrast',
             'histogram_clipping_highlights', 'histogram_clipping_shadows',
             'color_cast', 'noise_sigma', 'noise_score', 'technical_warnings', 'post_process_potential',
+            'resolution_mp', 'dpi', 'stock_notes', 'stock_fixable',
+            'stock_overall_score', 'stock_recommendation', 'stock_primary_category',
+            'stock_commercial_viability', 'stock_technical_quality', 'stock_composition_clarity',
+            'stock_keyword_potential', 'stock_release_concerns', 'stock_rejection_risks',
+            'stock_llm_notes', 'stock_llm_issues'
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
@@ -2212,6 +2464,21 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'noise_score': technical_metrics.get('noise_score', ''),
                     'technical_warnings': warnings_str,
                     'post_process_potential': metadata.get('post_process_potential', ''),
+                    'resolution_mp': technical_metrics.get('megapixels', ''),
+                    'dpi': technical_metrics.get('dpi_x', ''),
+                    'stock_notes': '; '.join(technical_metrics.get('stock_notes', [])),
+                    'stock_fixable': '; '.join(technical_metrics.get('stock_fixable', [])),
+                    'stock_overall_score': metadata.get('stock_overall_score', ''),
+                    'stock_recommendation': metadata.get('stock_recommendation', ''),
+                    'stock_primary_category': metadata.get('stock_primary_category', ''),
+                    'stock_commercial_viability': metadata.get('stock_commercial_viability', ''),
+                    'stock_technical_quality': metadata.get('stock_technical_quality', ''),
+                    'stock_composition_clarity': metadata.get('stock_composition_clarity', ''),
+                    'stock_keyword_potential': metadata.get('stock_keyword_potential', ''),
+                    'stock_release_concerns': metadata.get('stock_release_concerns', ''),
+                    'stock_rejection_risks': metadata.get('stock_rejection_risks', ''),
+                    'stock_llm_notes': metadata.get('stock_llm_notes', ''),
+                    'stock_llm_issues': metadata.get('stock_llm_issues', ''),
                     'status': 'success'
                 })
             else:
@@ -2238,6 +2505,21 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'noise_score': '',
                     'technical_warnings': '',
                     'post_process_potential': '',
+                    'resolution_mp': '',
+                    'dpi': '',
+                    'stock_notes': '',
+                    'stock_fixable': '',
+                    'stock_overall_score': '',
+                    'stock_recommendation': '',
+                    'stock_primary_category': '',
+                    'stock_commercial_viability': '',
+                    'stock_technical_quality': '',
+                    'stock_composition_clarity': '',
+                    'stock_keyword_potential': '',
+                    'stock_release_concerns': '',
+                    'stock_rejection_risks': '',
+                    'stock_llm_notes': '',
+                    'stock_llm_issues': '',
                 })
 
 
@@ -2592,6 +2874,8 @@ if __name__ == "__main__":
                                help='Override endpoint for context classification (default: same as Ollama host)')
     process_parser.add_argument('--ollama-metadata', action='store_true',
                                help='Use Ollama to generate titles/descriptions/keywords after scoring')
+    process_parser.add_argument('--stock-eval', action='store_true',
+                               help='Request stock photography suitability assessment (commercial/release scoring)')
     process_parser.add_argument('--skip-existing', action='store_true', default=True, help='Skip images with existing metadata (default: True)')
     process_parser.add_argument('--no-skip-existing', action='store_false', dest='skip_existing', help='Process all images, even with existing metadata')
     process_parser.add_argument('--min-score', type=int, default=None, help='Only save results with score >= this value')
@@ -2738,6 +3022,8 @@ if __name__ == "__main__":
         print(f"Context classifier endpoint: {args.context_host_url}")
     if args.ollama_metadata:
         print("Ollama metadata generation: enabled")
+    if args.stock_eval:
+        print("Stock suitability scoring: enabled")
     print(f"PyIQA model (clipiqa_z): {args.pyiqa_model}")
     print(f"PyIQA device: {pyiqa_manager.device if pyiqa_manager else args.pyiqa_device}")
     print(f"PyIQA max cached models: {args.pyiqa_max_models}")
@@ -2791,7 +3077,8 @@ if __name__ == "__main__":
         pyiqa_manager=pyiqa_manager,
         pyiqa_cache_label=pyiqa_cache_label,
         cli_args=args,
-        use_ollama_metadata=args.ollama_metadata
+        use_ollama_metadata=args.ollama_metadata,
+        stock_eval=args.stock_eval
     )
     elapsed_time = time.time() - start_time
     logger.info(f"Completed processing {len(results)} images in {elapsed_time:.2f} seconds")
