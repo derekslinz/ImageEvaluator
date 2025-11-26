@@ -694,6 +694,13 @@ def resolve_metric_model_name(metric_key: str, args) -> Optional[str]:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Default to suppressing PyIQA chatter unless explicitly enabled
+_pyiqa_root_logger = logging.getLogger('pyiqa')
+if not any(isinstance(handler, logging.NullHandler) for handler in _pyiqa_root_logger.handlers):
+    _pyiqa_root_logger.addHandler(logging.NullHandler())
+_pyiqa_root_logger.setLevel(logging.WARNING)
+_pyiqa_root_logger.propagate = False
+
 
 
 
@@ -1753,20 +1760,31 @@ def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str
     return image_context, exif_data, technical_metrics, technical_warnings
 
 
+def configure_pyiqa_logging(verbose: bool = False, debug: bool = False):
+    """Control PyIQA log verbosity based on CLI flags."""
+    pyiqa_logger = logging.getLogger('pyiqa')
+    if not any(isinstance(handler, logging.NullHandler) for handler in pyiqa_logger.handlers):
+        pyiqa_logger.addHandler(logging.NullHandler())
+
+    if debug:
+        pyiqa_level = logging.DEBUG
+        pyiqa_logger.propagate = True
+    elif verbose:
+        pyiqa_level = logging.INFO
+        pyiqa_logger.propagate = True
+    else:
+        pyiqa_level = logging.WARNING
+        pyiqa_logger.propagate = False
+
+    pyiqa_logger.setLevel(pyiqa_level)
+
+
 def setup_logging(log_file: Optional[str] = None, verbose: bool = False, debug: bool = False):
     """Configure logging with file handler and appropriate level."""
-    # Determine logger levels based on flags
-    if debug:
-        logger_level = logging.DEBUG
-    elif verbose:
-        logger_level = logging.INFO
-    else:
-        logger_level = logging.WARNING
-
-    console_level = logger_level
-    file_level = logger_level if not debug else logging.DEBUG
-
-    logger.setLevel(logger_level)
+    # Set level based on verbose/debug flags
+    log_level = logging.DEBUG if (verbose or debug) else logging.INFO
+    logging.getLogger().setLevel(log_level)
+    logger.setLevel(log_level)
     
     # Clear existing handlers to prevent duplicates
     logger.handlers.clear()
@@ -1793,6 +1811,8 @@ def setup_logging(log_file: Optional[str] = None, verbose: bool = False, debug: 
         file_handler.setFormatter(file_format)
         logger.addHandler(file_handler)
         logger.info(f"Logging to file: {log_file}")
+
+    configure_pyiqa_logging(verbose=verbose, debug=debug)
 
 
 def get_image_hash(image_path: str) -> str:
@@ -2844,8 +2864,8 @@ if __name__ == "__main__":
     process_parser.add_argument('--backup-dir', type=str, default=None, help='Directory to store backups (default: same directory as originals)')
     process_parser.add_argument('--verify', action='store_true', help='Verify metadata was correctly embedded after writing')
     process_parser.add_argument('--log-file', type=str, default=None, help='Path to log file (default: auto-generated)')
-    process_parser.add_argument('--verbose', '-v', action='store_true', help='Show INFO-level console logging')
-    process_parser.add_argument('--debug', action='store_true', help='Show DEBUG-level console logging (implies --verbose)')
+    process_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose debug output')
+    process_parser.add_argument('--debug', action='store_true', help='Enable debug logging (includes PyIQA output)')
     process_parser.add_argument('--cache', action='store_true', help='Enable API response caching')
     process_parser.add_argument('--cache-dir', type=str, default=CACHE_DIR, help=f'Cache directory (default: {CACHE_DIR})')
     process_parser.add_argument('--clear-cache', action='store_true', help='Clear cache before processing')
