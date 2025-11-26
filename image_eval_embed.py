@@ -2738,6 +2738,8 @@ if __name__ == "__main__":
     print(f"Ollama model: {args.model}")
     if args.context_host_url and args.context_host_url != args.ollama_host_url:
         print(f"Context classifier endpoint: {args.context_host_url}")
+    if args.ollama_metadata:
+        print("Ollama metadata generation: enabled")
     print(f"PyIQA model (clipiqa_z): {args.pyiqa_model}")
     print(f"PyIQA device: {pyiqa_manager.device if pyiqa_manager else args.pyiqa_device}")
     print(f"PyIQA max cached models: {args.pyiqa_max_models}")
@@ -2775,12 +2777,10 @@ if __name__ == "__main__":
     logger.info(f"Starting processing of images in {args.folder_path}")
     start_time = time.time()
     results = process_images_in_folder(
-        args.folder_path, 
+        args.folder_path,
         args.ollama_host_url,
         args.context_host_url,
-        max_workers=args.workers,
         model=args.model,
-        prompt=prompt,
         file_types=file_types,
         skip_existing=args.skip_existing,
         dry_run=args.dry_run,
@@ -2788,14 +2788,12 @@ if __name__ == "__main__":
         backup_dir=args.backup_dir,
         verify=args.verify,
         cache_dir=cache_dir,
-        ensemble_passes=args.ensemble,
         context_override=args.context,
         skip_context_classification=args.no_context_classification,
-        scoring_engine=args.score_engine,
         pyiqa_manager=pyiqa_manager,
         pyiqa_cache_label=pyiqa_cache_label,
         cli_args=args,
-        pyiqa_batch_size=args.pyiqa_batch_size
+        use_ollama_metadata=args.ollama_metadata
     )
     elapsed_time = time.time() - start_time
     logger.info(f"Completed processing {len(results)} images in {elapsed_time:.2f} seconds")
