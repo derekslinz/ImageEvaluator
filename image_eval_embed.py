@@ -643,8 +643,6 @@ class PyiqaManager:
                 "calibrated": float(calibrated),
                 "model_name": model_name,
             }
-            if torch is not None and torch.cuda.is_available():
-                torch.cuda.empty_cache()
         return scores
 
 
