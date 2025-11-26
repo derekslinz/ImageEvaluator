@@ -20,14 +20,16 @@ AI-powered image quality assessment with EXIF metadata embedding.
 3. **Multi-model PyIQA scoring**  
    After the profile is known, the image is resized to 2048 px and evaluated by all five models plus one disagreement metric (`pyiqa_diff_z`). The calibrated scores are converted to z-scores, blended with the profile’s weights, and adjusted with technical rules (sharpness, clipping, color cast, brightness) pulled from the same profile.
 
-4. **Metadata embedding**  
-   The weighted composite score, profile name, technical metrics, and keywords are written into EXIF (JPEG/PNG via piexif, RAW/TIFF via exiftool). You can optionally let Ollama rewrite title/description/keyword fields before embedding. CSV output mirrors the embedded metadata.
+4. **Metadata & stock suitability**  
+   The weighted composite score, profile name, technical metrics, and keywords are written into EXIF (JPEG/PNG via piexif, RAW/TIFF via exiftool). CSV output mirrors everything. Optional add-ons:
+   - `--ollama-metadata` rewrites title/description/keywords with the vision LLM.
+   - `--stock-eval` asks the LLM for commercial viability, release concerns, rejection risk, and a final stock recommendation (EXCELLENT/GOOD/MARGINAL/REJECT).
 
 ## Features
 
 - **Profile-aware PyIQA pipeline**: Automatic context detection feeds 10 tailored weighting/rule sets.
 - **Multi-model fusion**: clipiqa+_vitL14_512, laion_aes, musiq-ava, maniqa, musiq-paq2piq, plus a model disagreement metric.
-- **Metadata embedding**: Composite score, profile, warnings, and keywords written directly to EXIF, with optional Ollama rewrites for title/description/keywords.
+- **Metadata & stock summaries**: Composite score, profile, warnings, and keywords written directly to EXIF, with optional Ollama rewrites plus stock suitability scoring (commercial viability, release risk, rejection risk).
 - **Technical analysis**: Sharpness, noise, clipping, and color-cast metrics drive rule penalties and CSV reporting.
 - **Batch processing**: Parallel execution with resumable CSV output and optional caching.
 - **Format support**: JPEG, PNG, TIFF, RAW (NEF, DNG, CR2, ARW) with automatic backups.
@@ -51,11 +53,14 @@ python image_eval_embed.py process /path/to/images
 
 # Generate Ollama-driven titles/descriptions/keywords
 python image_eval_embed.py process /path/to/images --ollama-metadata
+
+# Add stock suitability scoring and recommendations
+python image_eval_embed.py process /path/to/images --stock-eval
 ```
 
 ## Scoring & Metadata
 
-PyIQA now performs all scoring. The vision LLM (Ollama) is used for context detection and, if `--ollama-metadata` is set, to regenerate titles/descriptions/keywords. There is no longer an Ollama-only scoring mode.
+PyIQA now performs all scoring. The vision LLM (Ollama) is used for context detection and, if `--ollama-metadata` is set, to regenerate titles/descriptions/keywords. Enable `--stock-eval` to have the same model generate commercial viability, release risk, rejection risk, and a final agency-ready recommendation. There is no longer an Ollama-only scoring mode.
 
 ## CLI Reference
 
@@ -88,6 +93,7 @@ Most flows only need the defaults. Add `--ollama-metadata` if you want the visio
 --model NAME              LLM model (default: qwen3-vl:8b)
 --context-host-url URL    Alternate Ollama endpoint for context classification
 --ollama-metadata         Use Ollama to rewrite title/description/keywords
+--stock-eval              Run stock photography suitability scoring (commercial/release)
 --context NAME            Manual context (e.g., landscape, portrait)
 --no-context-classification  Skip auto context detection
 ```
