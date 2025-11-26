@@ -570,8 +570,6 @@ RETRY_DELAY_BASE = 2  # seconds
 DEFAULT_MODEL = "qwen3-vl:8b"
 CACHE_DIR = ".image_eval_cache"
 CACHE_VERSION = "v1"
-DEFAULT_ENSEMBLE_PASSES = 1  # Number of evaluation passes for ensemble scoring
-
 # Technical analysis constants
 COLOR_CAST_THRESHOLD = 15.0  # Mean difference threshold for color cast detection
 HISTOGRAM_HIGHLIGHT_RANGE = (250, 256)  # Histogram bins considered as highlights
@@ -1872,240 +1870,6 @@ def collect_images(folder_path: str, file_types: Optional[List[str]] = None, ski
     return image_paths
 
 
-def make_single_evaluation(image_path: str, encoded_image: str, ollama_host_url: str, model: str, 
-                          prompt: str, headers: Dict) -> Optional[Dict]:
-    """Make a single evaluation API call."""
-    payload = {
-        "model": model,
-        "stream": False,
-        "images": [encoded_image],
-        "prompt": prompt,
-        "format": {
-            "type": "object",
-            "properties": {
-                "technical_score": {"type": ["integer", "string"]},
-                "composition_score": {"type": ["integer", "string"]},
-                "lighting_score": {"type": ["integer", "string"]},
-                "creativity_score": {"type": ["integer", "string"]},
-                "overall_score": {"type": ["integer", "string"]},
-                "title": {"type": "string"},
-                "description": {"type": "string"},
-                "keywords": {"type": "string"}
-            },
-            "required": [
-                "technical_score",
-                "composition_score",
-                "lighting_score",
-                "creativity_score",
-                "overall_score",
-                "title",
-                "description",
-                "keywords"
-            ]
-        },
-        "options": {
-            "temperature": 0.3,
-            "top_p": 0.9,
-            "repeat_penalty": 1.1
-        }
-    }
-
-    def make_request():
-        response = requests.post(ollama_host_url, json=payload, headers=headers, timeout=120)
-        response.raise_for_status()
-        return response
-    
-    try:
-        response = retry_with_backoff(make_request)
-    except Exception as e:
-        logger.error(f"Request failed after retries for {image_path}: {e}")
-        return None
-    
-    if response and response.status_code == 200:
-        response_data = response.json()
-        metadata_text = response_data.get('response') or response_data.get('thinking', '')
-        
-        if not metadata_text:
-            logger.error(f"No response or thinking field found for {image_path}")
-            return None
-        
-        # Check for content policy violations
-        metadata_lower = metadata_text.lower()
-        if 'violates content policies' in metadata_lower or 'cannot proceed' in metadata_lower:
-            logger.warning(f"Model refused due to content policy: {image_path}")
-            return None
-        
-        try:
-            response_metadata = json.loads(metadata_text)
-            
-            # Validate all score fields
-            score_fields = ['technical_score', 'composition_score', 'lighting_score', 'creativity_score', 'overall_score']
-            for field in score_fields:
-                if field in response_metadata:
-                    validated = validate_score(response_metadata[field])
-                    if validated is None:
-                        logger.warning(f"Invalid {field} for {image_path}")
-                        return None
-                    response_metadata[field] = str(validated)
-                else:
-                    logger.warning(f"Missing {field} in response for {image_path}")
-                    return None
-            
-            return response_metadata
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON for {image_path}: {e}")
-            return None
-    
-    return None
-
-
-def ensemble_evaluate(image_path: str, encoded_image: str, ollama_host_url: str, model: str,
-                     prompt: str, headers: Dict, num_passes: int = 3) -> Optional[Dict]:
-    """Perform ensemble evaluation with multiple passes and aggregate results."""
-    if num_passes == 1:
-        return make_single_evaluation(image_path, encoded_image, ollama_host_url, model, prompt, headers)
-    
-    logger.info(f"Performing {num_passes}-pass ensemble evaluation for {image_path}")
-    evaluations = []
-    
-    for pass_num in range(num_passes):
-        logger.debug(f"Ensemble pass {pass_num + 1}/{num_passes} for {image_path}")
-        result = make_single_evaluation(image_path, encoded_image, ollama_host_url, model, prompt, headers)
-        if result:
-            evaluations.append(result)
-        time.sleep(0.5)  # Small delay between passes
-    
-    if not evaluations:
-        logger.error(f"All ensemble passes failed for {image_path}")
-        return None
-    
-    # Aggregate scores (median for robustness)
-    score_fields = ['technical_score', 'composition_score', 'lighting_score', 'creativity_score', 'overall_score']
-    aggregated = {}
-    
-    for field in score_fields:
-        scores = [int(e[field]) for e in evaluations if field in e]
-        if scores:
-            # Use median for robust aggregation
-            scores.sort()
-            median_idx = len(scores) // 2
-            aggregated[field] = str(scores[median_idx] if len(scores) % 2 == 1 else (scores[median_idx - 1] + scores[median_idx]) // 2)
-    
-    # Use first evaluation's text fields
-    aggregated['title'] = evaluations[0].get('title', '')
-    aggregated['description'] = evaluations[0].get('description', '')
-    aggregated['keywords'] = evaluations[0].get('keywords', '')
-    
-    # Calculate score variance for logging
-    overall_scores = [int(e['overall_score']) for e in evaluations if 'overall_score' in e]
-    if len(overall_scores) > 1:
-        variance = sum((s - sum(overall_scores)/len(overall_scores))**2 for s in overall_scores) / len(overall_scores)
-        std_dev = variance ** 0.5
-        logger.info(f"Ensemble std dev for {image_path}: {std_dev:.2f} (scores: {overall_scores})")
-    
-    return aggregated
-
-
-def process_single_image(image_path: str, ollama_host_url: str, context_host_url: Optional[str], model: str, prompt: str, 
-                        dry_run: bool = False, backup_dir: Optional[str] = None, verify: bool = False,
-                        cache_dir: Optional[str] = None, ensemble_passes: int = 1,
-                        context_override: Optional[str] = None, skip_context_classification: bool = False,
-                        scoring_engine: str = 'ollama') -> Tuple[str, Optional[Dict]]:
-    """Process a single image using the selected scoring engine and return result."""
-    logger.debug(f"Processing image: {image_path}")
-    headers = {'Content-Type': 'application/json'}
-    
-    # Dry run mode - just return dummy data
-    if dry_run:
-        logger.debug(f"Dry run - skipping processing for {image_path}")
-        return (image_path, {'score': '0', 'title': '[DRY RUN]', 'description': 'Would process this image', 'keywords': 'dry-run'})
-    
-    # Check cache first
-    cached_metadata = load_from_cache(image_path, model, cache_dir) if cache_dir else None
-    if cached_metadata:
-        logger.info(f"Using cached result for {image_path}")
-        # Still embed metadata even if cached
-        try:
-            embed_metadata(image_path, cached_metadata, backup_dir, verify)
-            return (image_path, cached_metadata)
-        except Exception as e:
-            logger.error(f"Error embedding cached metadata for {image_path}: {e}")
-            return (image_path, None)
-    
-    # Encode image once for all operations (only needed for Ollama backend)
-    encoded_image = None
-    if scoring_engine == 'ollama':
-        with open(image_path, 'rb') as image_file:
-            encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
-    
-    technical_metrics: Dict[str, Any] = {}
-    technical_warnings: List[str] = []
-    exif_data: Dict = {}
-    
-    if scoring_engine == 'ollama':
-        _, exif_data, technical_metrics, technical_warnings = analyze_image_with_context(
-            image_path, context_host_url or ollama_host_url, model, context_override, skip_context_classification
-        )
-    
-    # Step 3: Enhance prompt with technical context (only needed for Ollama backend)
-    enhanced_prompt = prompt
-    if scoring_engine == 'ollama':
-        enhanced_prompt = create_enhanced_prompt(prompt, exif_data, technical_metrics)
-
-    if scoring_engine == 'pyiqa':
-        logger.error("Direct PyIQA single-image evaluation is disabled. Use the batch PyIQA pipeline.")
-        return (image_path, None)
-
-    # Step 4: Retry logic for malformed responses (Ollama backend)
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        try:
-            # Perform ensemble evaluation
-            response_metadata = ensemble_evaluate(image_path, encoded_image, ollama_host_url, 
-                                                 model, enhanced_prompt, headers, ensemble_passes)
-            
-            if response_metadata is None:
-                if attempt < max_attempts - 1:
-                    logger.info(f"Retrying {image_path} (attempt {attempt + 2}/{max_attempts})")
-                    time.sleep(2)
-                    continue
-                return (image_path, None)
-
-            # Add 'score' field for backwards compatibility (use overall_score)
-            if 'overall_score' in response_metadata:
-                response_metadata['score'] = response_metadata['overall_score']
-
-            response_metadata['technical_metrics'] = technical_metrics
-            response_metadata['technical_warnings'] = technical_warnings
-            response_metadata['post_process_potential'] = technical_metrics.get('post_process_potential')
-
-            # Save to cache
-            if cache_dir:
-                save_to_cache(image_path, model, response_metadata, cache_dir)
-                logger.debug(f"Saved response to cache for {image_path}")
-
-            # Embed metadata
-            try:
-                embed_metadata(image_path, response_metadata, backup_dir, verify)
-                logger.info(f"Successfully processed {image_path} with score {response_metadata.get('score')}")
-                return (image_path, response_metadata)
-            except Exception as e:
-                logger.error(f"Error embedding metadata for {image_path}: {e}")
-                return (image_path, None)
-                
-        except Exception as e:
-            logger.error(f"Unexpected error processing {image_path}: {e}")
-            if attempt < max_attempts - 1:
-                logger.info(f"Retrying {image_path} (attempt {attempt + 2}/{max_attempts})")
-                time.sleep(2)
-                continue
-            return (image_path, None)
-    
-    # Should never reach here
-    return (image_path, None)
-
-
 def _handle_cached_or_dry_run(image_path: str, cache_dir: Optional[str], model: str,
                               backup_dir: Optional[str], verify: bool,
                               dry_run: bool) -> Optional[Tuple[str, Optional[Dict]]]:
@@ -2725,24 +2489,21 @@ if __name__ == "__main__":
     )
     process_parser.add_argument('--csv', type=str, default=None, help='Path to save CSV report (default: auto-generated)')
     process_parser.add_argument('--model', type=str, default=DEFAULT_MODEL,
-                               help=f'Model identifier (LLM name or custom label). Default: {DEFAULT_MODEL}')
-    process_parser.add_argument('--score-engine', choices=['ollama', 'pyiqa'], default='pyiqa',
-                               help='Choose between Ollama (LLM) or PyIQA scoring (default: PyIQA)')
+                               help=f'Ollama model used for context classification and optional metadata. Default: {DEFAULT_MODEL}')
     process_parser.add_argument('--pyiqa-model', type=str, default='clipiqa+_vitl14_512',
-                               help='PyIQA metric name to use when --score-engine pyiqa (default: clipiqa+_vitl14_512)')
+                               help='Base PyIQA metric to use for clipiqa_z (default: clipiqa+_vitl14_512)')
     process_parser.add_argument('--pyiqa-device', type=str, default=None,
                                help='Device for PyIQA (e.g., cuda:0 or cpu). Defaults to CUDA if available.')
     process_parser.add_argument('--pyiqa-score-shift', type=float, default=None,
                                help='Additive adjustment (0-100 scale) applied to PyIQA scores (default: model-specific)')
     process_parser.add_argument('--pyiqa-scale-factor', type=float, default=None,
                                help='Optional multiplier applied to PyIQA raw scores before calibration (auto-detect if omitted)')
-    process_parser.add_argument('--pyiqa-batch-size', type=int, default=4,
-                               help='Images per batch for PyIQA evaluation (default: 4)')
     process_parser.add_argument('--pyiqa-max-models', type=int, default=1,
                                help='Maximum PyIQA models kept in GPU memory at once (default: 1, lower = less VRAM)')
-    process_parser.add_argument('--prompt-file', type=str, default=None, help='Path to custom prompt file (overrides default prompt)')
     process_parser.add_argument('--context-host-url', type=str, default=None,
                                help='Override endpoint for context classification (default: same as Ollama host)')
+    process_parser.add_argument('--ollama-metadata', action='store_true',
+                               help='Use Ollama to generate titles/descriptions/keywords after scoring')
     process_parser.add_argument('--skip-existing', action='store_true', default=True, help='Skip images with existing metadata (default: True)')
     process_parser.add_argument('--no-skip-existing', action='store_false', dest='skip_existing', help='Process all images, even with existing metadata')
     process_parser.add_argument('--min-score', type=int, default=None, help='Only save results with score >= this value')
@@ -2755,8 +2516,6 @@ if __name__ == "__main__":
     process_parser.add_argument('--cache', action='store_true', help='Enable API response caching')
     process_parser.add_argument('--cache-dir', type=str, default=CACHE_DIR, help=f'Cache directory (default: {CACHE_DIR})')
     process_parser.add_argument('--clear-cache', action='store_true', help='Clear cache before processing')
-    process_parser.add_argument('--ensemble', type=int, default=DEFAULT_ENSEMBLE_PASSES, 
-                              help=f'Number of evaluation passes for ensemble scoring (default: {DEFAULT_ENSEMBLE_PASSES})')
     process_parser.add_argument('--context', type=str, default=None,
                               help='Manual context override (e.g., landscape, portrait_neutral, stock_product)')
     process_parser.add_argument('--no-context-classification', action='store_true',
@@ -2900,7 +2659,6 @@ if __name__ == "__main__":
     if args.score_engine == 'pyiqa':
         print(f"PyIQA model: {args.pyiqa_model}")
         print(f"PyIQA device: {pyiqa_manager.device if pyiqa_manager else args.pyiqa_device}")
-        print(f"PyIQA batch size: {args.pyiqa_batch_size}")
         print(f"PyIQA max cached models: {args.pyiqa_max_models}")
         if args.pyiqa_scale_factor:
             print(f"PyIQA scale factor: {args.pyiqa_scale_factor}")
@@ -2909,8 +2667,6 @@ if __name__ == "__main__":
         print("PyIQA composite models: clipiqa_z, laion_aes_z, musiq_ava_z, musiq_paq2piq_z, maniqa_z")
     print(f"Workers: {args.workers}")
     print(f"Skip existing: {args.skip_existing}")
-    if args.ensemble > 1:
-        print(f"{Fore.CYAN}Ensemble mode: {args.ensemble} evaluation passes per image{Fore.RESET}")
     if args.min_score:
         print(f"Minimum score filter: {args.min_score}")
     if args.dry_run:
