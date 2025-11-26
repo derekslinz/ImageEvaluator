@@ -206,7 +206,7 @@ PROFILE_CONFIG = {
         },
     },
 
-    # 4. High-Key Portrait
+    # 5. High-Key Portrait
     "portrait_highkey": {
         "name": "High-Key Portrait",
         "model_weights": {
@@ -256,7 +256,7 @@ PROFILE_CONFIG = {
         },
     },
 
-    # 5. Landscape / Nature
+    # 6. Landscape / Nature
     "landscape": {
         "name": "Landscape/Nature",
         "model_weights": {
@@ -306,7 +306,7 @@ PROFILE_CONFIG = {
         },
     },
 
-    # 6. Street / Documentary
+    # 7. Street / Documentary
     "street_documentary": {
         "name": "Street/Documentary",
         "model_weights": {
@@ -356,9 +356,9 @@ PROFILE_CONFIG = {
         },
     },
 
-    # 7. Sports / Action / Wildlife
+    # 8. Sports / Action
     "sports_action": {
-        "name": "Sports/Action/Wildlife",
+        "name": "Sports/Action",
         "model_weights": {
             "clipiqa_z": 0.30,
             "laion_aes_z": 0.30,
@@ -406,7 +406,7 @@ PROFILE_CONFIG = {
         },
     },
 
-    # 8. Wildlife / Animal (animals as main subject)
+    # 9. Wildlife / Animal (animals as main subject)
     "wildlife_animal": {
         "name": "Wildlife/Animal Photography",
         "model_weights": {
@@ -454,7 +454,7 @@ PROFILE_CONFIG = {
         },
     },
 
-    # 9. Night / Artificial Light (concerts, neon, city lights, events)
+    # 10. Night / Artificial Light (concerts, neon, city lights, events)
     "night_artificial_light": {
         "name": "Night/Artificial Light",
         "model_weights": {
@@ -504,7 +504,7 @@ PROFILE_CONFIG = {
         },
     },
 
-    # 10. Night / Natural Light (stars, Milky Way, aurora, moonlight)
+    # 11. Night / Natural Light (stars, Milky Way, aurora, moonlight)
     "night_natural_light": {
         "name": "Night/Natural Light (Astro)",
         "model_weights": {
@@ -552,7 +552,7 @@ PROFILE_CONFIG = {
         },
     },
 
-    # 11. Architecture / Real Estate
+    # 12. Architecture / Real Estate
     "architecture_realestate": {
         "name": "Architecture/Real Estate",
         "model_weights": {
@@ -602,7 +602,7 @@ PROFILE_CONFIG = {
         },
     },
 
-    # 10. Fine Art / Creative / Experimental
+    # 13. Fine Art / Creative / Experimental
     "fineart_creative": {
         "name": "Fine Art/Creative/Experimental",
         "model_weights": {

@@ -1344,9 +1344,11 @@ Answer with JUST the category name, exactly as written above:
 
 STRICT RULES:
 
-1. If the main subject is a person → choose a portrait_* category (never wildlife_nature or landscape).
-2. If the main subject is a clear non-human animal and fills most of the frame → wildlife_animal.
-3. If the subject is a tiny part of a larger outdoor scene → landscape_nature.
+1. If the main subject is a human OR non-human animal and fills most of the frame
+   AND is framed like a portrait (head/torso or full body with context), choose a portrait_* category.
+2. If the main subject is a non-human animal but framed more as part of a larger scene
+   (e.g. more environmental, not portrait-style), choose wildlife_animal.
+3. If the subject is a tiny part of a larger outdoor scene → landscape.
 4. Macro categories are ONLY for extreme close-ups.
 5. If uncertain, choose the closest general category (NOT wildlife or macro).
 
@@ -1490,7 +1492,41 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
     
     raw_response = result.get('response', '')
     context_label = raw_response.strip().lower()
-    
+    # 1) Direct "category=<label>" extraction
+    m = re.search(r'category\s*=\s*([a-z_]+)', context_label)
+    if m:
+        candidate = m.group(1)
+
+    # Known labels from your prompt (canonical names)
+    allowed_labels = {
+        "landscape",
+        "wildlife_animal",
+        "portrait_neutral",
+        "portrait_highkey",
+        "macro_nature",
+        "macro_food",
+        "street_documentary",
+        "sports_action",
+        "architecture_realestate",
+        "studio_photography",
+        "night_natural_light",
+        "night_artificial_light",
+        "fineart_creative",
+    }
+
+    # Handle truncated/internal variants like "wildlife_an"
+    # Find exact or unique-prefix match
+    matched = None
+    if candidate in allowed_labels:
+        matched = candidate
+    else:
+        matches = [lbl for lbl in allowed_labels if lbl.startswith(candidate)]
+        if len(matches) == 1:
+            matched = matches[0]
+
+    if matched:
+        logger.info(f"Context classification: {matched} (category=) for {image_path}")
+        return ClassificationResult(matched, 'high', 'category_eq', raw_response, 0)
     # Log raw response for debugging
     logger.debug(f"Context classification raw response: '{raw_response}' for {image_path}")
     
