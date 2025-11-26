@@ -77,7 +77,7 @@ Most flows only need the defaults. Add `--ollama-metadata` if you want the visio
 
 **PyIQA Options:**
 ```
---pyiqa-model NAME        Metric name (default: clipiqa+_vitl14_512)
+--pyiqa-model NAME        Metric name (default: clipiqa+_vitL14_512)
 --pyiqa-device DEVICE     cuda:0, cpu (default: auto)
 --pyiqa-score-shift N     Score adjustment
 --pyiqa-max-models N      Max models in VRAM (default: 1)

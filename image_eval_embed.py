@@ -66,7 +66,7 @@ def list_pyiqa_metrics() -> List[str]:
 
 def get_default_pyiqa_shift(model_name: str) -> float:
     defaults = {
-        'clipiqa+_vitl14_512': 14.0,
+        DEFAULT_CLIPIQ_MODEL.lower(): 14.0,
         'maniqa': 14.0,
         'maniqa-kadid': 14.0,
         'maniqa-pipal': 14.0,
@@ -78,6 +78,7 @@ Image.MAX_IMAGE_PIXELS = None  # Remove limit entirely (or set to a higher value
 
 
 PYIQA_MAX_LONG_EDGE = 2048
+DEFAULT_CLIPIQ_MODEL = "clipiqa+_vitL14_512"
 
 CONTEXT_PROFILE_MAP = {
     # Preferred contexts (1:1 mapping)
@@ -2577,8 +2578,8 @@ if __name__ == "__main__":
     process_parser.add_argument('--csv', type=str, default=None, help='Path to save CSV report (default: auto-generated)')
     process_parser.add_argument('--model', type=str, default=DEFAULT_MODEL,
                                help=f'Ollama model used for context classification and optional metadata. Default: {DEFAULT_MODEL}')
-    process_parser.add_argument('--pyiqa-model', type=str, default='clipiqa+_vitl14_512',
-                               help='Base PyIQA metric to use for clipiqa_z (default: clipiqa+_vitl14_512)')
+    process_parser.add_argument('--pyiqa-model', type=str, default=DEFAULT_CLIPIQ_MODEL,
+                               help=f'Base PyIQA metric to use for clipiqa_z (default: {DEFAULT_CLIPIQ_MODEL})')
     process_parser.add_argument('--pyiqa-device', type=str, default=None,
                                help='Device for PyIQA (e.g., cuda:0 or cpu). Defaults to CUDA if available.')
     process_parser.add_argument('--pyiqa-score-shift', type=float, default=None,
