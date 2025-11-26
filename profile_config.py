@@ -108,7 +108,55 @@ PROFILE_CONFIG = {
         },
     },
 
-    # 3. Portrait (Neutral / Studio)
+    # 3. Macro / Nature (non-food: insects, flowers, textures)
+    "macro_nature": {
+        "name": "Macro/Nature Photography",
+        "model_weights": {
+            "clipiqa_z": 0.20,
+            "laion_aes_z": 0.25,
+            "musiq_ava_z": 0.30,
+            "maniqa_z": 0.50,
+            "musiq_paq2piq_z": 0.25,
+            "pyiqa_diff_z": 0.45,
+        },
+        "rules": {
+            "sharpness": {
+                "soft_threshold": 60.0,
+                "critical_threshold": 30.0,
+                "soft_penalty": 10.0,
+                "critical_penalty": 28.0,
+            },
+            "clipping": {
+                "warn_pct": 4.0,
+                "hard_pct": 18.0,
+                "warn_penalty": 6.0,
+                "hard_penalty": 14.0,
+            },
+            "color_cast": {
+                "threshold": 20.0,
+                "penalty": 4.0,
+            },
+            "brightness": {
+                "min_ok": 80.0,
+                "max_ok": 230.0,
+                "mild_penalty": 5.0,
+                "strong_penalty": 12.0,
+            },
+            "noise": {
+                "warn": 35.0,
+                "high": 60.0,
+                "warn_penalty": 6.0,
+                "high_penalty": 14.0,
+            },
+        },
+        "post_process": {
+            "base": 72,
+            "sharpness_heavy": 35.0,
+            "sharpness_soft": 60.0,
+        },
+    },
+
+    # 4. Portrait (Neutral / Studio)
     "portrait_neutral": {
         "name": "Portrait (Neutral/Studio)",
         "model_weights": {
@@ -358,9 +406,57 @@ PROFILE_CONFIG = {
         },
     },
 
-    # 8. Concert / Night / City at Night
-    "concert_night": {
-        "name": "Concert/Night/Low-Light",
+    # 8. Wildlife / Animal (animals as main subject)
+    "wildlife_animal": {
+        "name": "Wildlife/Animal Photography",
+        "model_weights": {
+            "clipiqa_z": 0.35,
+            "laion_aes_z": 0.35,
+            "musiq_ava_z": 0.30,
+            "maniqa_z": 0.40,
+            "musiq_paq2piq_z": 0.30,
+            "pyiqa_diff_z": 0.35,
+        },
+        "rules": {
+            "sharpness": {
+                "soft_threshold": 50.0,
+                "critical_threshold": 25.0,
+                "soft_penalty": 10.0,
+                "critical_penalty": 26.0,
+            },
+            "clipping": {
+                "warn_pct": 6.0,
+                "hard_pct": 25.0,
+                "warn_penalty": 5.0,
+                "hard_penalty": 12.0,
+            },
+            "color_cast": {
+                "threshold": 18.0,
+                "penalty": 5.0,
+            },
+            "brightness": {
+                "min_ok": 60.0,
+                "max_ok": 220.0,
+                "mild_penalty": 5.0,
+                "strong_penalty": 12.0,
+            },
+            "noise": {
+                "warn": 35.0,
+                "high": 65.0,
+                "warn_penalty": 6.0,
+                "high_penalty": 14.0,
+            },
+        },
+        "post_process": {
+            "base": 72,
+            "sharpness_heavy": 30.0,
+            "sharpness_soft": 50.0,
+        },
+    },
+
+    # 9. Night / Artificial Light (concerts, neon, city lights, events)
+    "night_artificial_light": {
+        "name": "Night/Artificial Light",
         "model_weights": {
             "clipiqa_z": 0.50,
             "laion_aes_z": 0.50,
@@ -408,7 +504,55 @@ PROFILE_CONFIG = {
         },
     },
 
-    # 9. Architecture / Real Estate
+    # 10. Night / Natural Light (stars, Milky Way, aurora, moonlight)
+    "night_natural_light": {
+        "name": "Night/Natural Light (Astro)",
+        "model_weights": {
+            "clipiqa_z": 0.45,
+            "laion_aes_z": 0.55,
+            "musiq_ava_z": 0.45,
+            "maniqa_z": 0.25,
+            "musiq_paq2piq_z": 0.20,
+            "pyiqa_diff_z": 0.25,
+        },
+        "rules": {
+            "sharpness": {
+                "soft_threshold": 35.0,
+                "critical_threshold": 12.0,
+                "soft_penalty": 3.0,
+                "critical_penalty": 10.0,
+            },
+            "clipping": {
+                "warn_pct": 15.0,
+                "hard_pct": 50.0,
+                "warn_penalty": 2.0,
+                "hard_penalty": 6.0,
+            },
+            "color_cast": {
+                "threshold": 35.0,
+                "penalty": 0.0,
+            },
+            "brightness": {
+                "min_ok": 10.0,
+                "max_ok": 100.0,
+                "mild_penalty": 2.0,
+                "strong_penalty": 6.0,
+            },
+            "noise": {
+                "warn": 55.0,
+                "high": 85.0,
+                "warn_penalty": 3.0,
+                "high_penalty": 8.0,
+            },
+        },
+        "post_process": {
+            "base": 72,
+            "sharpness_heavy": 18.0,
+            "sharpness_soft": 35.0,
+        },
+    },
+
+    # 11. Architecture / Real Estate
     "architecture_realestate": {
         "name": "Architecture/Real Estate",
         "model_weights": {

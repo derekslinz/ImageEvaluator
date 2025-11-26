@@ -142,21 +142,102 @@ CONTEXT_PROFILE_MAP = {
     # Preferred contexts (1:1 mapping)
     "stock_product": "stock_product",
     "macro_food": "macro_food",
+    "macro_nature": "macro_nature",
     "portrait_neutral": "portrait_neutral",
     "portrait_highkey": "portrait_highkey",
     "landscape": "landscape",
     "street_documentary": "street_documentary",
     "sports_action": "sports_action",
-    "concert_night": "concert_night",
+    "wildlife_animal": "wildlife_animal",
+    "night_artificial_light": "night_artificial_light",
+    "night_natural_light": "night_natural_light",
     "architecture_realestate": "architecture_realestate",
     "fineart_creative": "fineart_creative",
     # Legacy/alias contexts
-    "event_lowlight": "concert_night",
+    "concert_night": "night_artificial_light",
+    "event_lowlight": "night_artificial_light",
     "travel_story": "street_documentary",
     "travel": "landscape",
     "travel_reportage": "street_documentary",
     "product_catalog": "stock_product",
+    "wildlife": "wildlife_animal",
+    "animal": "wildlife_animal",
+    "pet": "wildlife_animal",
+    "astro": "night_natural_light",
+    "astrophotography": "night_natural_light",
+    "milky_way": "night_natural_light",
+    "aurora": "night_natural_light",
 }
+
+# Allowed classification labels (used for truncation handling)
+ALLOWED_LABELS = [
+    "landscape",
+    "portrait_neutral",
+    "portrait_highkey",
+    "macro_food",
+    "macro_nature",
+    "street_documentary",
+    "sports_action",
+    "wildlife_animal",
+    "night_artificial_light",
+    "night_natural_light",
+    "architecture_realestate",
+    "stock_product",
+    "fineart_creative",
+]
+
+
+def parse_context_response(raw: str) -> Tuple[str, str]:
+    """
+    Parse model response to extract context label.
+    
+    Handles:
+    - Exact matches
+    - qwen style "category=..." format
+    - Truncated responses (e.g., 'wildlife_an' -> 'wildlife_animal')
+    
+    Returns (label, source), where:
+      - label is one of ALLOWED_LABELS or 'unknown'
+      - source is 'exact', 'prefix', 'truncated', or 'unknown'
+    """
+    norm = raw.strip().lower()
+    
+    # Handle qwen style "category=…"
+    if norm.startswith("category="):
+        norm = norm.split("=", 1)[1].strip()
+    
+    # Strip quotes if present
+    norm = norm.strip('"\'')
+    
+    # Exact match
+    if norm in ALLOWED_LABELS:
+        return norm, "exact"
+    
+    # Check CONTEXT_PROFILE_MAP for aliases
+    if norm in CONTEXT_PROFILE_MAP:
+        return CONTEXT_PROFILE_MAP[norm], "alias"
+    
+    # Truncation / partial match, e.g. 'wildlife_an' or 'wildlife'
+    # Check if response is a prefix of a label OR label is a prefix of response
+    candidates = [
+        lab for lab in ALLOWED_LABELS
+        if lab.startswith(norm) or norm.startswith(lab)
+    ]
+    if len(candidates) == 1:
+        return candidates[0], "truncated"
+    
+    # Check for underscore-separated partial match (e.g., "night_art" -> "night_artificial_light")
+    if '_' in norm:
+        parts = norm.split('_')
+        candidates = [
+            lab for lab in ALLOWED_LABELS
+            if all(part in lab for part in parts)
+        ]
+        if len(candidates) == 1:
+            return candidates[0], "truncated"
+    
+    # Still unknown
+    return "unknown", "unknown"
 
 
 def map_context_to_profile(context_label: str) -> str:
@@ -1227,25 +1308,73 @@ def extract_exif_metadata(image_path: str) -> Dict[str, Union[str, int, None]]:
     return metadata
 
 
-# Lightweight classification prompt for 10 contexts
-IMAGE_CONTEXT_CLASSIFIER_PROMPT = """You are analyzing this photograph to classify it into ONE category.
+# Lightweight classification prompt for 12 contexts
+IMAGE_CONTEXT_CLASSIFIER_PROMPT = """You are NOT a chat assistant.
+You MUST NOT explain, greet, apologize, justify, describe, or respond conversationally.
 
-Look at the image and determine which category it belongs to:
+Your ONLY job is to classify the image into EXACTLY ONE photography category from the list below.
+You are a strict image classifier. Choose EXACTLY ONE category from the list.
 
-1. landscape - outdoor nature scenes, mountains, forests, seascapes, sunsets, natural vistas
-2. portrait_neutral - people photos with standard lighting, headshots, portraits
-3. portrait_highkey - bright, overexposed people photos, airy portraits
-4. macro_food - extreme close-ups of food or small objects, detailed macro shots
-5. street_documentary - candid street photography, photojournalism, documentary style
-6. sports_action - fast motion, sports, wildlife in motion, action photography
-7. concert_night - dark scenes, concerts, night cityscapes, low-light photography
-8. architecture_realestate - buildings, interiors, rooms, architectural photography
-9. stock_product - clean product shots on white/neutral backgrounds, catalog photography
-10. fineart_creative - abstract, experimental, artistic, intentionally unconventional
+Global portrait rule:
+- Portraits may be of humans OR animals.
+- Only call an image a portrait if the main subject is framed between:
+  - most zoomed-in: the whole head (not just an eye or lips), and
+  - least zoomed-in: the full body with reasonable surrounding context.
+- If the subject is tiny in the frame (small figure in a big scene), do NOT use a portrait class.
+  Use landscape, wildlife_animal, street_documentary, etc. instead.
+- If only a small part of the subject (eye, mouth, fur patch, feathers detail) is shown, treat it as macro/close-up, not portrait.
 
-Respond with ONLY the category name from the list above. Examples: "landscape" or "portrait_neutral" or "street_documentary"
+Categories:
+- landscape: wide outdoor scenes, natural environments, scenery, horizons, seascapes, skies
+- wildlife_animal: animals as the main subject (birds, mammals, etc.), not extreme close-up of a small detail
+- portrait_neutral: human or animal portraits with neutral/normal lighting; subject framed from head/shoulders up to full body
+- portrait_highkey: human or animal portraits with very bright, mostly white background and high-key lighting
+- macro_nature: extreme close-ups of flowers, insects, leaves, feathers, fur, etc.
+- macro_food: close-ups of food, dishes, drinks, ingredients where food is clearly the main subject
+- street_documentary: candid street scenes, people in public spaces, documentary-style urban life
+- sports_action: sports or fast action (players, running, jumping, flying, strong motion)
+- architecture_realestate: buildings, interiors, rooms, city structures as the main subject
+- stock_product: products or objects presented clearly for commercial use, often on plain or clean backgrounds
+- night_natural_light: night scenes lit mainly by moonlight or natural low light (e.g. stars, moonlit landscapes)
+- night_artificial_light: night scenes dominated by artificial lights (neon, city lights, concerts, street lamps)
+- fineart_creative: abstract, surreal, heavily stylized or concept-driven images that don’t clearly fit the other categories
 
-Your response:"""
+Answer with JUST the category name, exactly as written above:
+
+STRICT RULES:
+
+1. If the main subject is a person → choose a portrait_* category (never wildlife_nature or landscape).
+2. If the main subject is a clear non-human animal and fills most of the frame → wildlife_animal.
+3. If the subject is a tiny part of a larger outdoor scene → landscape_nature.
+4. Macro categories are ONLY for extreme close-ups.
+5. If uncertain, choose the closest general category (NOT wildlife or macro).
+
+FORBIDDEN OUTPUT:
+
+- No explanations
+- No reasoning
+- No greetings
+- No multi-sentence answers
+- No markdown
+- No justification
+- No extra words
+
+REQUIRED OUTPUT FORMAT (MANDATORY):
+
+Return ONLY this exact format:
+
+category=<one category from the allowed list>
+
+Example of correct output:
+category=macro_nature
+
+Example of invalid output:
+"The image appears to be..."
+"My answer is..."
+"macro_nature"
+"category: macro_nature"
+"category = macro_nature"
+"""
 
 
 class ClassificationResult:
@@ -1261,7 +1390,7 @@ class ClassificationResult:
         self.retries = retries
 
 
-def classify_image_context(image_path: str, ollama_host_url: str, model: str,
+def classify_image_context(image_path: str, ollama_host_url: str, model: str,   
                            max_retries: int = MAX_RETRIES) -> str:
     """Quickly classify image context using vision model with retry logic.
     
@@ -1273,14 +1402,35 @@ def classify_image_context(image_path: str, ollama_host_url: str, model: str,
 
 def classify_image_context_detailed(image_path: str, ollama_host_url: str, model: str,
                                      max_retries: int = MAX_RETRIES) -> ClassificationResult:
-    """Classify image context with retry logic and confidence tracking."""
+    """Classify image context with retry logic and confidence tracking.
+    
+    Retries on:
+    - Network errors (timeout, connection)
+    - Unrecognized responses (fallback to stock_product)
+    """
+    last_result = None
     last_error = None
     
     for attempt in range(max_retries):
         try:
             result = _classify_image_context_once(image_path, ollama_host_url, model)
             result.retries = attempt
-            return result
+            
+            # If we got a valid classification (not a fallback), return it
+            if result.method != 'fallback' and result.confidence != 'low':
+                return result
+            
+            # Got a fallback/unrecognized response - retry if we have attempts left
+            last_result = result
+            if attempt < max_retries - 1:
+                logger.warning(f"Classification returned unrecognized response for {image_path} "
+                              f"(attempt {attempt + 1}/{max_retries}): '{result.raw_response[:100]}...' - retrying")
+                time.sleep(RETRY_DELAY_BASE * (attempt + 1))
+            else:
+                # Last attempt - return whatever we got
+                logger.warning(f"Classification exhausted retries for {image_path}, using fallback")
+                return result
+                
         except requests.exceptions.Timeout as e:
             last_error = e
             logger.warning(f"Classification timeout for {image_path} (attempt {attempt + 1}/{max_retries})")
@@ -1294,10 +1444,14 @@ def classify_image_context_detailed(image_path: str, ollama_host_url: str, model
         except Exception as e:
             # Don't retry for other exceptions
             logger.warning(f"Classification failed for {image_path}: {e}")
-            return ClassificationResult('stock_product', 'low', 'error', str(e), attempt)
+            return ClassificationResult('unknown', 'low', 'error', str(e), attempt)
+    
+    # If we have a last result from fallback attempts, return it
+    if last_result:
+        return last_result
     
     logger.warning(f"Classification exhausted retries for {image_path}: {last_error}")
-    return ClassificationResult('stock_product', 'low', 'retry_exhausted', str(last_error), max_retries)
+    return ClassificationResult('unknown', 'low', 'retry_exhausted', str(last_error), max_retries)
 
 
 def _classify_image_context_once(image_path: str, ollama_host_url: str, model: str) -> ClassificationResult:
@@ -1351,7 +1505,14 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
             logger.debug(f"Context classification fallback response: '{raw_response}' for {image_path}")
         if not raw_response or not context_label:
             logger.warning(f"Context classification returned empty response for {image_path}. Model payload: {result}")
-            return ClassificationResult('stock_product', 'low', 'empty_response', '', 0)
+            return ClassificationResult('unknown', 'low', 'empty_response', '', 0)
+    
+    # Try parse_context_response first (handles truncation and category= format)
+    parsed_label, parse_source = parse_context_response(raw_response)
+    if parsed_label != "unknown":
+        confidence = 'high' if parse_source in ('exact', 'alias') else 'medium'
+        logger.info(f"Context classification: {parsed_label} ({parse_source}) for {image_path}")
+        return ClassificationResult(parsed_label, confidence, parse_source, raw_response, 0)
     
     # Handle numbered responses (e.g., "1", "1.", "5. landscape")
     number_to_context = {
@@ -1359,12 +1520,15 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
         '2': 'portrait_neutral',
         '3': 'portrait_highkey',
         '4': 'macro_food',
-        '5': 'street_documentary',
-        '6': 'sports_action',
-        '7': 'concert_night',
-        '8': 'architecture_realestate',
-        '9': 'stock_product',
-        '10': 'fineart_creative'
+        '5': 'macro_nature',
+        '6': 'street_documentary',
+        '7': 'sports_action',
+        '8': 'wildlife_animal',
+        '9': 'night_artificial_light',
+        '10': 'night_natural_light',
+        '11': 'architecture_realestate',
+        '12': 'stock_product',
+        '13': 'fineart_creative'
     }
     
     # Check if response starts with a number
@@ -1386,9 +1550,11 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
 
     # Weighted sentence analysis to avoid false positives
     sentences = re.split(r'[.!?\n]+', context_label)
-    positive_markers = ["include", "includes", "fits", "fit", "belongs to", "classified as", "this is", "is a", "matches", "best fits"]
-    negative_markers = ["don't fit", "doesn't fit", "does not fit", "not ", "no ", "without"]
+    positive_markers = ["include", "includes", "fits", "fit", "belongs to", "classified as", "this is", "is a", "matches", "best fits", "category is", "would be", "should be", "falls under"]
+    negative_markers = ["don't fit", "doesn't fit", "does not fit", "not ", "no ", "without", "isn't", "aren't"]
     candidate_scores = {}
+    
+    # First pass: check for explicit category mentions with context
     for sentence in sentences:
         s = sentence.strip()
         if not s:
@@ -1400,9 +1566,20 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
         elif any(marker in lowered for marker in positive_markers):
             sentiment = 1
         for known_context in PROFILE_CONFIG.keys():
-            if known_context in lowered:
+            # Check for the context name with word boundaries
+            pattern = r'\b' + re.escape(known_context) + r'\b'
+            if re.search(pattern, lowered):
                 score = 2 if sentiment == 1 else (-2 if sentiment == -1 else 1)
                 candidate_scores[known_context] = max(score, candidate_scores.get(known_context, -10))
+    
+    # Second pass: look for category name anywhere in response (common in verbose responses)
+    if not candidate_scores:
+        for known_context in PROFILE_CONFIG.keys():
+            # Use word boundaries to avoid partial matches
+            pattern = r'\b' + re.escape(known_context) + r'\b'
+            if re.search(pattern, context_label):
+                candidate_scores[known_context] = 1
+    
     if candidate_scores:
         best_context, best_score = max(candidate_scores.items(), key=lambda kv: kv[1])
         if best_score > 0:
@@ -1423,8 +1600,8 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
     
     # Log the failure with the actual response
     logger.warning(f"Context classification failed: unknown response '{raw_response}' (normalized: '{context_label}') for {image_path}. "
-                  f"Defaulting to 'stock_product' (most restrictive). Consider manual context override.")
-    return ClassificationResult('stock_product', 'low', 'fallback', raw_response, 0)
+                  f"Defaulting to 'unknown'. Consider manual context override.")
+    return ClassificationResult('unknown', 'low', 'fallback', raw_response, 0)
 
 
 def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, context: str = 'stock_product') -> Dict:
@@ -2260,7 +2437,8 @@ def process_context_only(
     backup_dir: Optional[str] = None,
     dry_run: bool = False,
     workers: int = 4,
-    force: bool = False
+    force: bool = False,
+    retry_contexts: Optional[List[str]] = None
 ) -> List[Tuple[str, str, str]]:
     """Classify images and embed context only (no scoring).
     
@@ -2268,6 +2446,7 @@ def process_context_only(
     - Have no context embedded, OR
     - Have 'stock_product' context (the fallback)
     
+    Use --retry-contexts to also re-classify specific contexts.
     Use --force to re-classify ALL images regardless of existing context.
     
     Returns list of (image_path, context, confidence) tuples.
@@ -2292,9 +2471,14 @@ def process_context_only(
                     # Force mode: process everything
                     image_paths.append(image_path)
                 elif cached and cached != 'stock_product':
-                    # Has real classification - skip and record
-                    results.append((image_path, cached, 'cached'))
-                    print(f"{Fore.YELLOW}[Cached]{Style.RESET_ALL} {os.path.basename(image_path)}: {cached}")
+                    # Check if this context should be retried
+                    if retry_contexts and cached in retry_contexts:
+                        print(f"{Fore.MAGENTA}[Retry]{Style.RESET_ALL} {os.path.basename(image_path)}: was {cached}")
+                        image_paths.append(image_path)
+                    else:
+                        # Has real classification - skip and record
+                        results.append((image_path, cached, 'cached'))
+                        print(f"{Fore.YELLOW}[Cached]{Style.RESET_ALL} {os.path.basename(image_path)}: {cached}")
                 else:
                     # No context OR stock_product fallback - needs (re)classification
                     if cached == 'stock_product':
@@ -3155,6 +3339,8 @@ if __name__ == "__main__":
     prep_parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
     prep_parser.add_argument('--context', type=str, default=None,
                             help='Manual context override for all images (skip classification)')
+    prep_parser.add_argument('--retry-contexts', type=str, default=None,
+                            help='Comma-separated list of contexts to re-classify (e.g., "macro_food,macro_nature")')
     prep_parser.add_argument('--force', action='store_true',
                             help='Re-classify ALL images, even those with existing non-fallback context')
     
@@ -3230,6 +3416,12 @@ if __name__ == "__main__":
             print(f"  CSV output: {args.csv_output}")
         print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}\n")
         
+        # Parse retry_contexts if provided
+        retry_contexts = None
+        if args.retry_contexts:
+            retry_contexts = [c.strip() for c in args.retry_contexts.split(',')]
+            print(f"  Retry:      {', '.join(retry_contexts)}")
+        
         results = process_context_only(
             folder_path=args.folder_path,
             ollama_host_url=args.ollama_host_url,
@@ -3239,7 +3431,8 @@ if __name__ == "__main__":
             backup_dir=args.backup_dir,
             dry_run=args.dry_run,
             workers=args.workers,
-            force=args.force
+            force=args.force,
+            retry_contexts=retry_contexts
         )
         
         print(f"\n{Fore.GREEN}Completed! Processed {len(results)} images.{Style.RESET_ALL}")

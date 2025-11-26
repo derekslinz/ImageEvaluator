@@ -120,18 +120,21 @@ ollama pull ingu627/Qwen2.5-VL-7B-Instruct-Q5_K_M
 
 ## Context Profiles
 
-The evaluator uses 10 photography profiles with tailored thresholds:
+The evaluator uses 13 photography profiles with tailored thresholds:
 
 | Profile | Use Case |
 |---------|----------|
 | `stock_product` | Product/catalog (strictest) |
-| `macro_food` | Food and macro photography |
+| `macro_food` | Food photography |
+| `macro_nature` | Nature macro (insects, flowers, textures) |
 | `portrait_neutral` | Standard portraits |
 | `portrait_highkey` | Bright, airy portraits |
 | `landscape` | Nature and scenery |
 | `street_documentary` | Street and documentary |
-| `sports_action` | Sports and wildlife |
-| `concert_night` | Low-light, concerts |
+| `sports_action` | Sports and fast action |
+| `wildlife_animal` | Animals as main subject (pets, birds, mammals) |
+| `night_artificial_light` | Concerts, neon, city lights, nightlife |
+| `night_natural_light` | Stars, Milky Way, aurora, moonlight |
 | `architecture_realestate` | Buildings and interiors |
 | `fineart_creative` | Experimental (most flexible) |
 
