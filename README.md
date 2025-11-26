@@ -18,7 +18,7 @@ AI-powered image quality assessment with EXIF metadata embedding.
    In addition to the weighted models, we always compute a sixth signal (`pyiqa_diff_z`) that measures disagreement between models and acts as a stability penalty/bonus.
 
 3. **Multi-model PyIQA scoring**  
-   After the profile is known, the image is resized to 2048 px and evaluated by **all six** metrics. The calibrated scores are converted to z-scores, blended with the profile’s weights, and adjusted with technical rules (sharpness, clipping, color cast, brightness) pulled from the same profile.
+   After the profile is known, the image is resized to 2048 px and evaluated by all five models plus one disagreement metric (`pyiqa_diff_z`). The calibrated scores are converted to z-scores, blended with the profile’s weights, and adjusted with technical rules (sharpness, clipping, color cast, brightness) pulled from the same profile.
 
 4. **Metadata embedding**  
    The weighted composite score, profile name, technical metrics, and keywords are written into EXIF (JPEG/PNG via piexif, RAW/TIFF via exiftool). You can optionally let Ollama rewrite title/description/keyword fields before embedding. CSV output mirrors the embedded metadata.
