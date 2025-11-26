@@ -2149,7 +2149,7 @@ def embed_metadata(image_path: str, metadata: Dict, backup_dir: Optional[str] = 
             if technical_value:
                 print(f"{Fore.BLUE}Embedding technical score:{Fore.RESET} {Fore.GREEN}{technical_value}{Fore.RESET}")
 
-            context_value = sanitize_string(str(metadata.get('context_label', '') or ''))
+            context_value = sanitize_string(metadata.get('context_label', ''))
             if context_value:
                 exif_dict["0th"][piexif.ImageIFD.ImageDescription] = context_value.encode('utf-8')
                 print(f"{Fore.BLUE}Embedding Context:{Fore.RESET} {Fore.GREEN}{context_value}{Fore.RESET}")
