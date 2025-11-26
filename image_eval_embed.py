@@ -1943,8 +1943,12 @@ def read_cached_context(image_path: str) -> Optional[str]:
         if not context_value:
             return None
 
-        mapped = map_context_to_profile(context_value)
-        if mapped in PROFILE_CONFIG:
+        normalized = context_value.strip().lower()
+        if normalized in PROFILE_CONFIG:
+            return normalized
+
+        mapped = CONTEXT_PROFILE_MAP.get(normalized)
+        if mapped and mapped in PROFILE_CONFIG:
             return mapped
 
         logger.debug(
