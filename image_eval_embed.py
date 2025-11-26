@@ -651,6 +651,7 @@ def generate_stock_assessment(
         try:
             score = float(val)
         except (TypeError, ValueError):
+            logger.error(f"Failed to parse {field}='{val}' as float for {image_path}")
             return None
         result[out_key] = int(max(0, min(100, round(score))))
 
