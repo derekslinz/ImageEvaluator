@@ -603,7 +603,7 @@ class PyiqaManager:
             oldest = self.scorer_usage.pop(0)
             scorer = self.scorers.pop(oldest, None)
             if scorer:
-                del scorer
+                pass
             if torch is not None and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
