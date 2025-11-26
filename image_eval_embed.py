@@ -56,6 +56,10 @@ def list_pyiqa_metrics() -> List[str]:
     if not PYIQA_AVAILABLE or pyiqa is None:
         return []
     try:
+        if hasattr(pyiqa, "list_models"):
+            models = pyiqa.list_models()
+            if models:
+                return sorted(models)
         return sorted(getattr(pyiqa, "AVAILABLE_METRICS", []))
     except Exception:
         return []
@@ -466,15 +470,37 @@ class PyIqaScorer:
 class PyiqaManager:
     """Lazily instantiate and reuse PyIQA scorers for multiple metrics."""
 
-    def __init__(self, device: Optional[str], scale_factor: Optional[float],
-                 shift_overrides: Optional[Dict[str, float]] = None):
+    def __init__(
+        self,
+        device: Optional[str],
+        scale_factor: Optional[float],
+        shift_overrides: Optional[Dict[str, float]] = None,
+        max_cached_models: int = 1,
+    ):
         self.device = device
         self.scale_factor = scale_factor
         self.shift_overrides = {k.lower(): v for k, v in (shift_overrides or {}).items()}
+        self.max_cached_models = max(1, int(max_cached_models))
         self.scorers: Dict[str, PyIqaScorer] = {}
+        self.scorer_usage: List[str] = []
+
+    def _mark_used(self, model_name: str):
+        if model_name in self.scorer_usage:
+            self.scorer_usage.remove(model_name)
+        self.scorer_usage.append(model_name)
+
+    def _evict_if_needed(self):
+        while len(self.scorers) >= self.max_cached_models:
+            oldest = self.scorer_usage.pop(0)
+            scorer = self.scorers.pop(oldest, None)
+            if scorer:
+                del scorer
+            if torch is not None and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def get_scorer(self, model_name: str) -> PyIqaScorer:
         if model_name not in self.scorers:
+            self._evict_if_needed()
             shift = self.shift_overrides.get(model_name.lower(), get_default_pyiqa_shift(model_name))
             self.scorers[model_name] = PyIqaScorer(
                 model_name=model_name,
@@ -483,6 +509,7 @@ class PyiqaManager:
                 scale_factor=self.scale_factor,
                 max_long_edge=PYIQA_MAX_LONG_EDGE,
             )
+        self._mark_used(model_name)
         return self.scorers[model_name]
 
     def score_metrics(self, image_path: str, metric_keys: List[str], args) -> Dict[str, Dict[str, float]]:
@@ -494,13 +521,21 @@ class PyiqaManager:
             if not model_name:
                 continue
             scorer = self.get_scorer(model_name)
-            raw, scaled, calibrated = scorer.score_image(image_path)
+            try:
+                raw, scaled, calibrated = scorer.score_image(image_path)
+            except RuntimeError as exc:
+                logger.error(f"PyIQA metric {model_name} failed for {image_path}: {exc}")
+                if "out of memory" in str(exc).lower() and torch is not None and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
             scores[metric_key] = {
                 "raw": float(raw),
                 "scaled": float(scaled),
                 "calibrated": float(calibrated),
                 "model_name": model_name,
             }
+            if torch is not None and torch.cuda.is_available():
+                torch.cuda.empty_cache()
         return scores
 
 
@@ -2179,7 +2214,7 @@ def ensemble_evaluate(image_path: str, encoded_image: str, ollama_host_url: str,
     return aggregated
 
 
-def process_single_image(image_path: str, ollama_host_url: str, model: str, prompt: str, 
+def process_single_image(image_path: str, ollama_host_url: str, context_host_url: Optional[str], model: str, prompt: str, 
                         dry_run: bool = False, backup_dir: Optional[str] = None, verify: bool = False,
                         cache_dir: Optional[str] = None, ensemble_passes: int = 1,
                         context_override: Optional[str] = None, skip_context_classification: bool = False,
@@ -2217,7 +2252,7 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
     
     if scoring_engine == 'ollama':
         _, exif_data, technical_metrics, technical_warnings = analyze_image_with_context(
-            image_path, ollama_host_url, model, context_override, skip_context_classification
+            image_path, context_host_url or ollama_host_url, model, context_override, skip_context_classification
         )
     
     # Step 3: Enhance prompt with technical context (only needed for Ollama backend)
@@ -2303,7 +2338,7 @@ def process_images_with_pyiqa(
     image_paths: List[str],
     cache_model_label: str,
     classification_model: str,
-    ollama_host_url: str,
+    context_host_url: str,
     cache_dir: Optional[str],
     backup_dir: Optional[str],
     verify: bool,
@@ -2338,7 +2373,7 @@ def process_images_with_pyiqa(
             try:
                 image_context, _, technical_metrics, technical_warnings = analyze_image_with_context(
                     image_path,
-                    ollama_host_url,
+                    context_host_url,
                     classification_model,
                     context_override,
                     skip_context_classification
@@ -2416,7 +2451,8 @@ def process_images_with_pyiqa(
     return results
 
 
-def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers: int = 4, 
+def process_images_in_folder(folder_path: str, ollama_host_url: str, context_host_url: Optional[str] = None,
+                            max_workers: int = 4, 
                             model: str = DEFAULT_MODEL, prompt: str = DEFAULT_PROMPT,
                             file_types: Optional[List[str]] = None, skip_existing: bool = True,
                             dry_run: bool = False, min_score: Optional[int] = None,
@@ -2446,7 +2482,7 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
             image_paths=image_paths,
             cache_model_label=cache_label,
             classification_model=model,
-            ollama_host_url=ollama_host_url,
+            context_host_url=context_host_url or ollama_host_url,
             cache_dir=cache_dir,
             backup_dir=backup_dir,
             verify=verify,
@@ -2462,7 +2498,7 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
-                process_single_image, image_path, ollama_host_url, model, prompt,
+                process_single_image, image_path, ollama_host_url, context_host_url, model, prompt,
                 dry_run, backup_dir, verify, cache_dir, ensemble_passes,
                 context_override, skip_context_classification, scoring_engine
             ): image_path
@@ -2909,7 +2945,11 @@ if __name__ == "__main__":
                                help='Optional multiplier applied to PyIQA raw scores before calibration (auto-detect if omitted)')
     process_parser.add_argument('--pyiqa-batch-size', type=int, default=4,
                                help='Images per batch for PyIQA evaluation (default: 4)')
+    process_parser.add_argument('--pyiqa-max-models', type=int, default=1,
+                               help='Maximum PyIQA models kept in GPU memory at once (default: 1, lower = less VRAM)')
     process_parser.add_argument('--prompt-file', type=str, default=None, help='Path to custom prompt file (overrides default prompt)')
+    process_parser.add_argument('--context-host-url', type=str, default=None,
+                               help='Override endpoint for context classification (default: same as Ollama host)')
     process_parser.add_argument('--skip-existing', action='store_true', default=True, help='Skip images with existing metadata (default: True)')
     process_parser.add_argument('--no-skip-existing', action='store_false', dest='skip_existing', help='Process all images, even with existing metadata')
     process_parser.add_argument('--min-score', type=int, default=None, help='Only save results with score >= this value')
@@ -2975,6 +3015,8 @@ if __name__ == "__main__":
         if not args.ollama_host_url:
             args.ollama_host_url = DEFAULT_OLLAMA_URL
             host_defaulted = True
+        if not args.context_host_url:
+            args.context_host_url = args.ollama_host_url
         
         if folder_defaulted:
             print(f"Using default image folder: {args.folder_path}")
@@ -3038,7 +3080,8 @@ if __name__ == "__main__":
             pyiqa_manager = PyiqaManager(
                 device=args.pyiqa_device,
                 scale_factor=args.pyiqa_scale_factor,
-                shift_overrides=shift_overrides
+                shift_overrides=shift_overrides,
+                max_cached_models=args.pyiqa_max_models,
             )
             pyiqa_cache_label = f"pyiqa_profiles_{args.pyiqa_model.lower()}"
         except Exception as e:
@@ -3059,10 +3102,13 @@ if __name__ == "__main__":
     print(f"\nProcessing images from: {Style.BRIGHT}{args.folder_path}{Style.RESET_ALL}")
     print(f"Model: {args.model}")
     print(f"Scoring engine: {args.score_engine}")
+    if args.context_host_url and args.context_host_url != args.ollama_host_url:
+        print(f"Context classifier endpoint: {args.context_host_url}")
     if args.score_engine == 'pyiqa':
         print(f"PyIQA model: {args.pyiqa_model}")
         print(f"PyIQA device: {pyiqa_manager.device if pyiqa_manager else args.pyiqa_device}")
         print(f"PyIQA batch size: {args.pyiqa_batch_size}")
+        print(f"PyIQA max cached models: {args.pyiqa_max_models}")
         if args.pyiqa_scale_factor:
             print(f"PyIQA scale factor: {args.pyiqa_scale_factor}")
         if args.pyiqa_score_shift is not None:
@@ -3100,7 +3146,8 @@ if __name__ == "__main__":
     start_time = time.time()
     results = process_images_in_folder(
         args.folder_path, 
-        args.ollama_host_url, 
+        args.ollama_host_url,
+        args.context_host_url,
         max_workers=args.workers,
         model=args.model,
         prompt=prompt,
