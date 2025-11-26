@@ -3,10 +3,9 @@
 ## AI-Powered Image Evaluation Suite
 
 A toolkit for evaluating images using multiple scoring backends:
-1. **Ollama (LLM)** - AI vision models for artistic merit evaluation with EXIF metadata embedding
-2. **PyIQA** - State-of-the-art perceptual image quality metrics (CLIP-IQA+, MUSIQ, MANIQA, etc.)
-3. **NIMA** - Neural Image Assessment for aesthetic and technical quality scoring
-4. **Stock Photo Evaluator** - Commercial stock photography suitability assessment
+1. **PyIQA (default)** - State-of-the-art perceptual image quality metrics (CLIP-IQA+, MUSIQ, MANIQA, etc.)
+2. **Ollama (LLM)** - AI vision models for artistic merit evaluation with EXIF metadata embedding
+3. **Stock Photo Evaluator** - Commercial stock photography suitability assessment
 
 ### Features
 
@@ -18,10 +17,6 @@ A toolkit for evaluating images using multiple scoring backends:
   - MUSIQ: Multi-scale image quality transformer
   - MANIQA: Multi-dimension attention network
   - 40+ additional metrics available
-- **NIMA**: Neural Image Assessment with aesthetic and technical heads
-  - MobileNet-based for efficiency
-  - Separate aesthetic and technical quality scores
-  - Batch processing support
 - **Ollama**: Full LLM-based evaluation with detailed feedback
   - Multi-criteria scoring (technical, composition, lighting, creativity)
   - Title, description, and keyword generation
@@ -112,9 +107,6 @@ A toolkit for evaluating images using multiple scoring backends:
 - **For PyIQA backend (default):**
   - `torch` - PyTorch for GPU acceleration
   - `pyiqa` - Image quality assessment metrics
-- **For NIMA backend:**
-  - `tensorflow` - TensorFlow/Keras
-  - Pre-trained weights (bundled or downloadable)
 - **For Ollama backend:**
   - Ollama server with vision model (recommended: `qwen3-vl:8b`)
 - Required Python libraries (see `requirements.txt`):
@@ -146,18 +138,6 @@ python image_eval_embed.py process /path/to/images --pyiqa-model musiq
 
 # Adjust batch size for memory constraints
 python image_eval_embed.py process /path/to/images --pyiqa-batch-size 8
-```
-
-#### NIMA Scoring
-
-```bash
-# Use NIMA aesthetic + technical scoring
-python image_eval_embed.py process /path/to/images --score-engine nima
-
-# NIMA with custom weights
-python image_eval_embed.py process /path/to/images --score-engine nima \
-  --nima-weights /path/to/aesthetic.hdf5 \
-  --nima-technical-weights /path/to/technical.hdf5
 ```
 
 #### Ollama LLM Scoring (Most Detailed)
@@ -216,7 +196,7 @@ Running without arguments assumes the `process` command, uses your current worki
 
 **Scoring Engine Options:**
 ```bash
---score-engine ENGINE    # Choose: pyiqa (default), nima, or ollama
+--score-engine ENGINE    # Choose: pyiqa (default) or ollama
 ```
 
 **PyIQA Options:**
@@ -226,17 +206,6 @@ Running without arguments assumes the `process` command, uses your current worki
 --pyiqa-score-shift N    # Score adjustment (default: model-specific)
 --pyiqa-scale-factor N   # Raw score multiplier (default: auto-detect)
 --pyiqa-batch-size N     # Images per batch (default: 4)
-```
-
-**NIMA Options:**
-```bash
---nima-model-type TYPE   # aesthetic, technical, or both (default: both)
---nima-base-model NAME   # Base CNN (default: MobileNet)
---nima-weights PATH      # Custom aesthetic weights (.hdf5)
---nima-technical-weights PATH  # Custom technical weights (.hdf5)
---nima-batch-size N      # Images per batch (default: 16)
---nima-score-shift N     # Aesthetic score adjustment (default: 27)
---nima-technical-score-shift N  # Technical score adjustment (default: 27)
 ```
 
 **Ollama Options:**
@@ -271,9 +240,6 @@ python image_eval_embed.py process /photos
 
 # PyIQA with MUSIQ metric
 python image_eval_embed.py process /photos --pyiqa-model musiq
-
-# NIMA aesthetic + technical scoring
-python image_eval_embed.py process /photos --score-engine nima
 
 # Ollama LLM with ensemble scoring
 python image_eval_embed.py process /photos --score-engine ollama \

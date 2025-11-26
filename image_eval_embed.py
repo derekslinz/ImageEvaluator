@@ -26,6 +26,7 @@ import cv2
 import piexif
 import piexif.helper
 import requests
+import torch
 from PIL import Image, ImageStat
 from colorama import Fore, Style
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -74,6 +75,278 @@ Image.MAX_IMAGE_PIXELS = None  # Remove limit entirely (or set to a higher value
 
 
 PYIQA_MAX_LONG_EDGE = 2048
+
+CONTEXT_PROFILE_MAP = {
+    # Preferred contexts (1:1 mapping)
+    "stock_product": "stock_product",
+    "macro_food": "macro_food",
+    "portrait_neutral": "portrait_neutral",
+    "portrait_highkey": "portrait_highkey",
+    "landscape": "landscape",
+    "street_documentary": "street_documentary",
+    "sports_action": "sports_action",
+    "concert_night": "concert_night",
+    "architecture_realestate": "architecture_realestate",
+    "fineart_creative": "fineart_creative",
+    # Legacy/alias contexts
+    "event_lowlight": "concert_night",
+    "travel_story": "street_documentary",
+    "travel": "landscape",
+    "travel_reportage": "street_documentary",
+    "product_catalog": "stock_product",
+}
+
+PYIQA_BASELINE_STATS = {
+    # Means/stds derived from GuruShots top-10 baseline set (pyiqa_comparison.csv)
+    "clipiqa_z": {"mean": 70.40125, "std": 9.290555155864835},
+    "laion_aes_z": {"mean": 57.107083333333335, "std": 3.5580589033519696},
+    "musiq_ava_z": {"mean": 56.75416666666667, "std": 4.285875947678478},
+    "maniqa_z": {"mean": 49.132083333333334, "std": 8.258054895659281},
+    "musiq_paq2piq_z": {"mean": 74.73625, "std": 3.1990914237483117},
+}
+
+PROFILE_SCORE_CENTER = 70.0
+PROFILE_SCORE_STD_SCALE = 12.0
+
+
+def map_context_to_profile(context_label: str) -> str:
+    """Map classifier output to one of the 10 defined profile keys."""
+    if not context_label:
+        return "stock_product"
+    normalized = context_label.strip().lower()
+    mapped = CONTEXT_PROFILE_MAP.get(normalized, normalized)
+    if mapped not in PROFILE_CONFIG:
+        return "stock_product"
+    return mapped
+
+
+def normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
+    """Normalize weight dictionary so it sums to 1.0."""
+    positive_items = {k: max(0.0, float(v)) for k, v in weights.items()}
+    total = sum(positive_items.values())
+    if total <= 0:
+        return {k: 1.0 / len(positive_items) for k in positive_items} if positive_items else {}
+    return {k: v / total for k, v in positive_items.items()}
+
+
+def compute_metric_z_scores(metric_scores: Dict[str, float]) -> Dict[str, float]:
+    """Convert calibrated metric scores to z-scores using baseline statistics."""
+    z_scores: Dict[str, float] = {}
+    for key, value in metric_scores.items():
+        stats = PYIQA_BASELINE_STATS.get(key)
+        if not stats:
+            z_scores[key] = 0.0
+            continue
+        std = stats.get("std") or 0.0
+        if std <= 1e-6:
+            z_scores[key] = 0.0
+            continue
+        mean = stats.get("mean", 0.0)
+        z_scores[key] = (value - mean) / std
+    return z_scores
+
+
+def compute_disagreement_z(z_scores: Dict[str, float]) -> float:
+    """Return negative spread across model z-scores (used as stability penalty/bonus)."""
+    if not z_scores:
+        return 0.0
+    values = list(z_scores.values())
+    disagreement = max(values) - min(values)
+    return -disagreement
+
+
+def categorize_score(score: float) -> str:
+    """Map composite score to a human-friendly bucket."""
+    if score >= 90:
+        return "elite"
+    if score >= 85:
+        return "award_ready"
+    if score >= 75:
+        return "portfolio"
+    if score >= 65:
+        return "solid"
+    if score >= 55:
+        return "needs_work"
+    return "critical"
+
+
+def compute_profile_composite(profile_key: str, z_scores: Dict[str, float], diff_z: float) -> Tuple[float, float, Dict[str, Dict[str, float]]]:
+    """Return (base_score, composite_z, contributions) before rule penalties."""
+    profile_cfg = PROFILE_CONFIG.get(profile_key, PROFILE_CONFIG["stock_product"])
+    weights = normalize_weights(profile_cfg.get("model_weights", {}))
+    composite_z = 0.0
+    contributions: Dict[str, Dict[str, float]] = {}
+    for metric_key, weight in weights.items():
+        if weight <= 0:
+            continue
+        metric_value = diff_z if metric_key == "pyiqa_diff_z" else z_scores.get(metric_key, 0.0)
+        contribution = metric_value * weight
+        composite_z += contribution
+        contributions[metric_key] = {
+            "weight": weight,
+            "value": metric_value,
+            "contribution": contribution,
+        }
+    base_score = PROFILE_SCORE_CENTER + (composite_z * PROFILE_SCORE_STD_SCALE)
+    return base_score, composite_z, contributions
+
+
+def apply_profile_rules(profile_key: str, technical_metrics: Dict[str, Any]) -> Tuple[float, List[str]]:
+    """Apply profile-specific rule penalties/bonuses based on technical metrics."""
+    profile_cfg = PROFILE_CONFIG.get(profile_key, PROFILE_CONFIG["stock_product"])
+    rules = profile_cfg.get("rules", {})
+    adjustments: List[str] = []
+    penalty = 0.0
+
+    sharpness = technical_metrics.get("sharpness")
+    sharpness_rules = rules.get("sharpness")
+    if isinstance(sharpness, (int, float)) and sharpness_rules:
+        if sharpness < sharpness_rules.get("critical_threshold", -float("inf")):
+            penalty += sharpness_rules.get("critical_penalty", 0.0)
+            adjustments.append("sharpness_critical")
+        elif sharpness < sharpness_rules.get("soft_threshold", -float("inf")):
+            penalty += sharpness_rules.get("soft_penalty", 0.0)
+            adjustments.append("sharpness_soft")
+
+    clipping = technical_metrics.get("histogram_clipping_highlights")
+    clipping_rules = rules.get("clipping")
+    if isinstance(clipping, (int, float)) and clipping_rules:
+        if clipping > clipping_rules.get("hard_pct", float("inf")):
+            penalty += clipping_rules.get("hard_penalty", 0.0)
+            adjustments.append("clipping_hard")
+        elif clipping > clipping_rules.get("warn_pct", float("inf")):
+            penalty += clipping_rules.get("warn_penalty", 0.0)
+            adjustments.append("clipping_warn")
+        elif clipping_rules.get("bonus_pct") is not None and clipping < clipping_rules.get("bonus_pct", 0.0):
+            bonus = clipping_rules.get("bonus_points", 0.0)
+            if bonus:
+                penalty -= bonus
+                adjustments.append("clipping_bonus")
+
+    color_cast_label = technical_metrics.get("color_cast")
+    color_cast_delta = technical_metrics.get("color_cast_delta", 0.0)
+    color_rules = rules.get("color_cast")
+    if color_rules and color_cast_label and color_cast_label != "neutral":
+        if color_cast_delta >= color_rules.get("threshold", 0.0):
+            penalty += color_rules.get("penalty", 0.0)
+            adjustments.append("color_cast")
+
+    brightness = technical_metrics.get("brightness")
+    brightness_rules = rules.get("brightness")
+    if isinstance(brightness, (int, float)) and brightness_rules:
+        min_ok = brightness_rules.get("min_ok")
+        max_ok = brightness_rules.get("max_ok")
+        mild = brightness_rules.get("mild_penalty", 0.0)
+        strong = brightness_rules.get("strong_penalty", mild)
+        tolerance = 20.0
+        if min_ok is not None and brightness < min_ok:
+            delta = min_ok - brightness
+            apply = strong if delta > tolerance else mild
+            if apply:
+                penalty += apply
+                adjustments.append("brightness_low_strong" if delta > tolerance else "brightness_low")
+        elif max_ok is not None and brightness > max_ok:
+            delta = brightness - max_ok
+            apply = strong if delta > tolerance else mild
+            if apply:
+                penalty += apply
+                adjustments.append("brightness_high_strong" if delta > tolerance else "brightness_high")
+
+    return penalty, adjustments
+
+
+def build_profile_metadata(
+    profile_key: str,
+    context_label: str,
+    technical_metrics: Dict[str, Any],
+    technical_warnings: List[str],
+    metric_details: Dict[str, Dict[str, float]],
+    z_scores: Dict[str, float],
+    diff_z: float,
+    base_score: float,
+    final_score: float,
+    rule_penalty: float,
+    rule_notes: List[str],
+    contributions: Dict[str, Dict[str, float]],
+) -> Dict[str, Any]:
+    """Assemble metadata payload for profiled PyIQA evaluation."""
+    rounded = int(round(max(0.0, min(100.0, final_score))))
+    base_rounded = int(round(max(0.0, min(100.0, base_score))))
+    profile_name = TECH_PROFILES.get(profile_key, {}).get("name")
+    context_profile_name = technical_metrics.get("context_profile", profile_key.title())
+    display_name = profile_name or context_profile_name or profile_key.replace("_", " ").title()
+    category = categorize_score(final_score)
+
+    keyword_candidates = ["pyiqa", profile_key, context_label, category]
+    ordered_unique = []
+    for kw in keyword_candidates:
+        if kw and kw not in ordered_unique:
+            ordered_unique.append(kw)
+    keywords = ",".join(ordered_unique)
+
+    metric_summary_parts = []
+    for metric, detail in metric_details.items():
+        z_val = z_scores.get(metric, 0.0)
+        metric_summary_parts.append(
+            f"{metric}:{detail['calibrated']:.1f} (z={z_val:+.2f})"
+        )
+    metric_summary = "; ".join(metric_summary_parts)
+
+    description_lines = [
+        f"Composite profile '{display_name}' score {rounded}/100 ({category}).",
+        f"Base model blend before rules: {base_rounded}/100 (penalty {rule_penalty:+.1f}).",
+        f"Model breakdown: {metric_summary}",
+        f"Disagreement penalty (pyiqa_diff_z): {diff_z:+.2f}",
+    ]
+    if rule_notes:
+        description_lines.append(f"Rule triggers: {', '.join(rule_notes)}")
+
+    extended_metrics = dict(technical_metrics)
+    extended_metrics.update({
+        "pyiqa_profile": profile_key,
+        "pyiqa_metric_details": metric_details,
+        "pyiqa_z_scores": z_scores,
+        "pyiqa_disagreement_z": diff_z,
+        "pyiqa_contributions": contributions,
+        "pyiqa_rule_penalty": rule_penalty,
+        "pyiqa_rule_notes": rule_notes,
+        "pyiqa_category": category,
+    })
+
+    metadata = {
+        'overall_score': str(rounded),
+        'score': str(rounded),
+        'technical_score': str(base_rounded),
+        'composition_score': str(rounded),
+        'lighting_score': str(rounded),
+        'creativity_score': str(rounded),
+        'title': f"{display_name} IQA composite {rounded}/100",
+        'description': " ".join(description_lines),
+        'keywords': keywords,
+        'technical_metrics': extended_metrics,
+        'technical_warnings': technical_warnings,
+        'post_process_potential': extended_metrics.get('post_process_potential'),
+        'pyiqa_profile': profile_key,
+        'pyiqa_category': category,
+    }
+    return metadata
+
+
+def resolve_metric_model_name(metric_key: str, args) -> Optional[str]:
+    metric_key = metric_key.lower()
+    if metric_key == "clipiqa_z":
+        return args.pyiqa_model
+    if metric_key == "laion_aes_z":
+        return "laion_aes"
+    if metric_key == "musiq_ava_z":
+        return "musiq-ava"
+    if metric_key == "maniqa_z":
+        return "maniqa"
+    if metric_key == "musiq_paq2piq_z":
+        return "musiq-paq2piq"
+    if metric_key == "pyiqa_diff_z":
+        return None
+    return None
 
 
 # Configure basic logging (will be updated based on verbose flag)
@@ -139,14 +412,16 @@ class PyIqaScorer:
     def score_batch(self, image_paths: List[str]) -> Dict[str, float]:
         results: Dict[str, float] = {}
         if self.use_amp and torch is not None:
-            autocast_ctx = lambda: torch.amp.autocast('cuda')
+            def autocast_ctx():
+                return torch.amp.autocast('cuda')
         else:
-            autocast_ctx = nullcontext
+            def autocast_ctx():
+                return nullcontext()
         assert torch is not None, "PyTorch is required for PyIQA scoring but was not imported."
         with torch.no_grad():
             for image_path in image_paths:
                 try:
-                    image_tensor = load_image_tensor_with_max_edge(image_path, self.max_long_edge) if torch is not None else None
+                    image_tensor = load_image_tensor_with_max_edge(image_path, self.max_long_edge)
                     if image_tensor is not None:
                         image_tensor = image_tensor.to(self.device)
                         with autocast_ctx():
@@ -154,14 +429,15 @@ class PyIqaScorer:
                     else:
                         with autocast_ctx():
                             score = self.metric(image_path)
-                    if hasattr(score, 'item'):
-                        value = float(score.item())
-                    else:
-                        value = float(score)
+                    value = float(score.item()) if hasattr(score, "item") else float(score)
                     results[image_path] = value
                 except Exception as exc:
                     logger.error(f"PyIQA scoring failed for {image_path}: {exc}")
         return results
+
+    def score_single(self, image_path: str) -> float:
+        _, _, calibrated = self.score_image(image_path)
+        return calibrated
 
     def convert_score(self, raw_score: float) -> float:
         if self.scale_factor is not None:
@@ -171,6 +447,61 @@ class PyIqaScorer:
         if 0.0 <= raw_score <= 10.0:
             return raw_score * 10.0
         return raw_score
+
+    def _apply_shift(self, scaled_score: float) -> float:
+        shifted = scaled_score + self.score_shift
+        return max(0.0, min(100.0, shifted))
+
+    def score_image(self, image_path: str) -> Tuple[float, float, float]:
+        """Return (raw, scaled, calibrated) scores for a single image."""
+        scores = self.score_batch([image_path])
+        if image_path not in scores:
+            raise RuntimeError(f"PyIQA returned no score for {image_path}")
+        raw_score = scores[image_path]
+        scaled_score = self.convert_score(raw_score)
+        calibrated = self._apply_shift(scaled_score)
+        return raw_score, scaled_score, calibrated
+
+
+class PyiqaManager:
+    """Lazily instantiate and reuse PyIQA scorers for multiple metrics."""
+
+    def __init__(self, device: Optional[str], scale_factor: Optional[float],
+                 shift_overrides: Optional[Dict[str, float]] = None):
+        self.device = device
+        self.scale_factor = scale_factor
+        self.shift_overrides = {k.lower(): v for k, v in (shift_overrides or {}).items()}
+        self.scorers: Dict[str, PyIqaScorer] = {}
+
+    def get_scorer(self, model_name: str) -> PyIqaScorer:
+        if model_name not in self.scorers:
+            shift = self.shift_overrides.get(model_name.lower(), get_default_pyiqa_shift(model_name))
+            self.scorers[model_name] = PyIqaScorer(
+                model_name=model_name,
+                device=self.device,
+                score_shift=shift,
+                scale_factor=self.scale_factor,
+                max_long_edge=PYIQA_MAX_LONG_EDGE,
+            )
+        return self.scorers[model_name]
+
+    def score_metrics(self, image_path: str, metric_keys: List[str], args) -> Dict[str, Dict[str, float]]:
+        scores: Dict[str, Dict[str, float]] = {}
+        for metric_key in metric_keys:
+            if metric_key == "pyiqa_diff_z":
+                continue
+            model_name = resolve_metric_model_name(metric_key, args)
+            if not model_name:
+                continue
+            scorer = self.get_scorer(model_name)
+            raw, scaled, calibrated = scorer.score_image(image_path)
+            scores[metric_key] = {
+                "raw": float(raw),
+                "scaled": float(scaled),
+                "calibrated": float(calibrated),
+                "model_name": model_name,
+            }
+        return scores
 
 
 def _is_raw_image(image_path: str) -> bool:
@@ -1033,6 +1364,7 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
             # --- Color cast detection (global) ---
             r_mean, g_mean, b_mean = stat.mean[:3]
             max_diff = max(abs(r_mean - g_mean), abs(g_mean - b_mean), abs(r_mean - b_mean))
+            metrics['color_cast_delta'] = float(max_diff)
             # We only set the label here; the profile decides how/if to penalize.
             if max_diff > COLOR_CAST_THRESHOLD:
                 # Identify dominant channel with sufficient margin (>5 units)
@@ -1851,8 +2183,7 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
                         dry_run: bool = False, backup_dir: Optional[str] = None, verify: bool = False,
                         cache_dir: Optional[str] = None, ensemble_passes: int = 1,
                         context_override: Optional[str] = None, skip_context_classification: bool = False,
-                        scoring_engine: str = 'ollama',
-                        pyiqa_backend: Optional[PyIqaScorer] = None) -> Tuple[str, Optional[Dict]]:
+                        scoring_engine: str = 'ollama') -> Tuple[str, Optional[Dict]]:
     """Process a single image using the selected scoring engine and return result."""
     logger.debug(f"Processing image: {image_path}")
     headers = {'Content-Type': 'application/json'}
@@ -1895,30 +2226,8 @@ def process_single_image(image_path: str, ollama_host_url: str, model: str, prom
         enhanced_prompt = create_enhanced_prompt(prompt, exif_data, technical_metrics)
 
     if scoring_engine == 'pyiqa':
-        if not pyiqa_backend:
-            logger.error("PyIQA backend requested but not initialized.")
-            return (image_path, None)
-        try:
-            score_value = pyiqa_backend.score_batch([image_path]).get(image_path)
-            if score_value is None:
-                logger.error(f"PyIQA did not return a score for {image_path}")
-                return (image_path, None)
-            scaled_score = pyiqa_backend.convert_score(score_value)
-            response_metadata = build_pyiqa_metadata(score_value, scaled_score, pyiqa_backend.model_name, pyiqa_backend.score_shift)
-        except Exception as e:
-            logger.error(f"PyIQA evaluation failed for {image_path}: {e}")
-            return (image_path, None)
-
-        if cache_dir:
-            save_to_cache(image_path, model, response_metadata, cache_dir)
-
-        try:
-            embed_metadata(image_path, response_metadata, backup_dir, verify)
-            logger.info(f"PyIQA score for {image_path}: {response_metadata.get('score')}")
-            return (image_path, response_metadata)
-        except Exception as e:
-            logger.error(f"Error embedding PyIQA metadata for {image_path}: {e}")
-            return (image_path, None)
+        logger.error("Direct PyIQA single-image evaluation is disabled. Use the batch PyIQA pipeline.")
+        return (image_path, None)
 
     # Step 4: Retry logic for malformed responses (Ollama backend)
     max_attempts = 3
@@ -1992,85 +2301,117 @@ def _handle_cached_or_dry_run(image_path: str, cache_dir: Optional[str], model: 
 
 def process_images_with_pyiqa(
     image_paths: List[str],
-    model: str,
+    cache_model_label: str,
+    classification_model: str,
+    ollama_host_url: str,
     cache_dir: Optional[str],
     backup_dir: Optional[str],
     verify: bool,
-    pyiqa_backend: "PyIqaScorer",
+    pyiqa_manager: PyiqaManager,
     min_score: Optional[int],
-    batch_size: int,
-    dry_run: bool
+    dry_run: bool,
+    context_override: Optional[str],
+    skip_context_classification: bool,
+    args
 ) -> List[Tuple[str, Optional[Dict]]]:
+    """Profile-aware PyIQA pipeline with context detection and rule weighting."""
     results: List[Tuple[str, Optional[Dict]]] = []
-    pending: List[str] = []
-
-    def flush_pending() -> List[Tuple[str, Optional[Dict]]]:
-        if not pending:
-            return []
-        batch = pending.copy()
-        pending.clear()
-        scores = pyiqa_backend.score_batch(batch)
-        batch_results: List[Tuple[str, Optional[Dict]]] = []
-        for image_path in batch:
-            score_value = scores.get(image_path)
-            if score_value is None:
-                batch_results.append((image_path, None))
-                continue
-            scaled_score = pyiqa_backend.convert_score(score_value)
-            response_metadata = build_pyiqa_metadata(score_value, scaled_score, pyiqa_backend.model_name, pyiqa_backend.score_shift)
-            if cache_dir:
-                save_to_cache(image_path, model, response_metadata, cache_dir)
-            try:
-                embed_metadata(image_path, response_metadata, backup_dir, verify)
-                logger.info(f"PyIQA score for {image_path}: {response_metadata.get('score')}")
-                batch_results.append((image_path, response_metadata))
-            except Exception as exc:
-                logger.error(f"Failed to embed PyIQA metadata for {image_path}: {exc}")
-                batch_results.append((image_path, None))
-        return batch_results
-
     with tqdm(total=len(image_paths), desc="Processing images", unit="img") as pbar:
         for image_path in image_paths:
-            immediate = _handle_cached_or_dry_run(image_path, cache_dir, model, backup_dir, verify, dry_run=dry_run)
+            immediate = _handle_cached_or_dry_run(
+                image_path, cache_dir, cache_model_label, backup_dir, verify, dry_run=dry_run
+            )
             if immediate:
                 path, metadata = immediate
-                if min_score is None or metadata is None:
-                    results.append((path, metadata))
-                else:
+                if metadata and min_score is not None:
                     try:
                         score = int(validate_score(metadata.get('score', '0')) or 0)
-                        if score >= min_score:
-                            results.append((path, metadata))
+                        if score < min_score:
+                            pbar.update(1)
+                            continue
                     except (ValueError, TypeError):
-                        results.append((path, metadata))
+                        pass
+                results.append((path, metadata))
                 pbar.update(1)
                 continue
 
-            pending.append(image_path)
-            if len(pending) >= batch_size:
-                batch_results = flush_pending()
-                pbar.update(len(batch_results))
-                for path, metadata in batch_results:
-                    if min_score is not None and metadata is not None:
-                        try:
-                            score = int(validate_score(metadata.get('score', '0')) or 0)
-                            if score < min_score:
-                                continue
-                        except (ValueError, TypeError):
-                            pass
-                    results.append((path, metadata))
+            try:
+                image_context, _, technical_metrics, technical_warnings = analyze_image_with_context(
+                    image_path,
+                    ollama_host_url,
+                    classification_model,
+                    context_override,
+                    skip_context_classification
+                )
+            except Exception as exc:
+                logger.error(f"Context/technical analysis failed for {image_path}: {exc}")
+                results.append((image_path, None))
+                pbar.update(1)
+                continue
 
-        batch_results = flush_pending()
-        pbar.update(len(batch_results))
-        for path, metadata in batch_results:
-            if min_score is not None and metadata is not None:
+            profile_key = map_context_to_profile(image_context)
+            profile_cfg = PROFILE_CONFIG.get(profile_key, PROFILE_CONFIG["stock_product"])
+            metric_keys = list(profile_cfg.get("model_weights", {}).keys())
+            try:
+                metric_details = pyiqa_manager.score_metrics(image_path, metric_keys, args)
+            except Exception as exc:
+                logger.error(f"PyIQA scoring failed for {image_path}: {exc}")
+                results.append((image_path, None))
+                pbar.update(1)
+                continue
+
+            if not metric_details:
+                logger.error(f"No PyIQA metrics computed for {image_path}")
+                results.append((image_path, None))
+                pbar.update(1)
+                continue
+
+            calibrated_scores = {k: v["calibrated"] for k, v in metric_details.items()}
+            z_scores = compute_metric_z_scores(calibrated_scores)
+            diff_z = compute_disagreement_z(z_scores)
+            base_score, composite_z, contributions = compute_profile_composite(profile_key, z_scores, diff_z)
+            rule_penalty, rule_notes = apply_profile_rules(profile_key, technical_metrics)
+            final_score = max(0.0, min(100.0, base_score - rule_penalty))
+
+            metadata = build_profile_metadata(
+                profile_key=profile_key,
+                context_label=image_context,
+                technical_metrics=technical_metrics,
+                technical_warnings=technical_warnings,
+                metric_details=metric_details,
+                z_scores=z_scores,
+                diff_z=diff_z,
+                base_score=base_score,
+                final_score=final_score,
+                rule_penalty=rule_penalty,
+                rule_notes=rule_notes,
+                contributions=contributions,
+            )
+
+            if cache_dir:
+                save_to_cache(image_path, cache_model_label, metadata, cache_dir)
+
+            try:
+                embed_metadata(image_path, metadata, backup_dir, verify)
+            except Exception as exc:
+                logger.error(f"Failed to embed metadata for {image_path}: {exc}")
+                results.append((image_path, None))
+                pbar.update(1)
+                continue
+
+            logger.info(f"Composite PyIQA score for {image_path}: {metadata.get('score')}")
+
+            if min_score is not None:
                 try:
-                    score = int(validate_score(metadata.get('score', '0')) or 0)
-                    if score < min_score:
+                    score_val = int(validate_score(metadata.get('score', '0')) or 0)
+                    if score_val < min_score:
+                        pbar.update(1)
                         continue
                 except (ValueError, TypeError):
                     pass
-            results.append((path, metadata))
+
+            results.append((image_path, metadata))
+            pbar.update(1)
 
     return results
 
@@ -2084,7 +2425,9 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
                             context_override: Optional[str] = None,
                             skip_context_classification: bool = False,
                             scoring_engine: str = 'pyiqa',
-                            pyiqa_backend: Optional[PyIqaScorer] = None,
+                            pyiqa_manager: Optional[PyiqaManager] = None,
+                            pyiqa_cache_label: Optional[str] = None,
+                            cli_args: Optional[argparse.Namespace] = None,
                             pyiqa_batch_size: int = 4) -> List[Tuple[str, Optional[Dict]]]:
     """Process images with parallel execution and progress bar."""
     # Collect all images to process
@@ -2097,17 +2440,22 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
     results: List[Tuple[str, Optional[Dict]]] = []
 
     # Use PyIQA batch processing if that engine is selected
-    if scoring_engine == 'pyiqa' and pyiqa_backend is not None:
+    if scoring_engine == 'pyiqa' and pyiqa_manager is not None:
+        cache_label = pyiqa_cache_label or "pyiqa_profiles"
         return process_images_with_pyiqa(
             image_paths=image_paths,
-            model=model,
+            cache_model_label=cache_label,
+            classification_model=model,
+            ollama_host_url=ollama_host_url,
             cache_dir=cache_dir,
             backup_dir=backup_dir,
             verify=verify,
-            pyiqa_backend=pyiqa_backend,
+            pyiqa_manager=pyiqa_manager,
             min_score=min_score,
-            batch_size=pyiqa_batch_size,
-            dry_run=dry_run
+            dry_run=dry_run,
+            context_override=context_override,
+            skip_context_classification=skip_context_classification,
+            args=cli_args
         )
 
     # Ollama processing with ThreadPoolExecutor
@@ -2116,7 +2464,7 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers
             executor.submit(
                 process_single_image, image_path, ollama_host_url, model, prompt,
                 dry_run, backup_dir, verify, cache_dir, ensemble_passes,
-                context_override, skip_context_classification, scoring_engine, pyiqa_backend
+                context_override, skip_context_classification, scoring_engine
             ): image_path
             for image_path in image_paths
         }
@@ -2657,7 +3005,8 @@ if __name__ == "__main__":
         os.makedirs(cache_dir, exist_ok=True)
         logger.info(f"API response caching enabled: {cache_dir}")
 
-    pyiqa_backend = None
+    pyiqa_manager: Optional[PyiqaManager] = None
+    pyiqa_cache_label: Optional[str] = None
 
     # Validate folder path
     if not os.path.exists(args.folder_path):
@@ -2682,21 +3031,19 @@ if __name__ == "__main__":
         if not PYIQA_AVAILABLE:
             logger.error("PyIQA backend requested but dependencies are missing. Install torch and pyiqa.")
             sys.exit(1)
-        pyiqa_shift = args.pyiqa_score_shift
-        if pyiqa_shift is None:
-            pyiqa_shift = get_default_pyiqa_shift(args.pyiqa_model)
+        shift_overrides = {}
+        if args.pyiqa_score_shift is not None:
+            shift_overrides[args.pyiqa_model.lower()] = args.pyiqa_score_shift
         try:
-            pyiqa_backend = PyIqaScorer(
-                model_name=args.pyiqa_model,
+            pyiqa_manager = PyiqaManager(
                 device=args.pyiqa_device,
-                score_shift=pyiqa_shift,
                 scale_factor=args.pyiqa_scale_factor,
-                max_long_edge=PYIQA_MAX_LONG_EDGE,
+                shift_overrides=shift_overrides
             )
+            pyiqa_cache_label = f"pyiqa_profiles_{args.pyiqa_model.lower()}"
         except Exception as e:
-            logger.error(f"Failed to initialize PyIQA backend: {e}")
+            logger.error(f"Failed to initialize PyIQA manager: {e}")
             sys.exit(1)
-        args.model = f"pyiqa_{args.pyiqa_model}"
 
     # Load custom prompt if specified
     prompt = DEFAULT_PROMPT
@@ -2714,12 +3061,13 @@ if __name__ == "__main__":
     print(f"Scoring engine: {args.score_engine}")
     if args.score_engine == 'pyiqa':
         print(f"PyIQA model: {args.pyiqa_model}")
-        print(f"PyIQA device: {pyiqa_backend.device if pyiqa_backend else args.pyiqa_device}")
+        print(f"PyIQA device: {pyiqa_manager.device if pyiqa_manager else args.pyiqa_device}")
         print(f"PyIQA batch size: {args.pyiqa_batch_size}")
         if args.pyiqa_scale_factor:
             print(f"PyIQA scale factor: {args.pyiqa_scale_factor}")
-        if pyiqa_backend:
-            print(f"PyIQA score shift: {pyiqa_backend.score_shift:+.2f}")
+        if args.pyiqa_score_shift is not None:
+            print(f"PyIQA custom score shift: {args.pyiqa_score_shift:+.2f}")
+        print("PyIQA composite models: clipiqa_z, laion_aes_z, musiq_ava_z, musiq_paq2piq_z, maniqa_z")
     print(f"Workers: {args.workers}")
     print(f"Skip existing: {args.skip_existing}")
     if args.ensemble > 1:
@@ -2767,7 +3115,9 @@ if __name__ == "__main__":
         context_override=args.context,
         skip_context_classification=args.no_context_classification,
         scoring_engine=args.score_engine,
-        pyiqa_backend=pyiqa_backend,
+        pyiqa_manager=pyiqa_manager,
+        pyiqa_cache_label=pyiqa_cache_label,
+        cli_args=args,
         pyiqa_batch_size=args.pyiqa_batch_size
     )
     elapsed_time = time.time() - start_time
