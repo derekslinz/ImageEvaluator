@@ -25,7 +25,7 @@ from image_eval_embed import (
 def test_map_context_to_profile_alias_and_unknown():
     assert map_context_to_profile("Travel") == "landscape"
     assert map_context_to_profile("street_documentary") == "street_documentary"
-    assert map_context_to_profile("made_up_label") == "stock_product"
+    assert map_context_to_profile("made_up_label") == "studio_photography"
 
 
 def test_normalize_weights_handles_negative_and_zero_totals():
@@ -85,7 +85,7 @@ def test_assess_technical_metrics_flags_expected_conditions():
         "color_cast": "warm/red",
         "noise_score": 70.0,
     }
-    warnings = assess_technical_metrics(metrics, context="stock_product")
+    warnings = assess_technical_metrics(metrics, context="studio_photography")
     assert warnings == [
         "Sharpness critically low (20.0)",
         "Highlight clipping 8.0% reduces tonal range",
@@ -103,7 +103,7 @@ def test_compute_post_process_potential_combines_adjustments():
         "noise_score": 70.0,  # high penalty
         "color_cast": "warm/red",  # penalty
     }
-    score = compute_post_process_potential(metrics, context="stock_product")
+    score = compute_post_process_potential(metrics, context="studio_photography")
     assert score == 57  # 70 base +5 sharpness +5 clipping -15 noise -8 color
 
 

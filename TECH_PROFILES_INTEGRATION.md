@@ -31,8 +31,8 @@ Each profile in `TECH_PROFILES` contains:
 
 ## 10 Photography Contexts
 
-### 1. stock_product
-**Stock/Product Photography**
+### 1. studio_photography
+**Studio Photography**
 - Most strict profile
 - Critical sharpness required (<30 = critical, <60 = soft)
 - Minimal clipping tolerance (warn >5%, bonus <0.5%)
@@ -137,7 +137,7 @@ enhanced_prompt = create_enhanced_prompt(prompt, exif_data, technical_metrics)
 ## Key Functions
 
 ### `get_profile(context: str) -> Dict`
-Retrieves the technical profile for a given context with fallback to `stock_product`.
+Retrieves the technical profile for a given context with fallback to `studio_photography`.
 
 ### `assess_technical_metrics(technical_metrics: Dict, context: str) -> List[str]`
 Generates context-aware warnings using profile thresholds:
@@ -176,4 +176,4 @@ This provides more granular control and consistent scoring across contexts.
 
 ## Default Context
 
-If context classification fails or returns unknown value, the system defaults to `stock_product` (most strict profile) rather than being overly permissive.
+If context classification fails or returns unknown value, the system defaults to `studio_photography` (most strict profile) rather than being overly permissive.

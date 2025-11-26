@@ -124,7 +124,7 @@ The evaluator uses 13 photography profiles with tailored thresholds:
 
 | Profile | Use Case |
 |---------|----------|
-| `stock_product` | Product/catalog (strictest) |
+| `studio_photography` | Controlled studio shots (strictest) |
 | `macro_food` | Food photography |
 | `macro_nature` | Nature macro (insects, flowers, textures) |
 | `portrait_neutral` | Standard portraits |

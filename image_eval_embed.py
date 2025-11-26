@@ -1789,7 +1789,7 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
     return metrics
 
 
-def assess_technical_metrics(technical_metrics: Dict, context: str = "stock_product") -> List[str]:
+def assess_technical_metrics(technical_metrics: Dict, context: str = "studio_photography") -> List[str]:
     """Generate human-readable warnings based on measured metrics and context."""
     profile = get_profile(context)
     rules = profile.get("rules", {})
@@ -1833,7 +1833,7 @@ def assess_technical_metrics(technical_metrics: Dict, context: str = "stock_prod
     return warnings
 
 
-def compute_post_process_potential(technical_metrics: Dict, context: str = "stock_product") -> int:
+def compute_post_process_potential(technical_metrics: Dict, context: str = "studio_photography") -> int:
     """Estimate how much post-processing can improve this image (0–100)."""
     profile = get_profile(context)
     post_process = profile.get("post_process", {})
@@ -2500,7 +2500,7 @@ def process_context_only(
     
     def classify_single(image_path: str) -> Tuple[str, str, str]:
         if context_override:
-            context = context_override if context_override in PROFILE_CONFIG else 'stock_product'
+            context = context_override if context_override in PROFILE_CONFIG else 'studio_photography'
             confidence = 'override'
         else:
             try:
@@ -2509,7 +2509,7 @@ def process_context_only(
                 confidence = result.confidence
             except Exception as e:
                 logger.warning(f"Classification failed for {image_path}: {e}")
-                context = 'stock_product'
+                context = 'studio_photography'
                 confidence = 'error'
         
         if not dry_run:
@@ -2531,7 +2531,7 @@ def process_context_only(
                 except Exception as e:
                     path = futures[future]
                     logger.error(f"Failed to process {path}: {e}")
-                    results.append((path, 'stock_product', 'error'))
+                    results.append((path, 'studio_photography', 'error'))
                 pbar.update(1)
     
     # Write CSV if requested
@@ -2678,7 +2678,7 @@ def process_images_with_pyiqa(
                 continue
 
             profile_key = map_context_to_profile(image_context)
-            profile_cfg = PROFILE_CONFIG.get(profile_key, PROFILE_CONFIG["stock_product"])
+            profile_cfg = PROFILE_CONFIG.get(profile_key, PROFILE_CONFIG["studio_photography"])
             metric_keys = list(profile_cfg.get("model_weights", {}).keys())
             try:
                 metric_details = pyiqa_manager.score_metrics(image_path, metric_keys, args)
@@ -3320,9 +3320,9 @@ if __name__ == "__main__":
     process_parser.add_argument('--cache-dir', type=str, default=CACHE_DIR, help=f'Cache directory (default: {CACHE_DIR})')
     process_parser.add_argument('--clear-cache', action='store_true', help='Clear cache before processing')
     process_parser.add_argument('--context', type=str, default=None,
-                              help='Manual context override (e.g., landscape, portrait_neutral, stock_product)')
+                              help='Manual context override (e.g., landscape, portrait_neutral, studio_photography)')
     process_parser.add_argument('--no-context-classification', action='store_true',
-                              help='Skip automatic context classification, use stock_product for all')
+                              help='Skip automatic context classification, use studio_photography for all')
     
     # Prep-context command - classify and embed context only (no scoring)
     prep_parser = subparsers.add_parser('prep-context', help='Classify images and embed context only (no scoring)')
