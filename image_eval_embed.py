@@ -21,8 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import math
 import numpy as np
-import piexif
-import piexif.helper
 import requests
 from PIL import Image, ImageStat
 from colorama import Fore, Style
@@ -37,6 +35,14 @@ from profile_config import (
     PROFILE_SCORE_STD_SCALE,
     get_default_pyiqa_shift,
 )
+
+try:
+    import piexif  # type: ignore
+    import piexif.helper  # type: ignore
+    PIEXIF_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    piexif = None  # type: ignore
+    PIEXIF_AVAILABLE = False
 
 try:
     import cv2  # type: ignore
@@ -864,9 +870,11 @@ class PyiqaManager:
 
 
 def _is_raw_image(image_path: str) -> bool:
+    """Check if file is a RAW image based on extension."""
     return Path(image_path).suffix.lower() in RAW_EXTENSIONS
 
 def _warn_rawpy_missing():
+    """Log a one-time warning when rawpy is needed but not installed."""
     global RAWPY_IMPORT_WARNINGED
     if not RAWPY_IMPORT_WARNINGED:
         logger.warning(
@@ -1057,6 +1065,10 @@ def encode_image_for_classification(image_path: str) -> str:
 
 @contextmanager
 def open_image_for_analysis(image_path: str):
+    """Context manager to open image files (including RAW) for analysis.
+    
+    Yields a PIL Image object. For RAW files, uses rawpy to decode.
+    """
     ext = Path(image_path).suffix.lower()
     if ext in RAW_EXTENSIONS:
         if not RAWPY_AVAILABLE:
@@ -1790,6 +1802,11 @@ def load_from_cache(image_path: str, model: str, cache_dir: str) -> Optional[Dic
 
 
 def save_to_cache(image_path: str, model: str, metadata: Dict, cache_dir: str):
+    """Save evaluation metadata to disk cache.
+    
+    Creates cache directories as needed. Cache key is derived from
+    image path, model name, and file modification time.
+    """
     """Save API response to cache."""
     if not cache_dir:
         return
@@ -1853,6 +1870,10 @@ def has_user_comment(image_path: str) -> bool:
                 return True
             return False
 
+        if not PIEXIF_AVAILABLE or piexif is None:
+            logger.debug("piexif not available; cannot inspect UserComment for %s", image_path)
+            return False
+
         with Image.open(image_path) as img:
             exif_data = img.info.get("exif", b"")
             if not exif_data:  # Check if EXIF data is empty
@@ -1884,6 +1905,10 @@ def verify_metadata(image_path: str, expected_metadata: Dict) -> bool:
             return False
         
         # For JPEG/PNG, use PIL
+        if not PIEXIF_AVAILABLE or piexif is None:
+            logger.debug("piexif not available; cannot verify metadata in %s", image_path)
+            return False
+
         with Image.open(image_path) as img:
             exif_data = img.info.get("exif", b"")
             if not exif_data:
@@ -1970,6 +1995,10 @@ def embed_metadata(image_path: str, metadata: Dict, backup_dir: Optional[str] = 
         if file_ext in ['.dng', '.nef', '.tif', '.tiff']:
             return embed_metadata_exiftool(image_path, metadata, backup_dir, verify)
         
+        if not PIEXIF_AVAILABLE or piexif is None:
+            logger.error("piexif is required to embed metadata into JPEG/PNG files. Please install piexif.")
+            return False
+
         # Open the image to access its EXIF data
         with Image.open(image_path) as img:
             exif_data = img.info.get("exif", b"")
@@ -2276,6 +2305,10 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, context_hos
 
 
 def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: str):
+    """Export evaluation results to a CSV file.
+    
+    Flattens nested metadata dictionaries and writes all fields as columns.
+    """
     """Save processing results to CSV file."""
     with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
         fieldnames = [
@@ -2446,7 +2479,6 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
                 # Try to extract numeric score from string
                 score_str = str(metadata['score'])
                 # Extract first number found
-                import re
                 match = re.search(r'\d+', score_str)
                 if match:
                     score = int(match.group())
@@ -2561,6 +2593,7 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
 
 
 def print_statistics(stats: Dict):
+    """Print formatted summary statistics to console with color coding."""
     """Print formatted statistics."""
     print(f"\n{'='*60}")
     print(f"PROCESSING SUMMARY")
