@@ -737,6 +737,8 @@ class PyIqaScorer:
         assert torch is not None, "PyTorch is required for PyIQA scoring but was not imported."
         with torch.no_grad():
             for image_path in image_paths:
+                image_tensor = None
+                score = None
                 try:
                     image_tensor = load_image_tensor_with_max_edge(image_path, self.max_long_edge)
                     if image_tensor is not None:
@@ -750,6 +752,12 @@ class PyIqaScorer:
                     results[image_path] = value
                 except Exception as exc:
                     logger.error(f"PyIQA scoring failed for {image_path}: {exc}")
+                finally:
+                    # Explicit tensor cleanup to prevent memory leaks
+                    if image_tensor is not None:
+                        del image_tensor
+                    if score is not None:
+                        del score
         return results
 
     def score_single(self, image_path: str) -> float:
@@ -1327,56 +1335,53 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
     # Explicit "category X" reference takes priority
     category_matches = re.findall(r'category\s*(\d+)', context_label)
     if category_matches:
-            last_match = category_matches[-1]
-            if last_match in number_to_context:
-                matched_context = number_to_context[last_match]
-                logger.info(f"Context classification: {matched_context} (from 'category {last_match}') for {image_path}")
-                return matched_context
+        last_match = category_matches[-1]
+        if last_match in number_to_context:
+            matched_context = number_to_context[last_match]
+            logger.info(f"Context classification: {matched_context} (from 'category {last_match}') for {image_path}")
+            return ClassificationResult(matched_context, 'high', 'category', raw_response, 0)
 
-        # Weighted sentence analysis to avoid false positives
-        sentences = re.split(r'[.!?\n]+', context_label)
-        positive_markers = ["include", "includes", "fits", "fit", "belongs to", "classified as", "this is", "is a", "matches", "best fits"]
-        negative_markers = ["don't fit", "doesn't fit", "does not fit", "not ", "no ", "without"]
-        candidate_scores = {}
-        for sentence in sentences:
-            s = sentence.strip()
-            if not s:
-                continue
-            sentiment = 0
-            lowered = s
-            if any(marker in lowered for marker in negative_markers):
-                sentiment = -1
-            elif any(marker in lowered for marker in positive_markers):
-                sentiment = 1
-            for known_context in PROFILE_CONFIG.keys():
-                if known_context in lowered:
-                    score = 2 if sentiment == 1 else (-2 if sentiment == -1 else 1)
-                    candidate_scores[known_context] = max(score, candidate_scores.get(known_context, -10))
-        if candidate_scores:
-            best_context, best_score = max(candidate_scores.items(), key=lambda kv: kv[1])
-            if best_score > 0:
-                logger.info(f"Context classification: {best_context} (sentence-weighted) for {image_path}")
-                return best_context
-
-        # Validate against known contexts (exact match)
-        if context_label in PROFILE_CONFIG:
-            logger.info(f"Context classification: {context_label} (exact match) for {image_path}")
-            return context_label
-        
-        # Try to extract valid context from response (partial match)
+    # Weighted sentence analysis to avoid false positives
+    sentences = re.split(r'[.!?\n]+', context_label)
+    positive_markers = ["include", "includes", "fits", "fit", "belongs to", "classified as", "this is", "is a", "matches", "best fits"]
+    negative_markers = ["don't fit", "doesn't fit", "does not fit", "not ", "no ", "without"]
+    candidate_scores = {}
+    for sentence in sentences:
+        s = sentence.strip()
+        if not s:
+            continue
+        sentiment = 0
+        lowered = s
+        if any(marker in lowered for marker in negative_markers):
+            sentiment = -1
+        elif any(marker in lowered for marker in positive_markers):
+            sentiment = 1
         for known_context in PROFILE_CONFIG.keys():
-            if known_context in context_label:
-                logger.info(f"Context classification: {known_context} (extracted from '{context_label}') for {image_path}")
-                return known_context
-        
-        # Log the failure with the actual response
-        logger.warning(f"Context classification failed: unknown response '{raw_response}' (normalized: '{context_label}') for {image_path}. "
-                      f"Defaulting to 'stock_product' (most restrictive). Consider manual context override.")
-        return 'stock_product'
-        
-    except Exception as e:
-        logger.warning(f"Context classification failed for {image_path}: {e}, defaulting to 'stock_product'")
-        return 'stock_product'
+            if known_context in lowered:
+                score = 2 if sentiment == 1 else (-2 if sentiment == -1 else 1)
+                candidate_scores[known_context] = max(score, candidate_scores.get(known_context, -10))
+    if candidate_scores:
+        best_context, best_score = max(candidate_scores.items(), key=lambda kv: kv[1])
+        if best_score > 0:
+            confidence = 'high' if best_score >= 2 else 'medium'
+            logger.info(f"Context classification: {best_context} (sentence-weighted, score={best_score}) for {image_path}")
+            return ClassificationResult(best_context, confidence, 'weighted', raw_response, 0)
+
+    # Validate against known contexts (exact match)
+    if context_label in PROFILE_CONFIG:
+        logger.info(f"Context classification: {context_label} (exact match) for {image_path}")
+        return ClassificationResult(context_label, 'high', 'exact', raw_response, 0)
+    
+    # Try to extract valid context from response (partial match)
+    for known_context in PROFILE_CONFIG.keys():
+        if known_context in context_label:
+            logger.info(f"Context classification: {known_context} (extracted from '{context_label}') for {image_path}")
+            return ClassificationResult(known_context, 'medium', 'partial', raw_response, 0)
+    
+    # Log the failure with the actual response
+    logger.warning(f"Context classification failed: unknown response '{raw_response}' (normalized: '{context_label}') for {image_path}. "
+                  f"Defaulting to 'stock_product' (most restrictive). Consider manual context override.")
+    return ClassificationResult('stock_product', 'low', 'fallback', raw_response, 0)
 
 
 def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, context: str = 'stock_product') -> Dict:

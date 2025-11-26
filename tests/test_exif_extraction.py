@@ -1,4 +1,9 @@
+import os
+import sys
+
 import pytest
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import image_eval_embed
 from image_eval_embed import extract_exif_metadata
@@ -44,4 +49,3 @@ def test_extract_exif_metadata_merges_defaults(monkeypatch, helper_result):
             assert result[key] == helper_result[key]
         else:
             assert result[key] is None
-
