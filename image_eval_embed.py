@@ -311,7 +311,7 @@ def build_profile_metadata(
     """Assemble metadata payload for profiled PyIQA evaluation."""
     rounded = int(round(max(0.0, min(100.0, final_score))))
     base_rounded = int(round(max(0.0, min(100.0, base_score))))
-    profile_name = TECH_PROFILES.get(profile_key, {}).get("name")
+    profile_name = PROFILE_CONFIG.get(profile_key, {}).get("name")
     context_profile_name = technical_metrics.get("context_profile", profile_key.title())
     display_name = profile_name or context_profile_name or profile_key.replace("_", " ").title()
     category = categorize_score(final_score)
@@ -1311,7 +1311,7 @@ def classify_image_context(image_path: str, ollama_host_url: str, model: str) ->
                 sentiment = -1
             elif any(marker in lowered for marker in positive_markers):
                 sentiment = 1
-            for known_context in TECH_PROFILES.keys():
+            for known_context in PROFILE_CONFIG.keys():
                 if known_context in lowered:
                     score = 2 if sentiment == 1 else (-2 if sentiment == -1 else 1)
                     candidate_scores[known_context] = max(score, candidate_scores.get(known_context, -10))
@@ -1322,12 +1322,12 @@ def classify_image_context(image_path: str, ollama_host_url: str, model: str) ->
                 return best_context
 
         # Validate against known contexts (exact match)
-        if context_label in TECH_PROFILES:
+        if context_label in PROFILE_CONFIG:
             logger.info(f"Context classification: {context_label} (exact match) for {image_path}")
             return context_label
         
         # Try to extract valid context from response (partial match)
-        for known_context in TECH_PROFILES.keys():
+        for known_context in PROFILE_CONFIG.keys():
             if known_context in context_label:
                 logger.info(f"Context classification: {known_context} (extracted from '{context_label}') for {image_path}")
                 return known_context
@@ -1359,7 +1359,7 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
     }
     
     # Get context profile
-    profile = TECH_PROFILES.get(context, TECH_PROFILES['stock_product'])
+    profile = get_profile(context)
     metrics['context_profile'] = profile['name']
     
     try:
@@ -1510,44 +1510,45 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
     return metrics
 
 
-def get_profile(context: str) -> Dict:
-    """Retrieve technical profile for a given context, with fallback."""
-    return TECH_PROFILES.get(context, TECH_PROFILES["stock_product"])
-
-
 def assess_technical_metrics(technical_metrics: Dict, context: str = "stock_product") -> List[str]:
     """Generate human-readable warnings based on measured metrics and context."""
     profile = get_profile(context)
+    rules = profile.get("rules", {})
     warnings: List[str] = []
 
     # Sharpness
     sharpness = technical_metrics.get('sharpness')
+    sharpness_rules = rules.get("sharpness", {})
     if sharpness is not None:
-        if sharpness < profile["sharpness_crit"]:
+        if sharpness < sharpness_rules.get("critical_threshold", 30.0):
             warnings.append(f"Sharpness critically low ({sharpness:.1f})")
-        elif sharpness < profile["sharpness_soft"]:
+        elif sharpness < sharpness_rules.get("soft_threshold", 60.0):
             warnings.append(f"Lower sharpness ({sharpness:.1f}) may impact detail")
 
     # Highlight and shadow clipping
     highlights = float(technical_metrics.get('histogram_clipping_highlights', 0.0))
     shadows = float(technical_metrics.get('histogram_clipping_shadows', 0.0))
+    clipping_rules = rules.get("clipping", {})
+    clip_warn = clipping_rules.get("warn_pct", 5.0)
 
-    if highlights > profile["clip_warn"]:
+    if highlights > clip_warn:
         warnings.append(f"Highlight clipping {highlights:.1f}% reduces tonal range")
 
-    if shadows > profile["clip_warn"]:
+    if shadows > clip_warn:
         warnings.append(f"Shadow clipping {shadows:.1f}% removes shadow detail")
 
     # Color cast (respect profile penalties)
     color_cast = technical_metrics.get('color_cast', 'neutral')
-    if color_cast != 'neutral' and profile["color_cast_penalty"] > 0:
+    color_rules = rules.get("color_cast", {})
+    if color_cast != 'neutral' and color_rules.get("penalty", 0) > 0:
         warnings.append(f"Color cast detected: {color_cast}")
 
     # Noise (0–100 severity)
     noise_score = float(technical_metrics.get('noise_score', 0.0))
-    if noise_score > profile["noise_high"]:
+    noise_rules = rules.get("noise", {})
+    if noise_score > noise_rules.get("high", 60.0):
         warnings.append(f"High noise level (score {noise_score:.1f}/100)")
-    elif noise_score > profile["noise_warn"]:
+    elif noise_score > noise_rules.get("warn", 30.0):
         warnings.append(f"Elevated noise (score {noise_score:.1f}/100)")
 
     return warnings
@@ -1556,14 +1557,19 @@ def assess_technical_metrics(technical_metrics: Dict, context: str = "stock_prod
 def compute_post_process_potential(technical_metrics: Dict, context: str = "stock_product") -> int:
     """Estimate how much post-processing can improve this image (0–100)."""
     profile = get_profile(context)
-    base_score = float(profile["post_base"])
+    post_process = profile.get("post_process", {})
+    rules = profile.get("rules", {})
+    
+    base_score = float(post_process.get("base", 70))
 
     # Sharpness contribution
     sharpness = technical_metrics.get('sharpness')
     if sharpness is not None:
-        if sharpness < profile["sharpness_post_heavy"]:
+        sharpness_heavy = post_process.get("sharpness_heavy", 35.0)
+        sharpness_soft = post_process.get("sharpness_soft", 55.0)
+        if sharpness < sharpness_heavy:
             base_score -= 25
-        elif sharpness < profile["sharpness_post_soft"]:
+        elif sharpness < sharpness_soft:
             base_score -= 10
         else:
             base_score += 5
@@ -1572,26 +1578,35 @@ def compute_post_process_potential(technical_metrics: Dict, context: str = "stoc
     highlights = float(technical_metrics.get('histogram_clipping_highlights', 0.0))
     shadows = float(technical_metrics.get('histogram_clipping_shadows', 0.0))
     clipping = max(highlights, shadows)
+    
+    clip_high = post_process.get("clip_high", 15.0)
+    clip_mid = post_process.get("clip_mid", 5.0)
+    clip_bonus = post_process.get("clip_bonus", 2.0)
 
-    if clipping > profile["clip_penalty_high"]:
+    if clipping > clip_high:
         base_score -= 20
-    elif clipping > profile["clip_penalty_mid"]:
+    elif clipping > clip_mid:
         base_score -= 10
-    elif clipping < profile["clip_bonus_max"]:
+    elif clipping < clip_bonus:
         base_score += 5
-    # else: neutral zone (between clip_bonus_max and clip_penalty_mid) - no adjustment
+    # else: neutral zone (between clip_bonus and clip_mid) - no adjustment
 
     # Noise contribution
     noise_score = float(technical_metrics.get('noise_score', 0.0))
-    if noise_score > profile["noise_high"]:
-        base_score -= profile["noise_penalty_high"]
-    elif noise_score > profile["noise_warn"]:
-        base_score -= profile["noise_penalty_mid"]
+    noise_rules = rules.get("noise", {})
+    noise_penalty_high = post_process.get("noise_penalty_high", 15)
+    noise_penalty_mid = post_process.get("noise_penalty_mid", 5)
+    
+    if noise_score > noise_rules.get("high", 60.0):
+        base_score -= noise_penalty_high
+    elif noise_score > noise_rules.get("warn", 30.0):
+        base_score -= noise_penalty_mid
 
     # Color cast contribution
     color_cast = technical_metrics.get('color_cast', 'neutral')
     if color_cast != 'neutral':
-        base_score -= profile["color_cast_penalty"]
+        color_penalty = rules.get("color_cast", {}).get("penalty", 5)
+        base_score -= color_penalty
 
     post_score = max(0, min(100, int(round(base_score))))
     return post_score
@@ -1603,7 +1618,7 @@ def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str
                                ) -> Tuple[str, Dict, Dict, List[str]]:
     """Determine context, extract EXIF, and compute technical metrics for an image."""
     if context_override:
-        image_context = context_override if context_override in TECH_PROFILES else 'stock_product'
+        image_context = context_override if context_override in PROFILE_CONFIG else 'stock_product'
         logger.info(f"Using manual context override: {image_context}")
     elif skip_context_classification:
         image_context = 'stock_product'
@@ -1615,7 +1630,7 @@ def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str
             logger.warning(f"Context classification failed for {image_path}: {e}, using default")
             image_context = 'stock_product'
 
-    logger.info(f"Image context for {image_path}: {image_context} ({TECH_PROFILES[image_context]['name']})")
+    logger.info(f"Image context for {image_path}: {image_context} ({PROFILE_CONFIG[image_context]['name']})")
 
     exif_data = extract_exif_metadata(image_path)
 
