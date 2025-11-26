@@ -1,11 +1,15 @@
 import os
 import sys
+from contextlib import contextmanager
 
 import pytest
+from PIL import Image
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from image_eval_embed import (
+    ImageResolutionTooSmallError,
+    analyze_image_technical,
     assess_technical_metrics,
     categorize_score,
     compute_disagreement_z,
@@ -120,3 +124,21 @@ def test_prompt_for_image_folder_non_interactive(monkeypatch):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     with pytest.raises(SystemExit):
         prompt_for_image_folder("/fallback")
+
+
+def test_analyze_image_technical_enforces_min_long_edge(tmp_path, monkeypatch):
+    image_path = tmp_path / "tiny.jpg"
+    Image.new('RGB', (800, 600)).save(image_path)
+
+    @contextmanager
+    def fake_open(_):
+        img = Image.open(image_path)
+        try:
+            yield img
+        finally:
+            img.close()
+
+    monkeypatch.setattr("image_eval_embed.open_image_for_analysis", fake_open)
+
+    with pytest.raises(ImageResolutionTooSmallError):
+        analyze_image_technical(str(image_path))

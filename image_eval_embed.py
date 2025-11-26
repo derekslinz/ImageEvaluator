@@ -919,6 +919,11 @@ CACHE_VERSION = "v1"
 COLOR_CAST_THRESHOLD = 15.0  # Mean difference threshold for color cast detection
 HISTOGRAM_HIGHLIGHT_RANGE = (250, 256)  # Histogram bins considered as highlights
 HISTOGRAM_SHADOW_RANGE = (0, 6)  # Histogram bins considered as shadows
+MIN_LONG_EDGE = 850  # Minimum pixels required on the long edge
+
+
+class ImageResolutionTooSmallError(RuntimeError):
+    """Raised when an image fails the minimum long-edge requirement."""
 
 
 def _extract_pil_exif_metadata(image_path: str) -> Dict[str, Union[str, int, None]]:
@@ -1439,6 +1444,11 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
         with open_image_for_analysis(image_path) as img:
             img_rgb = img if img.mode == 'RGB' else img.convert('RGB')
             width, height = img_rgb.size
+            long_edge = max(width, height)
+            if long_edge < MIN_LONG_EDGE:
+                raise ImageResolutionTooSmallError(
+                    f"Skipping {image_path}: long edge {long_edge}px is below the minimum {MIN_LONG_EDGE}px requirement"
+                )
             metrics['dimensions'] = f"{width}x{height}"
             metrics['megapixels'] = float((width * height) / 1_000_000)
             metrics['aspect_ratio'] = float(width / max(height, 1))
@@ -1581,6 +1591,8 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
                 gray_stat = ImageStat.Stat(img_gray)
                 metrics['sharpness'] = float(sum(gray_stat.stddev) / len(gray_stat.stddev))
     
+    except ImageResolutionTooSmallError:
+        raise
     except Exception as e:
         logger.debug(f"Could not analyze technical metrics for {image_path}: {e}")
         metrics['status'] = 'error'
@@ -1741,11 +1753,20 @@ def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str
     return image_context, exif_data, technical_metrics, technical_warnings
 
 
-def setup_logging(log_file: Optional[str] = None, verbose: bool = False):
+def setup_logging(log_file: Optional[str] = None, verbose: bool = False, debug: bool = False):
     """Configure logging with file handler and appropriate level."""
-    # Set level based on verbose flag
-    log_level = logging.DEBUG if verbose else logging.INFO
-    logger.setLevel(log_level)
+    # Determine logger levels based on flags
+    if debug:
+        logger_level = logging.DEBUG
+    elif verbose:
+        logger_level = logging.INFO
+    else:
+        logger_level = logging.WARNING
+
+    console_level = logger_level
+    file_level = logger_level if not debug else logging.DEBUG
+
+    logger.setLevel(logger_level)
     
     # Clear existing handlers to prevent duplicates
     logger.handlers.clear()
@@ -1755,7 +1776,7 @@ def setup_logging(log_file: Optional[str] = None, verbose: bool = False):
     
     # Console handler
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(log_level)
+    console_handler.setLevel(console_level)
     console_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(console_format)
     logger.addHandler(console_handler)
@@ -1765,7 +1786,7 @@ def setup_logging(log_file: Optional[str] = None, verbose: bool = False):
         file_handler = logging.handlers.RotatingFileHandler(
             log_file, maxBytes=10*1024*1024, backupCount=5  # 10MB per file, 5 backups
         )
-        file_handler.setLevel(logging.DEBUG)  # Always log debug to file
+        file_handler.setLevel(file_level)
         file_format = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
         )
@@ -2175,6 +2196,11 @@ def process_images_with_pyiqa(
                     skip_context_classification,
                     stock_eval
                 )
+            except ImageResolutionTooSmallError as exc:
+                logger.warning(str(exc))
+                results.append((image_path, None))
+                pbar.update(1)
+                continue
             except Exception as exc:
                 logger.error(f"Context/technical analysis failed for {image_path}: {exc}")
                 results.append((image_path, None))
@@ -2818,7 +2844,8 @@ if __name__ == "__main__":
     process_parser.add_argument('--backup-dir', type=str, default=None, help='Directory to store backups (default: same directory as originals)')
     process_parser.add_argument('--verify', action='store_true', help='Verify metadata was correctly embedded after writing')
     process_parser.add_argument('--log-file', type=str, default=None, help='Path to log file (default: auto-generated)')
-    process_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose debug output')
+    process_parser.add_argument('--verbose', '-v', action='store_true', help='Show INFO-level console logging')
+    process_parser.add_argument('--debug', action='store_true', help='Show DEBUG-level console logging (implies --verbose)')
     process_parser.add_argument('--cache', action='store_true', help='Enable API response caching')
     process_parser.add_argument('--cache-dir', type=str, default=CACHE_DIR, help=f'Cache directory (default: {CACHE_DIR})')
     process_parser.add_argument('--clear-cache', action='store_true', help='Clear cache before processing')
@@ -2839,8 +2866,10 @@ if __name__ == "__main__":
     raw_cli_args = sys.argv[1:]
     normalized_args, inferred_command = prepare_cli_args(raw_cli_args)
     args = parser.parse_args(normalized_args)
-
     
+    if hasattr(args, 'debug') and args.debug:
+        args.verbose = True
+
     if inferred_command == 'implicit':
         print("No command supplied. Defaulting to 'process'.")
     elif inferred_command == 'inferred':
@@ -2895,7 +2924,7 @@ if __name__ == "__main__":
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             log_file = f"image_evaluator_{timestamp}.log"
         
-        setup_logging(log_file, args.verbose)
+        setup_logging(log_file, verbose=args.verbose, debug=getattr(args, 'debug', False))
         logger.info(f"Starting image evaluation - log file: {log_file}")
         logger.debug(f"Arguments: {vars(args)}")
     
@@ -2987,8 +3016,10 @@ if __name__ == "__main__":
     if args.verify:
         print(f"Metadata verification: enabled")
     
-    if args.verbose:
-        print(f"Verbose logging: enabled")
+    if getattr(args, 'debug', False):
+        print("Debug logging: enabled")
+    elif args.verbose:
+        print("Verbose logging: enabled")
     
     if cache_dir:
         cache_stats = get_cache_stats(cache_dir)
