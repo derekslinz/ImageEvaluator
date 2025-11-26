@@ -1789,18 +1789,22 @@ def setup_logging(log_file: Optional[str] = None, verbose: bool = False, debug: 
     """Configure logging with file handler and appropriate level."""
     # Set level based on verbose/debug flags
     log_level = logging.DEBUG if (verbose or debug) else logging.INFO
-    logging.getLogger().setLevel(log_level)
-    logger.setLevel(log_level)
+    
+    # Clear root logger handlers (from basicConfig at module load)
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(log_level)
     
     # Clear existing handlers to prevent duplicates
     logger.handlers.clear()
+    logger.setLevel(log_level)
     
     # Prevent propagation to root logger to avoid duplicate messages
     logger.propagate = False
     
     # Console handler
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(console_level)
+    console_handler.setLevel(log_level)
     console_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(console_format)
     logger.addHandler(console_handler)
@@ -1810,7 +1814,7 @@ def setup_logging(log_file: Optional[str] = None, verbose: bool = False, debug: 
         file_handler = logging.handlers.RotatingFileHandler(
             log_file, maxBytes=10*1024*1024, backupCount=5  # 10MB per file, 5 backups
         )
-        file_handler.setLevel(file_level)
+        file_handler.setLevel(log_level)
         file_format = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
         )
@@ -2179,6 +2183,191 @@ def embed_metadata(image_path: str, metadata: Dict, backup_dir: Optional[str] = 
     except Exception as e:
         logger.error(f"Error embedding metadata in {image_path}: {e}")
         return False
+
+
+def embed_context_only(image_path: str, context_label: str, backup_dir: Optional[str] = None) -> bool:
+    """Embed only the context label into image EXIF without scoring.
+    
+    This is a lightweight operation for pre-classifying image sets before full evaluation.
+    The context is stored in ImageDescription field.
+    """
+    try:
+        file_ext = os.path.splitext(image_path)[1].lower()
+        
+        # For RAW/TIFF files, use exiftool
+        if file_ext in ['.dng', '.nef', '.tif', '.tiff', '.cr2', '.cr3', '.arw', '.rw2', '.raf', '.orf']:
+            cmd = ['exiftool', '-overwrite_original']
+            if backup_dir:
+                os.makedirs(backup_dir, exist_ok=True)
+                cmd.extend(['-b', '-o', backup_dir])
+            cmd.extend([
+                f'-ImageDescription={context_label}',
+                image_path
+            ])
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.error(f"exiftool failed for {image_path}: {result.stderr}")
+                return False
+            print(f"{Fore.CYAN}[Context]{Style.RESET_ALL} {os.path.basename(image_path)}: {Fore.GREEN}{context_label}{Style.RESET_ALL}")
+            return True
+        
+        # For JPEG/PNG, use piexif
+        if not PIEXIF_AVAILABLE or piexif is None:
+            logger.error("piexif required for JPEG/PNG context embedding")
+            return False
+        
+        with Image.open(image_path) as img:
+            exif_data = img.info.get("exif", b"")
+            if exif_data:
+                exif_dict = piexif.load(exif_data)
+            else:
+                exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
+            
+            # Store context in ImageDescription
+            exif_dict["0th"][piexif.ImageIFD.ImageDescription] = context_label.encode('utf-8')
+            
+            exif_bytes = piexif.dump(exif_dict)
+            
+            # Backup if requested
+            if backup_dir:
+                os.makedirs(backup_dir, exist_ok=True)
+                backup_path = os.path.join(backup_dir, os.path.basename(image_path) + '.original')
+                if not os.path.exists(backup_path):
+                    import shutil
+                    shutil.copy2(image_path, backup_path)
+            
+            # Save with new EXIF
+            img.save(image_path, exif=exif_bytes, quality=95)
+        
+        print(f"{Fore.CYAN}[Context]{Style.RESET_ALL} {os.path.basename(image_path)}: {Fore.GREEN}{context_label}{Style.RESET_ALL}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error embedding context in {image_path}: {e}")
+        return False
+
+
+def process_context_only(
+    folder_path: str,
+    ollama_host_url: str,
+    model: str,
+    context_override: Optional[str] = None,
+    csv_output: Optional[str] = None,
+    backup_dir: Optional[str] = None,
+    dry_run: bool = False,
+    workers: int = 4,
+    force: bool = False
+) -> List[Tuple[str, str, str]]:
+    """Classify images and embed context only (no scoring).
+    
+    By default, processes images that:
+    - Have no context embedded, OR
+    - Have 'stock_product' context (the fallback)
+    
+    Use --force to re-classify ALL images regardless of existing context.
+    
+    Returns list of (image_path, context, confidence) tuples.
+    """
+    results: List[Tuple[str, str, str]] = []
+    
+    # Collect images
+    image_paths = []
+    file_types = ['.jpg', '.jpeg', '.png', '.nef', '.tif', '.tiff', '.dng', '.cr2', '.cr3', '.arw']
+    
+    for root, dirs, files in os.walk(folder_path):
+        for filename in files:
+            if '.original.' in filename:
+                continue
+            if any(filename.lower().endswith(ext) for ext in file_types):
+                image_path = os.path.join(root, filename)
+                
+                # Check existing context
+                cached = read_cached_context(image_path)
+                
+                if force:
+                    # Force mode: process everything
+                    image_paths.append(image_path)
+                elif cached and cached != 'stock_product':
+                    # Has real classification - skip and record
+                    results.append((image_path, cached, 'cached'))
+                    print(f"{Fore.YELLOW}[Cached]{Style.RESET_ALL} {os.path.basename(image_path)}: {cached}")
+                else:
+                    # No context OR stock_product fallback - needs (re)classification
+                    if cached == 'stock_product':
+                        print(f"{Fore.MAGENTA}[Retry]{Style.RESET_ALL} {os.path.basename(image_path)}: was fallback")
+                    image_paths.append(image_path)
+    
+    if not image_paths:
+        print(f"{Fore.YELLOW}No images to process (all may have cached context){Style.RESET_ALL}")
+        return results
+    
+    print(f"\n{Fore.CYAN}Processing {len(image_paths)} images for context classification...{Style.RESET_ALL}\n")
+    
+    # Process images
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    def classify_single(image_path: str) -> Tuple[str, str, str]:
+        if context_override:
+            context = context_override if context_override in PROFILE_CONFIG else 'stock_product'
+            confidence = 'override'
+        else:
+            try:
+                result = classify_image_context_detailed(image_path, ollama_host_url, model)
+                context = result.context
+                confidence = result.confidence
+            except Exception as e:
+                logger.warning(f"Classification failed for {image_path}: {e}")
+                context = 'stock_product'
+                confidence = 'error'
+        
+        if not dry_run:
+            embed_context_only(image_path, context, backup_dir)
+        else:
+            profile_name = get_profile_name(context)
+            print(f"{Fore.MAGENTA}[Dry-run]{Style.RESET_ALL} {os.path.basename(image_path)}: {context} ({profile_name})")
+        
+        return (image_path, context, confidence)
+    
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(classify_single, path): path for path in image_paths}
+        
+        with tqdm(total=len(image_paths), desc="Classifying", unit="img") as pbar:
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    path = futures[future]
+                    logger.error(f"Failed to process {path}: {e}")
+                    results.append((path, 'stock_product', 'error'))
+                pbar.update(1)
+    
+    # Write CSV if requested
+    if csv_output:
+        with open(csv_output, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['file_path', 'filename', 'context', 'profile_name', 'confidence'])
+            for path, context, confidence in results:
+                profile_name = get_profile_name(context)
+                writer.writerow([path, os.path.basename(path), context, profile_name, confidence])
+        print(f"\n{Fore.GREEN}Context assignments saved to: {csv_output}{Style.RESET_ALL}")
+    
+    # Print summary
+    context_counts: Dict[str, int] = {}
+    for _, context, _ in results:
+        context_counts[context] = context_counts.get(context, 0) + 1
+    
+    print(f"\n{Fore.CYAN}{'='*50}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}Context Classification Summary{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{'='*50}{Style.RESET_ALL}")
+    for context, count in sorted(context_counts.items(), key=lambda x: -x[1]):
+        profile_name = get_profile_name(context)
+        pct = 100 * count / len(results)
+        print(f"  {context:25} ({profile_name:30}): {count:4} ({pct:5.1f}%)")
+    print(f"{Fore.CYAN}{'='*50}{Style.RESET_ALL}")
+    print(f"  {'Total':25} {' ':30}  {len(results):4}")
+    
+    return results
 
 
 def collect_images(folder_path: str, file_types: Optional[List[str]] = None, skip_existing: bool = True) -> List[str]:
@@ -2845,7 +3034,7 @@ def prepare_cli_args(cli_args: List[str]) -> Tuple[List[str], Optional[str]]:
         return ['process'], 'implicit'
     if cli_args[0] in ('-h', '--help'):
         return cli_args, None
-    if cli_args[0] in {'process', 'rollback', 'stats'}:
+    if cli_args[0] in {'process', 'rollback', 'stats', 'prep-context'}:
         return cli_args, None
     return ['process'] + cli_args, 'inferred'
 
@@ -2943,6 +3132,28 @@ if __name__ == "__main__":
     process_parser.add_argument('--no-context-classification', action='store_true',
                               help='Skip automatic context classification, use stock_product for all')
     
+    # Prep-context command - classify and embed context only (no scoring)
+    prep_parser = subparsers.add_parser('prep-context', help='Classify images and embed context only (no scoring)')
+    prep_parser.add_argument('folder_path', type=str, nargs='?', default=None,
+                            help='Path to the folder containing images')
+    prep_parser.add_argument('ollama_host_url', type=str, nargs='?', default=None,
+                            help='URL of the Ollama API endpoint')
+    prep_parser.add_argument('--model', type=str, default=DEFAULT_MODEL,
+                            help=f'Ollama model to use for context classification (default: {DEFAULT_MODEL})')
+    prep_parser.add_argument('--csv', type=str, default=None, dest='csv_output',
+                            help='Output CSV file for context assignments')
+    prep_parser.add_argument('--backup-dir', type=str, default=None,
+                            help='Directory for image backups before embedding')
+    prep_parser.add_argument('--dry-run', action='store_true',
+                            help='Classify images but do not embed metadata')
+    prep_parser.add_argument('--workers', type=int, default=DEFAULT_WORKER_COUNT,
+                            help=f'Number of parallel workers (default: {DEFAULT_WORKER_COUNT})')
+    prep_parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
+    prep_parser.add_argument('--context', type=str, default=None,
+                            help='Manual context override for all images (skip classification)')
+    prep_parser.add_argument('--force', action='store_true',
+                            help='Re-classify ALL images, even those with existing non-fallback context')
+    
     # Rollback command
     rollback_parser = subparsers.add_parser('rollback', help='Restore images from backups')
     rollback_parser.add_argument('folder_path', type=str, help='Path to the folder containing images')
@@ -2979,6 +3190,55 @@ if __name__ == "__main__":
         results = load_results_from_csv(args.csv_path)
         stats = calculate_statistics(results)
         print_statistics(stats)
+        sys.exit(0)
+    
+    # Handle prep-context command
+    if args.command == 'prep-context':
+        # Handle missing folder path
+        if not args.folder_path:
+            args.folder_path = prompt_for_image_folder(DEFAULT_IMAGE_FOLDER)
+        
+        # Handle missing Ollama URL (only needed if not using context override)
+        if not args.ollama_host_url and not args.context:
+            args.ollama_host_url = DEFAULT_OLLAMA_URL
+            print(f"Using default Ollama endpoint: {args.ollama_host_url}")
+        
+        # Validate folder exists
+        if not os.path.exists(args.folder_path):
+            print(f"{Fore.RED}Error: Folder '{args.folder_path}' does not exist.{Style.RESET_ALL}")
+            sys.exit(1)
+        
+        # Setup logging for prep-context
+        setup_logging(verbose=args.verbose)
+        
+        print(f"\n{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}Image Context Preparation{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
+        print(f"  Folder:     {args.folder_path}")
+        if args.context:
+            print(f"  Context:    {args.context} (manual override)")
+        else:
+            print(f"  Model:      {args.model}")
+            print(f"  Ollama:     {args.ollama_host_url}")
+        print(f"  Dry-run:    {args.dry_run}")
+        print(f"  Workers:    {args.workers}")
+        if args.csv_output:
+            print(f"  CSV output: {args.csv_output}")
+        print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}\n")
+        
+        results = process_context_only(
+            folder_path=args.folder_path,
+            ollama_host_url=args.ollama_host_url,
+            model=args.model,
+            context_override=args.context,
+            csv_output=args.csv_output,
+            backup_dir=args.backup_dir,
+            dry_run=args.dry_run,
+            workers=args.workers,
+            force=args.force
+        )
+        
+        print(f"\n{Fore.GREEN}Completed! Processed {len(results)} images.{Style.RESET_ALL}")
         sys.exit(0)
     
     # Fill in defaults for positional arguments when omitted
