@@ -1,6 +1,7 @@
 import os
 import sys
 
+import pytest
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from image_eval_embed import _decode_exif_string
