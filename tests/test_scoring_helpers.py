@@ -13,6 +13,7 @@ from image_eval_embed import (
     compute_post_process_potential,
     map_context_to_profile,
     normalize_weights,
+    prompt_for_image_folder,
     validate_score,
 )
 
@@ -100,3 +101,22 @@ def test_compute_post_process_potential_combines_adjustments():
     }
     score = compute_post_process_potential(metrics, context="stock_product")
     assert score == 57  # 70 base +5 sharpness +5 clipping -15 noise -8 color
+
+
+def test_prompt_for_image_folder_accepts_user_input(monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "/tmp/images")
+    assert prompt_for_image_folder("/fallback") == "/tmp/images"
+
+
+def test_prompt_for_image_folder_uses_default_on_empty(monkeypatch):
+    responses = iter(["", "   ", "/final"])
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+    assert prompt_for_image_folder("/fallback") == "/fallback"
+
+
+def test_prompt_for_image_folder_non_interactive(monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    with pytest.raises(SystemExit):
+        prompt_for_image_folder("/fallback")

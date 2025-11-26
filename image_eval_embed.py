@@ -2283,7 +2283,8 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, context_hos
                             pyiqa_manager: Optional[PyiqaManager] = None,
                             pyiqa_cache_label: Optional[str] = None,
                             cli_args: Optional[argparse.Namespace] = None,
-                            use_ollama_metadata: bool = False) -> List[Tuple[str, Optional[Dict]]]:
+                            use_ollama_metadata: bool = False,
+                            stock_eval: bool = False) -> List[Tuple[str, Optional[Dict]]]:
     """Process images end-to-end using the PyIQA composite pipeline."""
     if pyiqa_manager is None:
         raise ValueError("PyIQA manager must be initialized before processing images.")
@@ -2294,8 +2295,9 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, context_hos
         return []
 
     cache_label = pyiqa_cache_label or "pyiqa_profiles"
+    effective_stock_eval = stock_eval or bool(cli_args and getattr(cli_args, 'stock_eval', False))
     metadata_host = None
-    if use_ollama_metadata or (cli_args and getattr(cli_args, 'stock_eval', False)):
+    if use_ollama_metadata or effective_stock_eval:
         metadata_host = ollama_host_url
     return process_images_with_pyiqa(
         image_paths=image_paths,
@@ -2313,7 +2315,7 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, context_hos
         skip_context_classification=skip_context_classification,
         args=cli_args,
         use_ollama_metadata=use_ollama_metadata,
-        stock_eval=bool(getattr(cli_args, 'stock_eval', False))
+        stock_eval=effective_stock_eval
     )
 
 
@@ -2733,6 +2735,36 @@ def prepare_cli_args(cli_args: List[str]) -> Tuple[List[str], Optional[str]]:
     return ['process'] + cli_args, 'inferred'
 
 
+def prompt_for_image_folder(default_path: Optional[str]) -> str:
+    """
+    Prompt the user for an image folder when no CLI argument was provided.
+    Requires an interactive terminal; otherwise instructs the user to pass a path.
+    """
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            "Image folder path is required when running non-interactively. "
+            "Provide it as the first positional argument or set IMAGE_EVAL_DEFAULT_FOLDER."
+        )
+
+    while True:
+        prompt = "Enter path to the image folder"
+        if default_path:
+            prompt += f" [{default_path}]"
+        prompt += ": "
+        try:
+            response = input(prompt)
+        except EOFError:
+            raise SystemExit(
+                "Image folder path input was interrupted. "
+                "Provide it as the first argument or set IMAGE_EVAL_DEFAULT_FOLDER."
+            )
+
+        candidate = response.strip() or (default_path or "")
+        if candidate:
+            return candidate
+        print("Please enter a valid folder path (Ctrl+C to cancel).")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process and evaluate images with AI.')
     subparsers = parser.add_subparsers(dest='command', help='Command to execute')
@@ -2744,7 +2776,7 @@ if __name__ == "__main__":
         type=str,
         nargs='?',
         default=None,
-        help='Path to the folder containing images (default: current working directory or IMAGE_EVAL_DEFAULT_FOLDER)'
+        help='Path to the folder containing images (prompted if omitted; defaults to IMAGE_EVAL_DEFAULT_FOLDER when confirmed)'
     )
     process_parser.add_argument(
         'ollama_host_url',
@@ -2834,18 +2866,23 @@ if __name__ == "__main__":
     # Fill in defaults for positional arguments when omitted
     if args.command == 'process':
         folder_defaulted = False
+        folder_prompted = False
         host_defaulted = False
         if not args.folder_path:
-            args.folder_path = DEFAULT_IMAGE_FOLDER
-            folder_defaulted = True
+            folder_prompted = True
+            args.folder_path = prompt_for_image_folder(DEFAULT_IMAGE_FOLDER)
+            folder_defaulted = DEFAULT_IMAGE_FOLDER and args.folder_path == DEFAULT_IMAGE_FOLDER
         if not args.ollama_host_url:
             args.ollama_host_url = DEFAULT_OLLAMA_URL
             host_defaulted = True
         if not args.context_host_url:
             args.context_host_url = args.ollama_host_url
         
-        if folder_defaulted:
-            print(f"Using default image folder: {args.folder_path}")
+        if folder_prompted:
+            if folder_defaulted:
+                print(f"Using default image folder: {args.folder_path}")
+            else:
+                print(f"Image folder selected: {args.folder_path}")
         if host_defaulted:
             print(f"Using default Ollama endpoint: {args.ollama_host_url}")
     
