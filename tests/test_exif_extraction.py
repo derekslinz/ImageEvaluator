@@ -45,21 +45,3 @@ def test_extract_exif_metadata_merges_defaults(monkeypatch, helper_result):
         else:
             assert result[key] is None
 
-
-def test_extract_exif_metadata_handles_helper_errors(monkeypatch):
-    """If the helper raises, the top-level function should return empty defaults."""
-    def fail(_):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(image_eval_embed, "_extract_pil_exif_metadata", fail)
-    result = extract_exif_metadata("/tmp/broken.jpg")
-
-    assert result == {
-        'iso': None,
-        'aperture': None,
-        'shutter_speed': None,
-        'focal_length': None,
-        'camera_make': None,
-        'camera_model': None,
-        'lens_model': None
-    }

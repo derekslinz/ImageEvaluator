@@ -1197,17 +1197,68 @@ Respond with ONLY the category name from the list above. Examples: "landscape" o
 Your response:"""
 
 
-def classify_image_context(image_path: str, ollama_host_url: str, model: str) -> str:
-    """Quickly classify image context using vision model."""
-    try:
-        # Encode image appropriately (handles RAW files by creating JPEG preview)
-        logger.debug(f"Encoding image for classification: {image_path}")
-        encoded_image = encode_image_for_classification(image_path)
-        image_size_kb = len(encoded_image) * 3 / 4 / 1024  # Approximate decoded size in KB
-        logger.debug(f"Encoded image size: {image_size_kb:.1f}KB")
-        
-        headers = {'Content-Type': 'application/json'}
-        payload = {
+class ClassificationResult:
+    """Result of image context classification with confidence tracking."""
+    __slots__ = ('context', 'confidence', 'method', 'raw_response', 'retries')
+    
+    def __init__(self, context: str, confidence: str = 'low', method: str = 'fallback',
+                 raw_response: str = '', retries: int = 0):
+        self.context = context
+        self.confidence = confidence  # 'high', 'medium', 'low'
+        self.method = method  # 'exact', 'number', 'category', 'weighted', 'partial', 'fallback'
+        self.raw_response = raw_response
+        self.retries = retries
+
+
+def classify_image_context(image_path: str, ollama_host_url: str, model: str,
+                           max_retries: int = MAX_RETRIES) -> str:
+    """Quickly classify image context using vision model with retry logic.
+    
+    Returns the context string. For detailed results, use classify_image_context_detailed().
+    """
+    result = classify_image_context_detailed(image_path, ollama_host_url, model, max_retries)
+    return result.context
+
+
+def classify_image_context_detailed(image_path: str, ollama_host_url: str, model: str,
+                                     max_retries: int = MAX_RETRIES) -> ClassificationResult:
+    """Classify image context with retry logic and confidence tracking."""
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            result = _classify_image_context_once(image_path, ollama_host_url, model)
+            result.retries = attempt
+            return result
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            logger.warning(f"Classification timeout for {image_path} (attempt {attempt + 1}/{max_retries})")
+            if attempt < max_retries - 1:
+                time.sleep(RETRY_DELAY_BASE * (attempt + 1))
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            logger.warning(f"Classification connection error for {image_path} (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(RETRY_DELAY_BASE * (attempt + 1))
+        except Exception as e:
+            # Don't retry for other exceptions
+            logger.warning(f"Classification failed for {image_path}: {e}")
+            return ClassificationResult('stock_product', 'low', 'error', str(e), attempt)
+    
+    logger.warning(f"Classification exhausted retries for {image_path}: {last_error}")
+    return ClassificationResult('stock_product', 'low', 'retry_exhausted', str(last_error), max_retries)
+
+
+def _classify_image_context_once(image_path: str, ollama_host_url: str, model: str) -> ClassificationResult:
+    """Single attempt at image context classification."""
+    # Encode image appropriately (handles RAW files by creating JPEG preview)
+    logger.debug(f"Encoding image for classification: {image_path}")
+    encoded_image = encode_image_for_classification(image_path)
+    image_size_kb = len(encoded_image) * 3 / 4 / 1024  # Approximate decoded size in KB
+    logger.debug(f"Encoded image size: {image_size_kb:.1f}KB")
+    
+    headers = {'Content-Type': 'application/json'}
+    payload = {
             "model": model,
             "stream": False,
             "images": [encoded_image],
