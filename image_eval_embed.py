@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import io
 import json  # Import json for parsing the response
@@ -56,6 +55,10 @@ def list_pyiqa_metrics() -> List[str]:
     if not PYIQA_AVAILABLE or pyiqa is None:
         return []
     try:
+        if hasattr(pyiqa, "list_models"):
+            models = pyiqa.list_models()
+            if models:
+                return sorted(models)
         return sorted(getattr(pyiqa, "AVAILABLE_METRICS", []))
     except Exception:
         return []
@@ -63,7 +66,7 @@ def list_pyiqa_metrics() -> List[str]:
 
 def get_default_pyiqa_shift(model_name: str) -> float:
     defaults = {
-        'clipiqa+_vitl14_512': 14.0,
+        DEFAULT_CLIPIQ_MODEL.lower(): 14.0,
         'maniqa': 14.0,
         'maniqa-kadid': 14.0,
         'maniqa-pipal': 14.0,
@@ -75,6 +78,7 @@ Image.MAX_IMAGE_PIXELS = None  # Remove limit entirely (or set to a higher value
 
 
 PYIQA_MAX_LONG_EDGE = 2048
+DEFAULT_CLIPIQ_MODEL = "clipiqa+_vitL14_512"
 
 CONTEXT_PROFILE_MAP = {
     # Preferred contexts (1:1 mapping)
@@ -332,6 +336,116 @@ def build_profile_metadata(
     return metadata
 
 
+def generate_ollama_metadata(
+    image_path: str,
+    ollama_host_url: str,
+    model: str,
+    profile_key: str,
+    final_score: float,
+    technical_metrics: Dict[str, Any],
+    technical_warnings: List[str],
+) -> Optional[Dict[str, str]]:
+    """Use Ollama to refine title/description/keywords."""
+    try:
+        encoded_image = encode_image_for_classification(image_path)
+    except Exception as exc:
+        logger.error(f"Failed to encode image for metadata generation ({image_path}): {exc}")
+        return None
+
+    warnings_str = ", ".join(technical_warnings) if technical_warnings else "none"
+    summary_parts = [
+        f"profile: {profile_key}",
+        f"score: {final_score:.1f}/100",
+        f"sharpness: {technical_metrics.get('sharpness')}",
+        f"brightness: {technical_metrics.get('brightness')}",
+        f"clipping_highlights: {technical_metrics.get('histogram_clipping_highlights')}",
+        f"clipping_shadows: {technical_metrics.get('histogram_clipping_shadows')}",
+        f"noise_score: {technical_metrics.get('noise_score')}",
+        f"color_cast: {technical_metrics.get('color_cast')}",
+        f"warnings: {warnings_str}",
+    ]
+    technical_summary = "\n".join(f"- {part}" for part in summary_parts)
+
+    prompt = f"""You craft concise metadata for professional photo libraries.
+
+Use the info below plus the attached image to output STRICT JSON with exactly these keys:
+{{"title": "...", "description": "...", "keywords": "..."}}
+
+Rules:
+- title <= 60 chars, objective, no sensational language.
+- description <= 200 chars, mention key visual elements/lighting without guessing hidden context.
+- keywords: lowercase comma-separated list (<=12 unique items), no hashtags.
+
+TECH SUMMARY:
+{technical_summary}
+"""
+
+    payload = {
+        "model": model,
+        "stream": False,
+        "images": [encoded_image],
+        "prompt": prompt,
+        "format": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+                "keywords": {"type": "string"},
+            },
+            "required": ["title", "description", "keywords"],
+        },
+        "options": {
+            "temperature": 0.4,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1,
+        },
+    }
+
+    def make_request():
+        response = requests.post(ollama_host_url, json=payload, timeout=120)
+        response.raise_for_status()
+        return response
+
+    try:
+        response = retry_with_backoff(make_request)
+    except Exception as exc:
+        logger.error(f"Ollama metadata generation failed for {image_path}: {exc}")
+        return None
+
+    data = response.json()
+    raw_json = data.get("response") or data.get("message") or data.get("text")
+    if not raw_json:
+        logger.error(f"Ollama returned no metadata payload for {image_path}")
+        return None
+
+    try:
+        metadata_obj = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+    except json.JSONDecodeError as exc:
+        logger.error(f"Failed to parse Ollama metadata JSON for {image_path}: {exc}")
+        return None
+
+    title = str(metadata_obj.get("title", "")).strip()
+    description = str(metadata_obj.get("description", "")).strip()
+    keywords_raw = str(metadata_obj.get("keywords", "")).lower()
+    keywords = []
+    for token in keywords_raw.split(','):
+        token = token.strip()
+        if token and token not in keywords:
+            keywords.append(token)
+        if len(keywords) >= 12:
+            break
+    keywords_str = ",".join(keywords)
+
+    result: Dict[str, str] = {}
+    if title:
+        result["title"] = title[:60]
+    if description:
+        result["description"] = description[:200]
+    if keywords_str:
+        result["keywords"] = keywords_str
+    return result or None
+
+
 def resolve_metric_model_name(metric_key: str, args) -> Optional[str]:
     metric_key = metric_key.lower()
     if metric_key == "clipiqa_z":
@@ -466,15 +580,37 @@ class PyIqaScorer:
 class PyiqaManager:
     """Lazily instantiate and reuse PyIQA scorers for multiple metrics."""
 
-    def __init__(self, device: Optional[str], scale_factor: Optional[float],
-                 shift_overrides: Optional[Dict[str, float]] = None):
+    def __init__(
+        self,
+        device: Optional[str],
+        scale_factor: Optional[float],
+        shift_overrides: Optional[Dict[str, float]] = None,
+        max_cached_models: int = 1,
+    ):
         self.device = device
         self.scale_factor = scale_factor
         self.shift_overrides = {k.lower(): v for k, v in (shift_overrides or {}).items()}
+        self.max_cached_models = max(1, int(max_cached_models))
         self.scorers: Dict[str, PyIqaScorer] = {}
+        self.scorer_usage: List[str] = []
+
+    def _mark_used(self, model_name: str):
+        if model_name in self.scorer_usage:
+            self.scorer_usage.remove(model_name)
+        self.scorer_usage.append(model_name)
+
+    def _evict_if_needed(self):
+        while len(self.scorers) >= self.max_cached_models:
+            oldest = self.scorer_usage.pop(0)
+            scorer = self.scorers.pop(oldest, None)
+            if scorer:
+                del scorer
+            if torch is not None and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def get_scorer(self, model_name: str) -> PyIqaScorer:
         if model_name not in self.scorers:
+            self._evict_if_needed()
             shift = self.shift_overrides.get(model_name.lower(), get_default_pyiqa_shift(model_name))
             self.scorers[model_name] = PyIqaScorer(
                 model_name=model_name,
@@ -483,6 +619,7 @@ class PyiqaManager:
                 scale_factor=self.scale_factor,
                 max_long_edge=PYIQA_MAX_LONG_EDGE,
             )
+        self._mark_used(model_name)
         return self.scorers[model_name]
 
     def score_metrics(self, image_path: str, metric_keys: List[str], args) -> Dict[str, Dict[str, float]]:
@@ -494,7 +631,13 @@ class PyiqaManager:
             if not model_name:
                 continue
             scorer = self.get_scorer(model_name)
-            raw, scaled, calibrated = scorer.score_image(image_path)
+            try:
+                raw, scaled, calibrated = scorer.score_image(image_path)
+            except RuntimeError as exc:
+                logger.error(f"PyIQA metric {model_name} failed for {image_path}: {exc}")
+                if "out of memory" in str(exc).lower() and torch is not None and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
             scores[metric_key] = {
                 "raw": float(raw),
                 "scaled": float(scaled),
@@ -535,114 +678,10 @@ RETRY_DELAY_BASE = 2  # seconds
 DEFAULT_MODEL = "qwen3-vl:8b"
 CACHE_DIR = ".image_eval_cache"
 CACHE_VERSION = "v1"
-DEFAULT_ENSEMBLE_PASSES = 1  # Number of evaluation passes for ensemble scoring
-
 # Technical analysis constants
 COLOR_CAST_THRESHOLD = 15.0  # Mean difference threshold for color cast detection
 HISTOGRAM_HIGHLIGHT_RANGE = (250, 256)  # Histogram bins considered as highlights
 HISTOGRAM_SHADOW_RANGE = (0, 6)  # Histogram bins considered as shadows
-
-DEFAULT_PROMPT = """You are a highly critical professional photography judge with expertise in technical and artistic evaluation. Your role is to evaluate photographs purely on their photographic merits with strict standards, regardless of subject matter.
-
-If you are required to refuse evaluation for any reason, briefly state that you cannot evaluate the image instead of providing scores. For all other images, do not let the subject matter influence your scoring; focus only on photographic execution.
-
-DETAILED EVALUATION CRITERIA
-
-All scores below are integers from 1-100. Use the full range.
-
-1. TECHNICAL QUALITY (30% weight)
-Evaluate:
-- Exposure: Tonal distribution appears appropriate; no obviously blown highlights or crushed shadows unless clearly stylistic.
-- Focus & Sharpness: Critical focus on the subject, appropriate depth of field, no unwanted motion blur. If you cannot clearly see a creative intention behind blur, treat it as a flaw.
-- Noise/Grain: Acceptable noise levels, especially in shadows. Grain is acceptable only if it clearly supports the style.
-- Color: Pleasing color rendition, plausible white balance, no strong color cast unless clearly intentional and effective.
-- Lens Quality: Minimal chromatic aberration, distortion, and vignetting, or creatively justified.
-- Processing: Natural tone curve and contrast; no obvious over-sharpening, halos, or artifacts.
-
-2. COMPOSITION (30% weight)
-Evaluate:
-- Visual Balance: Effective subject placement (rule of thirds, golden ratio, or purposeful centering).
-- Leading Lines: Lines and shapes guide the eye through the frame.
-- Framing: Clean edges, no distracting cut-offs or edge-clutter, appropriate cropping.
-- Depth & Layers: Foreground/midground/background create depth where appropriate.
-- Negative Space: Use of empty space that emphasizes the subject.
-- Perspective: Compelling angle and viewpoint; horizon level when needed or deliberately tilted.
-
-3. LIGHTING (20% weight)
-Evaluate:
-- Quality: Soft or hard light used appropriately for the subject; pleasant shadow quality.
-- Direction: Front/side/back lighting chosen deliberately to shape the subject.
-- Dynamic Range: Sufficient detail retained in important highlights and shadows.
-- Color Temperature: Warmth/coolness supports the mood.
-- Contrast: Good tonal separation between key elements.
-
-4. CREATIVITY & IMPACT (20% weight)
-Evaluate:
-- Unique Perspective: Fresh or interesting viewpoint, not a cliche angle.
-- Emotional Impact: Conveys feeling or story, even subtly.
-- Artistic Vision: Clear intent and cohesive style.
-- Originality: Stands out within its genre or subject type.
-- Moment: For action or candid scenes, quality of the captured moment.
-
-IMPORTANT - SCORING FRAMEWORK (USE 1-100)
-
-Calibrate scores based on absolute quality, not relative to other images in the same batch:
-- 95-100: Near-perfect, museum/gallery-level, iconic imagery (extremely rare: ~1 in 10,000).
-- 90-94: Award-winning excellence, top competition material (top ~1%).
-- 85-89: Outstanding professional work, competition finalist quality (top ~5%).
-- 80-84: Excellent professional quality, strong technique and vision (top ~10%).
-- 75-79: Very good work, advanced skill level (top ~20%).
-- 70-74: Solid, competent professional/serious amateur work (top ~30%).
-- 65-69: Above average, decent technical execution.
-- 60-64: Average competent photography.
-- 55-59: Below average, noticeable issues.
-- 50-54: Mediocre, multiple problems.
-- 40-49: Poor quality, significant technical failures.
-- 30-39: Very poor, severe problems.
-- 20-29: Barely usable.
-- 1-19: Fundamentally failed.
-
-CALIBRATION GUIDE
-
-Use these as anchors:
-- Would win a major international photography competition: typically 88-95.
-- Could be published in National Geographic / top-tier magazine: typically 85-92.
-- Shows professional skill but not groundbreaking: typically 75-84.
-- Technically sound but uninspired: typically 65-74.
-- Typical amateur snapshot without care: typically 50-64.
-- Major technical problems: usually below 50.
-
-Assume most random user-submitted photos fall in the 45-65 overall range. Scores above 80 are uncommon; above 90 are extremely rare. Do not cluster everything in 75-85.
-
-High-end anchor: Award 90+ when the image is technically flawless, beautifully lit, and über compelling; explicitly state which attributes (sharpness, lighting control, composition) justify such a grade rather than letting minor clipping concerns dominate the score, and treat small warnings (<10% clipping or sharpness >40) as advisory unless they severely impair quality.
-
-OVERALL SCORE
-
-Compute the overall score as a weighted combination:
-- technical_score: 30%
-- composition_score: 30%
-- lighting_score: 20%
-- creativity_score: 20%
-
-Use the formula:
-overall_score = round(0.3*technical_score + 0.3*composition_score + 0.2*lighting_score + 0.2*creativity_score)
-
-OUTPUT FORMAT (STRICT)
-
-Return only a single valid JSON object, with exactly these fields and no others. Do not include any explanation, commentary, or markdown code fences.
-
-Field requirements:
-- technical_score: integer 1-100
-- composition_score: integer 1-100
-- lighting_score: integer 1-100
-- creativity_score: integer 1-100
-- overall_score: integer 1-100 (using the weighted formula above)
-- title: concise descriptive title, maximum 60 characters
-- description: image description, maximum 200 characters, objective and free of speculation about unseen context
-- keywords: comma-separated list of up to 12 relevant English keywords or short phrases, all lowercase, no hashtags, no quotes, no duplicates
-
-Example format (structure only; values are illustrative):
-{"technical_score": 55, "composition_score": 62, "lighting_score": 58, "creativity_score": 60, "overall_score": 58, "title": "sunset over mountains", "description": "Decent sunset composition with strong colors but slightly overexposed highlights and soft detail in the foreground.", "keywords": "sunset, mountains, landscape, golden hour, clouds, peaks, nature, scenic, dramatic sky, outdoor, wilderness"}"""
 
 
 def _extract_pil_exif_metadata(image_path: str) -> Dict[str, Union[str, int, None]]:
@@ -826,16 +865,6 @@ def open_image_for_analysis(image_path: str):
     else:
         with Image.open(image_path) as img:
             yield img
-
-
-def load_prompt_from_file(prompt_file: str) -> str:
-    """Load custom prompt from file."""
-    try:
-        with open(prompt_file, 'r', encoding='utf-8') as f:
-            return f.read().strip()
-    except Exception as e:
-        logger.error(f"Failed to load prompt from {prompt_file}: {e}")
-        sys.exit(1)
 
 
 def validate_image(image_path: str) -> bool:
@@ -1556,101 +1585,6 @@ def compute_post_process_potential(technical_metrics: Dict, context: str = "stoc
     return post_score
 
 
-def create_enhanced_prompt(base_prompt: str, exif_data: Dict, technical_metrics: Dict) -> str:
-    """Enhance prompt with technical context from image analysis, including context awareness."""
-    context_parts = []
-    
-    # Add image context classification
-    image_context = technical_metrics.get('context', 'stock_product')
-    context_profile_name = technical_metrics.get('context_profile', 'Stock/Product Photography')
-    context_parts.append(f"IMAGE CONTEXT: {context_profile_name}")
-    
-    profile = get_profile(image_context)
-    context_parts.append(f"Expected brightness: {profile['brightness_range'][0]}-{profile['brightness_range'][1]}")
-    context_parts.append(f"Sharpness thresholds: critical<{profile['sharpness_crit']}, soft<{profile['sharpness_soft']}")
-    context_parts.append(f"Clipping tolerance: warn>{profile['clip_warn']}%, penalty>{profile['clip_penalty_mid']}%")
-    context_parts.append(f"Color cast sensitivity: {profile['color_cast_penalty']} point penalty if detected")
-    
-    # Add EXIF context
-    if exif_data.get('iso'):
-        iso_val = exif_data['iso']
-        if isinstance(iso_val, str):
-            context_parts.append(f"ISO: {iso_val}")
-        elif iso_val > 3200:
-            context_parts.append(f"High ISO ({iso_val}) - check for noise")
-        elif iso_val > 800:
-            context_parts.append(f"Moderate ISO ({iso_val})")
-        else:
-            context_parts.append(f"ISO: {iso_val}")
-    
-    if exif_data.get('aperture'):
-        context_parts.append(f"Aperture: {exif_data['aperture']}")
-    
-    if exif_data.get('shutter_speed'):
-        context_parts.append(f"Shutter: {exif_data['shutter_speed']}")
-    
-    # Add technical analysis context
-    brightness = technical_metrics.get('brightness')
-    if brightness is not None:
-        context_parts.append(f"Measured brightness: {brightness:.0f}")
-    
-    highlights = technical_metrics.get('histogram_clipping_highlights')
-    if highlights is not None:
-        context_parts.append(f"Highlight clipping: {highlights:.1f}%")
-
-    shadows = technical_metrics.get('histogram_clipping_shadows')
-    if shadows is not None:
-        context_parts.append(f"Shadow clipping: {shadows:.1f}%")
-
-    sharpness = technical_metrics.get('sharpness')
-    if sharpness is not None:
-        context_parts.append(f"Sharpness metric: {sharpness:.1f}")
-
-    noise_score = technical_metrics.get('noise_score', 0)
-    if noise_score > 0:
-        context_parts.append(f"Noise score: {noise_score:.1f}/100")
-
-    color_cast = technical_metrics.get('color_cast')
-    if color_cast and color_cast != 'neutral':
-        context_parts.append(f"Color cast: {color_cast}")
-
-    for warning in technical_metrics.get('warnings', []):
-        context_parts.append(f"Warning: {warning}")
-    
-    # Build enhanced prompt
-    if context_parts:
-        technical_context = "\n\nTECHNICAL CONTEXT:\n" + "\n".join(f"- {part}" for part in context_parts)
-        technical_context += "\n\nConsider these technical factors and the image context in your evaluation. "
-        technical_context += f"Note that this image is classified as '{context_profile_name}', which may have different "
-        technical_context += "expectations for technical attributes like clipping, sharpness, and noise tolerance."
-        return base_prompt + technical_context
-    
-    return base_prompt
-
-
-def build_pyiqa_metadata(raw_score: float, calibrated_score: float, model_name: str, score_shift: float = 0.0) -> Dict[str, Any]:
-    """Build metadata entries for PyIQA-based scoring."""
-    overall_score = max(1, min(100, int(round(calibrated_score + score_shift))))
-    metadata: Dict[str, Any] = {
-        'overall_score': str(overall_score),
-        'technical_score': '',
-        'composition_score': str(overall_score),
-        'lighting_score': str(overall_score),
-        'creativity_score': str(overall_score),
-        'score': str(overall_score),
-        'title': f"PyIQA {model_name} score",
-        'description': f"PyIQA {model_name} raw {raw_score:.4f} (scaled {calibrated_score:.2f}, calibrated {overall_score}/100)",
-        'keywords': f"pyiqa,{model_name},automated score",
-        'pyiqa_raw_score': f"{raw_score:.4f}",
-        'pyiqa_scaled_score': f"{calibrated_score:.4f}",
-        'pyiqa_model': model_name,
-        'technical_metrics': {},
-        'technical_warnings': [],
-        'post_process_potential': overall_score,
-    }
-    return metadata
-
-
 def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str,
                                context_override: Optional[str], skip_context_classification: bool
                                ) -> Tuple[str, Dict, Dict, List[str]]:
@@ -2044,240 +1978,6 @@ def collect_images(folder_path: str, file_types: Optional[List[str]] = None, ski
     return image_paths
 
 
-def make_single_evaluation(image_path: str, encoded_image: str, ollama_host_url: str, model: str, 
-                          prompt: str, headers: Dict) -> Optional[Dict]:
-    """Make a single evaluation API call."""
-    payload = {
-        "model": model,
-        "stream": False,
-        "images": [encoded_image],
-        "prompt": prompt,
-        "format": {
-            "type": "object",
-            "properties": {
-                "technical_score": {"type": ["integer", "string"]},
-                "composition_score": {"type": ["integer", "string"]},
-                "lighting_score": {"type": ["integer", "string"]},
-                "creativity_score": {"type": ["integer", "string"]},
-                "overall_score": {"type": ["integer", "string"]},
-                "title": {"type": "string"},
-                "description": {"type": "string"},
-                "keywords": {"type": "string"}
-            },
-            "required": [
-                "technical_score",
-                "composition_score",
-                "lighting_score",
-                "creativity_score",
-                "overall_score",
-                "title",
-                "description",
-                "keywords"
-            ]
-        },
-        "options": {
-            "temperature": 0.3,
-            "top_p": 0.9,
-            "repeat_penalty": 1.1
-        }
-    }
-
-    def make_request():
-        response = requests.post(ollama_host_url, json=payload, headers=headers, timeout=120)
-        response.raise_for_status()
-        return response
-    
-    try:
-        response = retry_with_backoff(make_request)
-    except Exception as e:
-        logger.error(f"Request failed after retries for {image_path}: {e}")
-        return None
-    
-    if response and response.status_code == 200:
-        response_data = response.json()
-        metadata_text = response_data.get('response') or response_data.get('thinking', '')
-        
-        if not metadata_text:
-            logger.error(f"No response or thinking field found for {image_path}")
-            return None
-        
-        # Check for content policy violations
-        metadata_lower = metadata_text.lower()
-        if 'violates content policies' in metadata_lower or 'cannot proceed' in metadata_lower:
-            logger.warning(f"Model refused due to content policy: {image_path}")
-            return None
-        
-        try:
-            response_metadata = json.loads(metadata_text)
-            
-            # Validate all score fields
-            score_fields = ['technical_score', 'composition_score', 'lighting_score', 'creativity_score', 'overall_score']
-            for field in score_fields:
-                if field in response_metadata:
-                    validated = validate_score(response_metadata[field])
-                    if validated is None:
-                        logger.warning(f"Invalid {field} for {image_path}")
-                        return None
-                    response_metadata[field] = str(validated)
-                else:
-                    logger.warning(f"Missing {field} in response for {image_path}")
-                    return None
-            
-            return response_metadata
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON for {image_path}: {e}")
-            return None
-    
-    return None
-
-
-def ensemble_evaluate(image_path: str, encoded_image: str, ollama_host_url: str, model: str,
-                     prompt: str, headers: Dict, num_passes: int = 3) -> Optional[Dict]:
-    """Perform ensemble evaluation with multiple passes and aggregate results."""
-    if num_passes == 1:
-        return make_single_evaluation(image_path, encoded_image, ollama_host_url, model, prompt, headers)
-    
-    logger.info(f"Performing {num_passes}-pass ensemble evaluation for {image_path}")
-    evaluations = []
-    
-    for pass_num in range(num_passes):
-        logger.debug(f"Ensemble pass {pass_num + 1}/{num_passes} for {image_path}")
-        result = make_single_evaluation(image_path, encoded_image, ollama_host_url, model, prompt, headers)
-        if result:
-            evaluations.append(result)
-        time.sleep(0.5)  # Small delay between passes
-    
-    if not evaluations:
-        logger.error(f"All ensemble passes failed for {image_path}")
-        return None
-    
-    # Aggregate scores (median for robustness)
-    score_fields = ['technical_score', 'composition_score', 'lighting_score', 'creativity_score', 'overall_score']
-    aggregated = {}
-    
-    for field in score_fields:
-        scores = [int(e[field]) for e in evaluations if field in e]
-        if scores:
-            # Use median for robust aggregation
-            scores.sort()
-            median_idx = len(scores) // 2
-            aggregated[field] = str(scores[median_idx] if len(scores) % 2 == 1 else (scores[median_idx - 1] + scores[median_idx]) // 2)
-    
-    # Use first evaluation's text fields
-    aggregated['title'] = evaluations[0].get('title', '')
-    aggregated['description'] = evaluations[0].get('description', '')
-    aggregated['keywords'] = evaluations[0].get('keywords', '')
-    
-    # Calculate score variance for logging
-    overall_scores = [int(e['overall_score']) for e in evaluations if 'overall_score' in e]
-    if len(overall_scores) > 1:
-        variance = sum((s - sum(overall_scores)/len(overall_scores))**2 for s in overall_scores) / len(overall_scores)
-        std_dev = variance ** 0.5
-        logger.info(f"Ensemble std dev for {image_path}: {std_dev:.2f} (scores: {overall_scores})")
-    
-    return aggregated
-
-
-def process_single_image(image_path: str, ollama_host_url: str, model: str, prompt: str, 
-                        dry_run: bool = False, backup_dir: Optional[str] = None, verify: bool = False,
-                        cache_dir: Optional[str] = None, ensemble_passes: int = 1,
-                        context_override: Optional[str] = None, skip_context_classification: bool = False,
-                        scoring_engine: str = 'ollama') -> Tuple[str, Optional[Dict]]:
-    """Process a single image using the selected scoring engine and return result."""
-    logger.debug(f"Processing image: {image_path}")
-    headers = {'Content-Type': 'application/json'}
-    
-    # Dry run mode - just return dummy data
-    if dry_run:
-        logger.debug(f"Dry run - skipping processing for {image_path}")
-        return (image_path, {'score': '0', 'title': '[DRY RUN]', 'description': 'Would process this image', 'keywords': 'dry-run'})
-    
-    # Check cache first
-    cached_metadata = load_from_cache(image_path, model, cache_dir) if cache_dir else None
-    if cached_metadata:
-        logger.info(f"Using cached result for {image_path}")
-        # Still embed metadata even if cached
-        try:
-            embed_metadata(image_path, cached_metadata, backup_dir, verify)
-            return (image_path, cached_metadata)
-        except Exception as e:
-            logger.error(f"Error embedding cached metadata for {image_path}: {e}")
-            return (image_path, None)
-    
-    # Encode image once for all operations (only needed for Ollama backend)
-    encoded_image = None
-    if scoring_engine == 'ollama':
-        with open(image_path, 'rb') as image_file:
-            encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
-    
-    technical_metrics: Dict[str, Any] = {}
-    technical_warnings: List[str] = []
-    exif_data: Dict = {}
-    
-    if scoring_engine == 'ollama':
-        _, exif_data, technical_metrics, technical_warnings = analyze_image_with_context(
-            image_path, ollama_host_url, model, context_override, skip_context_classification
-        )
-    
-    # Step 3: Enhance prompt with technical context (only needed for Ollama backend)
-    enhanced_prompt = prompt
-    if scoring_engine == 'ollama':
-        enhanced_prompt = create_enhanced_prompt(prompt, exif_data, technical_metrics)
-
-    if scoring_engine == 'pyiqa':
-        logger.error("Direct PyIQA single-image evaluation is disabled. Use the batch PyIQA pipeline.")
-        return (image_path, None)
-
-    # Step 4: Retry logic for malformed responses (Ollama backend)
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        try:
-            # Perform ensemble evaluation
-            response_metadata = ensemble_evaluate(image_path, encoded_image, ollama_host_url, 
-                                                 model, enhanced_prompt, headers, ensemble_passes)
-            
-            if response_metadata is None:
-                if attempt < max_attempts - 1:
-                    logger.info(f"Retrying {image_path} (attempt {attempt + 2}/{max_attempts})")
-                    time.sleep(2)
-                    continue
-                return (image_path, None)
-
-            # Add 'score' field for backwards compatibility (use overall_score)
-            if 'overall_score' in response_metadata:
-                response_metadata['score'] = response_metadata['overall_score']
-
-            response_metadata['technical_metrics'] = technical_metrics
-            response_metadata['technical_warnings'] = technical_warnings
-            response_metadata['post_process_potential'] = technical_metrics.get('post_process_potential')
-
-            # Save to cache
-            if cache_dir:
-                save_to_cache(image_path, model, response_metadata, cache_dir)
-                logger.debug(f"Saved response to cache for {image_path}")
-
-            # Embed metadata
-            try:
-                embed_metadata(image_path, response_metadata, backup_dir, verify)
-                logger.info(f"Successfully processed {image_path} with score {response_metadata.get('score')}")
-                return (image_path, response_metadata)
-            except Exception as e:
-                logger.error(f"Error embedding metadata for {image_path}: {e}")
-                return (image_path, None)
-                
-        except Exception as e:
-            logger.error(f"Unexpected error processing {image_path}: {e}")
-            if attempt < max_attempts - 1:
-                logger.info(f"Retrying {image_path} (attempt {attempt + 2}/{max_attempts})")
-                time.sleep(2)
-                continue
-            return (image_path, None)
-    
-    # Should never reach here
-    return (image_path, None)
-
-
 def _handle_cached_or_dry_run(image_path: str, cache_dir: Optional[str], model: str,
                               backup_dir: Optional[str], verify: bool,
                               dry_run: bool) -> Optional[Tuple[str, Optional[Dict]]]:
@@ -2303,7 +2003,8 @@ def process_images_with_pyiqa(
     image_paths: List[str],
     cache_model_label: str,
     classification_model: str,
-    ollama_host_url: str,
+    context_host_url: str,
+    metadata_host_url: Optional[str],
     cache_dir: Optional[str],
     backup_dir: Optional[str],
     verify: bool,
@@ -2312,7 +2013,8 @@ def process_images_with_pyiqa(
     dry_run: bool,
     context_override: Optional[str],
     skip_context_classification: bool,
-    args
+    args,
+    use_ollama_metadata: bool = False
 ) -> List[Tuple[str, Optional[Dict]]]:
     """Profile-aware PyIQA pipeline with context detection and rule weighting."""
     results: List[Tuple[str, Optional[Dict]]] = []
@@ -2338,7 +2040,7 @@ def process_images_with_pyiqa(
             try:
                 image_context, _, technical_metrics, technical_warnings = analyze_image_with_context(
                     image_path,
-                    ollama_host_url,
+                    context_host_url,
                     classification_model,
                     context_override,
                     skip_context_classification
@@ -2388,6 +2090,19 @@ def process_images_with_pyiqa(
                 contributions=contributions,
             )
 
+            if use_ollama_metadata and metadata_host_url:
+                llm_fields = generate_ollama_metadata(
+                    image_path=image_path,
+                    ollama_host_url=metadata_host_url,
+                    model=classification_model,
+                    profile_key=profile_key,
+                    final_score=final_score,
+                    technical_metrics=technical_metrics,
+                    technical_warnings=technical_warnings,
+                )
+                if llm_fields:
+                    metadata.update(llm_fields)
+
             if cache_dir:
                 save_to_cache(image_path, cache_model_label, metadata, cache_dir)
 
@@ -2416,79 +2131,45 @@ def process_images_with_pyiqa(
     return results
 
 
-def process_images_in_folder(folder_path: str, ollama_host_url: str, max_workers: int = 4, 
-                            model: str = DEFAULT_MODEL, prompt: str = DEFAULT_PROMPT,
+def process_images_in_folder(folder_path: str, ollama_host_url: str, context_host_url: Optional[str] = None,
+                            model: str = DEFAULT_MODEL,
                             file_types: Optional[List[str]] = None, skip_existing: bool = True,
                             dry_run: bool = False, min_score: Optional[int] = None,
                             backup_dir: Optional[str] = None, verify: bool = False,
-                            cache_dir: Optional[str] = None, ensemble_passes: int = 1,
+                            cache_dir: Optional[str] = None,
                             context_override: Optional[str] = None,
                             skip_context_classification: bool = False,
-                            scoring_engine: str = 'pyiqa',
                             pyiqa_manager: Optional[PyiqaManager] = None,
                             pyiqa_cache_label: Optional[str] = None,
                             cli_args: Optional[argparse.Namespace] = None,
-                            pyiqa_batch_size: int = 4) -> List[Tuple[str, Optional[Dict]]]:
-    """Process images with parallel execution and progress bar."""
-    # Collect all images to process
+                            use_ollama_metadata: bool = False) -> List[Tuple[str, Optional[Dict]]]:
+    """Process images end-to-end using the PyIQA composite pipeline."""
+    if pyiqa_manager is None:
+        raise ValueError("PyIQA manager must be initialized before processing images.")
+
     image_paths = collect_images(folder_path, file_types=file_types, skip_existing=skip_existing)
-    
     if not image_paths:
         logger.warning("No images found to process")
         return []
-    
-    results: List[Tuple[str, Optional[Dict]]] = []
 
-    # Use PyIQA batch processing if that engine is selected
-    if scoring_engine == 'pyiqa' and pyiqa_manager is not None:
-        cache_label = pyiqa_cache_label or "pyiqa_profiles"
-        return process_images_with_pyiqa(
-            image_paths=image_paths,
-            cache_model_label=cache_label,
-            classification_model=model,
-            ollama_host_url=ollama_host_url,
-            cache_dir=cache_dir,
-            backup_dir=backup_dir,
-            verify=verify,
-            pyiqa_manager=pyiqa_manager,
-            min_score=min_score,
-            dry_run=dry_run,
-            context_override=context_override,
-            skip_context_classification=skip_context_classification,
-            args=cli_args
-        )
-
-    # Ollama processing with ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                process_single_image, image_path, ollama_host_url, model, prompt,
-                dry_run, backup_dir, verify, cache_dir, ensemble_passes,
-                context_override, skip_context_classification, scoring_engine
-            ): image_path
-            for image_path in image_paths
-        }
-        
-        with tqdm(total=len(image_paths), desc="Processing images", unit="img") as pbar:
-            for future in as_completed(futures):
-                image_path = futures[future]
-                try:
-                    result = future.result()
-                    if min_score is not None and result[1] is not None:
-                        try:
-                            score = int(validate_score(result[1].get('score', '0')) or 0)
-                            if score < min_score:
-                                pbar.update(1)
-                                continue
-                        except (ValueError, TypeError):
-                            pass
-                    results.append(result)
-                except Exception as e:
-                    logger.error(f"Error processing {image_path}: {e}")
-                    results.append((image_path, None))
-                pbar.update(1)
-    
-    return results
+    cache_label = pyiqa_cache_label or "pyiqa_profiles"
+    return process_images_with_pyiqa(
+        image_paths=image_paths,
+        cache_model_label=cache_label,
+        classification_model=model,
+        context_host_url=context_host_url or ollama_host_url,
+        metadata_host_url=ollama_host_url if use_ollama_metadata else None,
+        cache_dir=cache_dir,
+        backup_dir=backup_dir,
+        verify=verify,
+        pyiqa_manager=pyiqa_manager,
+        min_score=min_score,
+        dry_run=dry_run,
+        context_override=context_override,
+        skip_context_classification=skip_context_classification,
+        args=cli_args,
+        use_ollama_metadata=use_ollama_metadata
+    )
 
 
 def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: str):
@@ -2896,20 +2577,21 @@ if __name__ == "__main__":
     )
     process_parser.add_argument('--csv', type=str, default=None, help='Path to save CSV report (default: auto-generated)')
     process_parser.add_argument('--model', type=str, default=DEFAULT_MODEL,
-                               help=f'Model identifier (LLM name or custom label). Default: {DEFAULT_MODEL}')
-    process_parser.add_argument('--score-engine', choices=['ollama', 'pyiqa'], default='pyiqa',
-                               help='Choose between Ollama (LLM) or PyIQA scoring (default: PyIQA)')
-    process_parser.add_argument('--pyiqa-model', type=str, default='clipiqa+_vitl14_512',
-                               help='PyIQA metric name to use when --score-engine pyiqa (default: clipiqa+_vitl14_512)')
+                               help=f'Ollama model used for context classification and optional metadata. Default: {DEFAULT_MODEL}')
+    process_parser.add_argument('--pyiqa-model', type=str, default=DEFAULT_CLIPIQ_MODEL,
+                               help=f'Base PyIQA metric to use for clipiqa_z (default: {DEFAULT_CLIPIQ_MODEL})')
     process_parser.add_argument('--pyiqa-device', type=str, default=None,
                                help='Device for PyIQA (e.g., cuda:0 or cpu). Defaults to CUDA if available.')
     process_parser.add_argument('--pyiqa-score-shift', type=float, default=None,
                                help='Additive adjustment (0-100 scale) applied to PyIQA scores (default: model-specific)')
     process_parser.add_argument('--pyiqa-scale-factor', type=float, default=None,
                                help='Optional multiplier applied to PyIQA raw scores before calibration (auto-detect if omitted)')
-    process_parser.add_argument('--pyiqa-batch-size', type=int, default=4,
-                               help='Images per batch for PyIQA evaluation (default: 4)')
-    process_parser.add_argument('--prompt-file', type=str, default=None, help='Path to custom prompt file (overrides default prompt)')
+    process_parser.add_argument('--pyiqa-max-models', type=int, default=1,
+                               help='Maximum PyIQA models kept in GPU memory at once (default: 1, lower = less VRAM)')
+    process_parser.add_argument('--context-host-url', type=str, default=None,
+                               help='Override endpoint for context classification (default: same as Ollama host)')
+    process_parser.add_argument('--ollama-metadata', action='store_true',
+                               help='Use Ollama to generate titles/descriptions/keywords after scoring')
     process_parser.add_argument('--skip-existing', action='store_true', default=True, help='Skip images with existing metadata (default: True)')
     process_parser.add_argument('--no-skip-existing', action='store_false', dest='skip_existing', help='Process all images, even with existing metadata')
     process_parser.add_argument('--min-score', type=int, default=None, help='Only save results with score >= this value')
@@ -2922,8 +2604,6 @@ if __name__ == "__main__":
     process_parser.add_argument('--cache', action='store_true', help='Enable API response caching')
     process_parser.add_argument('--cache-dir', type=str, default=CACHE_DIR, help=f'Cache directory (default: {CACHE_DIR})')
     process_parser.add_argument('--clear-cache', action='store_true', help='Clear cache before processing')
-    process_parser.add_argument('--ensemble', type=int, default=DEFAULT_ENSEMBLE_PASSES, 
-                              help=f'Number of evaluation passes for ensemble scoring (default: {DEFAULT_ENSEMBLE_PASSES})')
     process_parser.add_argument('--context', type=str, default=None,
                               help='Manual context override (e.g., landscape, portrait_neutral, stock_product)')
     process_parser.add_argument('--no-context-classification', action='store_true',
@@ -2975,6 +2655,8 @@ if __name__ == "__main__":
         if not args.ollama_host_url:
             args.ollama_host_url = DEFAULT_OLLAMA_URL
             host_defaulted = True
+        if not args.context_host_url:
+            args.context_host_url = args.ollama_host_url
         
         if folder_defaulted:
             print(f"Using default image folder: {args.folder_path}")
@@ -3027,29 +2709,23 @@ if __name__ == "__main__":
         logger.error(f"No image files found in the directory '{args.folder_path}' or its subdirectories.")
         sys.exit(1)
 
-    if args.score_engine == 'pyiqa':
-        if not PYIQA_AVAILABLE:
-            logger.error("PyIQA backend requested but dependencies are missing. Install torch and pyiqa.")
-            sys.exit(1)
-        shift_overrides = {}
-        if args.pyiqa_score_shift is not None:
-            shift_overrides[args.pyiqa_model.lower()] = args.pyiqa_score_shift
-        try:
-            pyiqa_manager = PyiqaManager(
-                device=args.pyiqa_device,
-                scale_factor=args.pyiqa_scale_factor,
-                shift_overrides=shift_overrides
-            )
-            pyiqa_cache_label = f"pyiqa_profiles_{args.pyiqa_model.lower()}"
-        except Exception as e:
-            logger.error(f"Failed to initialize PyIQA manager: {e}")
-            sys.exit(1)
-
-    # Load custom prompt if specified
-    prompt = DEFAULT_PROMPT
-    if args.prompt_file:
-        prompt = load_prompt_from_file(args.prompt_file)
-        print(f"Loaded custom prompt from: {args.prompt_file}")
+    if not PYIQA_AVAILABLE:
+        logger.error("PyIQA backend is required but torch/pyiqa are missing.")
+        sys.exit(1)
+    shift_overrides: Dict[str, float] = {}
+    if args.pyiqa_score_shift is not None:
+        shift_overrides[args.pyiqa_model.lower()] = args.pyiqa_score_shift
+    try:
+        pyiqa_manager = PyiqaManager(
+            device=args.pyiqa_device,
+            scale_factor=args.pyiqa_scale_factor,
+            shift_overrides=shift_overrides,
+            max_cached_models=args.pyiqa_max_models,
+        )
+        pyiqa_cache_label = f"pyiqa_profiles_{args.pyiqa_model.lower()}"
+    except Exception as e:
+        logger.error(f"Failed to initialize PyIQA manager: {e}")
+        sys.exit(1)
     
     # Parse file types if specified
     file_types = None
@@ -3057,21 +2733,21 @@ if __name__ == "__main__":
         file_types = [ext.strip() for ext in args.file_types.split(',')]
         print(f"Filtering for file types: {', '.join(file_types)}")
     print(f"\nProcessing images from: {Style.BRIGHT}{args.folder_path}{Style.RESET_ALL}")
-    print(f"Model: {args.model}")
-    print(f"Scoring engine: {args.score_engine}")
-    if args.score_engine == 'pyiqa':
-        print(f"PyIQA model: {args.pyiqa_model}")
-        print(f"PyIQA device: {pyiqa_manager.device if pyiqa_manager else args.pyiqa_device}")
-        print(f"PyIQA batch size: {args.pyiqa_batch_size}")
-        if args.pyiqa_scale_factor:
-            print(f"PyIQA scale factor: {args.pyiqa_scale_factor}")
-        if args.pyiqa_score_shift is not None:
-            print(f"PyIQA custom score shift: {args.pyiqa_score_shift:+.2f}")
-        print("PyIQA composite models: clipiqa_z, laion_aes_z, musiq_ava_z, musiq_paq2piq_z, maniqa_z")
+    print(f"Ollama model: {args.model}")
+    if args.context_host_url and args.context_host_url != args.ollama_host_url:
+        print(f"Context classifier endpoint: {args.context_host_url}")
+    if args.ollama_metadata:
+        print("Ollama metadata generation: enabled")
+    print(f"PyIQA model (clipiqa_z): {args.pyiqa_model}")
+    print(f"PyIQA device: {pyiqa_manager.device if pyiqa_manager else args.pyiqa_device}")
+    print(f"PyIQA max cached models: {args.pyiqa_max_models}")
+    if args.pyiqa_scale_factor:
+        print(f"PyIQA scale factor: {args.pyiqa_scale_factor}")
+    if args.pyiqa_score_shift is not None:
+        print(f"PyIQA custom score shift: {args.pyiqa_score_shift:+.2f}")
+    print("PyIQA composite models: clipiqa+_vitL14_512, laion_aes, musiq-ava, musiq-paq2piq, maniqa, disagreement penalty")
     print(f"Workers: {args.workers}")
     print(f"Skip existing: {args.skip_existing}")
-    if args.ensemble > 1:
-        print(f"{Fore.CYAN}Ensemble mode: {args.ensemble} evaluation passes per image{Fore.RESET}")
     if args.min_score:
         print(f"Minimum score filter: {args.min_score}")
     if args.dry_run:
@@ -3099,11 +2775,10 @@ if __name__ == "__main__":
     logger.info(f"Starting processing of images in {args.folder_path}")
     start_time = time.time()
     results = process_images_in_folder(
-        args.folder_path, 
-        args.ollama_host_url, 
-        max_workers=args.workers,
+        args.folder_path,
+        args.ollama_host_url,
+        args.context_host_url,
         model=args.model,
-        prompt=prompt,
         file_types=file_types,
         skip_existing=args.skip_existing,
         dry_run=args.dry_run,
@@ -3111,14 +2786,12 @@ if __name__ == "__main__":
         backup_dir=args.backup_dir,
         verify=args.verify,
         cache_dir=cache_dir,
-        ensemble_passes=args.ensemble,
         context_override=args.context,
         skip_context_classification=args.no_context_classification,
-        scoring_engine=args.score_engine,
         pyiqa_manager=pyiqa_manager,
         pyiqa_cache_label=pyiqa_cache_label,
         cli_args=args,
-        pyiqa_batch_size=args.pyiqa_batch_size
+        use_ollama_metadata=args.ollama_metadata
     )
     elapsed_time = time.time() - start_time
     logger.info(f"Completed processing {len(results)} images in {elapsed_time:.2f} seconds")
