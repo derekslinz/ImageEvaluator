@@ -5,7 +5,7 @@ AI-powered image quality assessment with EXIF metadata embedding.
 ## How It Works
 
 1. **Context classification (Ollama-only step)**  
-   Every image is resized to 1024 px and sent to `qwen3-vl:8b` (via Ollama or a remote endpoint) purely to decide which of the 10 photographic profiles best fits the scene (landscape, portrait_highkey, sports_action, etc.). No scoring happens here—this step just selects the profile so the right weights and penalties can be applied later.
+   Every image is resized to 1024 px and sent to `qwen3-vl:8b` (via Ollama or a remote endpoint) purely to decide which of the 10 photographic profiles best fits the scene (landscape, portrait_highkey, sports_action, etc.). This same model can optionally be reused later to rewrite titles/descriptions/keywords.
 
 2. **Profile-specific weighting**  
    Each profile stores its own weight table covering five PyIQA models:
@@ -21,13 +21,13 @@ AI-powered image quality assessment with EXIF metadata embedding.
    After the profile is known, the image is resized to 2048 px and evaluated by **all six** metrics. The calibrated scores are converted to z-scores, blended with the profile’s weights, and adjusted with technical rules (sharpness, clipping, color cast, brightness) pulled from the same profile.
 
 4. **Metadata embedding**  
-   The weighted composite score, profile name, technical metrics, and keywords are written into EXIF (JPEG/PNG via piexif, RAW/TIFF via exiftool). CSV output mirrors the embedded metadata.
+   The weighted composite score, profile name, technical metrics, and keywords are written into EXIF (JPEG/PNG via piexif, RAW/TIFF via exiftool). You can optionally let Ollama rewrite title/description/keyword fields before embedding. CSV output mirrors the embedded metadata.
 
 ## Features
 
 - **Profile-aware PyIQA pipeline**: Automatic context detection feeds 10 tailored weighting/rule sets.
 - **Multi-model fusion**: clipiqa+_vitL14_512, laion_aes, musiq-ava, maniqa, musiq-paq2piq, plus a model disagreement metric.
-- **Metadata embedding**: Composite score, profile, warnings, and keywords written directly to EXIF.
+- **Metadata embedding**: Composite score, profile, warnings, and keywords written directly to EXIF, with optional Ollama rewrites for title/description/keywords.
 - **Technical analysis**: Sharpness, noise, clipping, and color-cast metrics drive rule penalties and CSV reporting.
 - **Batch processing**: Parallel execution with resumable CSV output and optional caching.
 - **Format support**: JPEG, PNG, TIFF, RAW (NEF, DNG, CR2, ARW) with automatic backups.
@@ -49,13 +49,13 @@ python image_eval_embed.py
 # Process a specific folder
 python image_eval_embed.py process /path/to/images
 
-# Use Ollama LLM for detailed evaluation
-python image_eval_embed.py process /path/to/images --score-engine ollama
+# Generate Ollama-driven titles/descriptions/keywords
+python image_eval_embed.py process /path/to/images --ollama-metadata
 ```
 
-## Scoring Backends
+## Scoring & Metadata
 
-PyIQA is the default and recommended backend. Ollama-based scoring (full LLM critiques) still exists for legacy workflows, but the current pipeline only uses the vision LLM for context classification before running the PyIQA ensemble. If you explicitly pass `--score-engine ollama`, the older “LLM does everything” mode is used instead of the profile pipeline.
+PyIQA now performs all scoring. The vision LLM (Ollama) is used for context detection and, if `--ollama-metadata` is set, to regenerate titles/descriptions/keywords. There is no longer an Ollama-only scoring mode.
 
 ## CLI Reference
 
@@ -73,28 +73,21 @@ python image_eval_embed.py <command> [options]
 
 ### Options
 
-Most flows only need the defaults. Options related to legacy full-LLM scoring (`--score-engine ollama`, `--prompt-file`, `--ensemble`) are provided for backward compatibility.
-
-**Scoring Engine:**
-```
---score-engine {pyiqa,ollama}  Backend (default: pyiqa)
-```
+Most flows only need the defaults. Add `--ollama-metadata` if you want the vision LLM to rewrite descriptions/keywords before embedding.
 
 **PyIQA Options:**
 ```
 --pyiqa-model NAME        Metric name (default: clipiqa+_vitl14_512)
 --pyiqa-device DEVICE     cuda:0, cpu (default: auto)
---pyiqa-batch-size N      Images per batch (default: 4)
 --pyiqa-score-shift N     Score adjustment
 --pyiqa-max-models N      Max models in VRAM (default: 1)
---context-host-url URL    Alternate Ollama endpoint for context classification
 ```
 
-**Ollama Options:**
+**Ollama / Context Options:**
 ```
 --model NAME              LLM model (default: qwen3-vl:8b)
---ensemble N              Evaluation passes (default: 1)
---prompt-file FILE        Custom prompt template
+--context-host-url URL    Alternate Ollama endpoint for context classification
+--ollama-metadata         Use Ollama to rewrite title/description/keywords
 --context NAME            Manual context (e.g., landscape, portrait)
 --no-context-classification  Skip auto context detection
 ```

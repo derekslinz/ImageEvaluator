@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import io
 import json  # Import json for parsing the response
