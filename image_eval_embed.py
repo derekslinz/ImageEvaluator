@@ -1362,21 +1362,13 @@ FORBIDDEN OUTPUT:
 - No justification
 - No extra words
 
-REQUIRED OUTPUT FORMAT (MANDATORY):
+Return ONLY valid JSON, exactly like:
+{"category": "<one category from the list>"}
 
-Return ONLY this exact format:
-
-category=<one category from the allowed list>
-
-Example of correct output:
-category=macro_nature
-
-Example of invalid output:
-"The image appears to be..."
-"My answer is..."
-"macro_nature"
-"category: macro_nature"
-"category = macro_nature"
+Examples:
+{"category": "fineart_creative"}
+or
+{"category": "night_natural_light"}
 """
 
 
@@ -1469,6 +1461,8 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
     payload = {
         "model": model,
         "stream": False,
+        "format": "json",
+        "think": False,
         "images": [encoded_image],
         "prompt": IMAGE_CONTEXT_CLASSIFIER_PROMPT,
         "options": {
@@ -1493,6 +1487,7 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
     raw_response = result.get('response', '')
     context_label = raw_response.strip().lower()
     # 1) Direct "category=<label>" extraction
+    candidate = None  # Initialize before conditional assignment
     m = re.search(r'category\s*=\s*([a-z_]+)', context_label)
     if m:
         candidate = m.group(1)
@@ -1517,12 +1512,13 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
     # Handle truncated/internal variants like "wildlife_an"
     # Find exact or unique-prefix match
     matched = None
-    if candidate in allowed_labels:
-        matched = candidate
-    else:
-        matches = [lbl for lbl in allowed_labels if lbl.startswith(candidate)]
-        if len(matches) == 1:
-            matched = matches[0]
+    if candidate:
+        if candidate in allowed_labels:
+            matched = candidate
+        else:
+            matches = [lbl for lbl in allowed_labels if lbl.startswith(candidate)]
+            if len(matches) == 1:
+                matched = matches[0]
 
     if matched:
         logger.info(f"Context classification: {matched} (category=) for {image_path}")
