@@ -336,6 +336,116 @@ def build_profile_metadata(
     return metadata
 
 
+def generate_ollama_metadata(
+    image_path: str,
+    ollama_host_url: str,
+    model: str,
+    profile_key: str,
+    final_score: float,
+    technical_metrics: Dict[str, Any],
+    technical_warnings: List[str],
+) -> Optional[Dict[str, str]]:
+    """Use Ollama to refine title/description/keywords."""
+    try:
+        encoded_image = encode_image_for_classification(image_path)
+    except Exception as exc:
+        logger.error(f"Failed to encode image for metadata generation ({image_path}): {exc}")
+        return None
+
+    warnings_str = ", ".join(technical_warnings) if technical_warnings else "none"
+    summary_parts = [
+        f"profile: {profile_key}",
+        f"score: {final_score:.1f}/100",
+        f"sharpness: {technical_metrics.get('sharpness')}",
+        f"brightness: {technical_metrics.get('brightness')}",
+        f"clipping_highlights: {technical_metrics.get('histogram_clipping_highlights')}",
+        f"clipping_shadows: {technical_metrics.get('histogram_clipping_shadows')}",
+        f"noise_score: {technical_metrics.get('noise_score')}",
+        f"color_cast: {technical_metrics.get('color_cast')}",
+        f"warnings: {warnings_str}",
+    ]
+    technical_summary = "\n".join(f"- {part}" for part in summary_parts)
+
+    prompt = f"""You craft concise metadata for professional photo libraries.
+
+Use the info below plus the attached image to output STRICT JSON with exactly these keys:
+{{"title": "...", "description": "...", "keywords": "..."}}
+
+Rules:
+- title <= 60 chars, objective, no sensational language.
+- description <= 200 chars, mention key visual elements/lighting without guessing hidden context.
+- keywords: lowercase comma-separated list (<=12 unique items), no hashtags.
+
+TECH SUMMARY:
+{technical_summary}
+"""
+
+    payload = {
+        "model": model,
+        "stream": False,
+        "images": [encoded_image],
+        "prompt": prompt,
+        "format": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+                "keywords": {"type": "string"},
+            },
+            "required": ["title", "description", "keywords"],
+        },
+        "options": {
+            "temperature": 0.4,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1,
+        },
+    }
+
+    def make_request():
+        response = requests.post(ollama_host_url, json=payload, timeout=120)
+        response.raise_for_status()
+        return response
+
+    try:
+        response = retry_with_backoff(make_request)
+    except Exception as exc:
+        logger.error(f"Ollama metadata generation failed for {image_path}: {exc}")
+        return None
+
+    data = response.json()
+    raw_json = data.get("response") or data.get("message") or data.get("text")
+    if not raw_json:
+        logger.error(f"Ollama returned no metadata payload for {image_path}")
+        return None
+
+    try:
+        metadata_obj = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+    except json.JSONDecodeError as exc:
+        logger.error(f"Failed to parse Ollama metadata JSON for {image_path}: {exc}")
+        return None
+
+    title = str(metadata_obj.get("title", "")).strip()
+    description = str(metadata_obj.get("description", "")).strip()
+    keywords_raw = str(metadata_obj.get("keywords", "")).lower()
+    keywords = []
+    for token in keywords_raw.split(','):
+        token = token.strip()
+        if token and token not in keywords:
+            keywords.append(token)
+        if len(keywords) >= 12:
+            break
+    keywords_str = ",".join(keywords)
+
+    result: Dict[str, str] = {}
+    if title:
+        result["title"] = title[:60]
+    if description:
+        result["description"] = description[:200]
+    if keywords_str:
+        result["keywords"] = keywords_str
+    return result or None
+
+
 def resolve_metric_model_name(metric_key: str, args) -> Optional[str]:
     metric_key = metric_key.lower()
     if metric_key == "clipiqa_z":
@@ -1981,6 +2091,19 @@ def process_images_with_pyiqa(
                 rule_notes=rule_notes,
                 contributions=contributions,
             )
+
+            if use_ollama_metadata and metadata_host_url:
+                llm_fields = generate_ollama_metadata(
+                    image_path=image_path,
+                    ollama_host_url=metadata_host_url,
+                    model=classification_model,
+                    profile_key=profile_key,
+                    final_score=final_score,
+                    technical_metrics=technical_metrics,
+                    technical_warnings=technical_warnings,
+                )
+                if llm_fields:
+                    metadata.update(llm_fields)
 
             if cache_dir:
                 save_to_cache(image_path, cache_model_label, metadata, cache_dir)
