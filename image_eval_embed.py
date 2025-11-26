@@ -378,6 +378,7 @@ def build_profile_metadata(
         'post_process_potential': extended_metrics.get('post_process_potential'),
         'pyiqa_profile': profile_key,
         'pyiqa_category': category,
+        'context_label': context_label,
     }
     return metadata
 
@@ -1717,15 +1718,20 @@ def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str
     if context_override:
         image_context = context_override if context_override in PROFILE_CONFIG else 'stock_product'
         logger.info(f"Using manual context override: {image_context}")
-    elif skip_context_classification:
-        image_context = 'stock_product'
-        logger.debug(f"Context classification disabled, using default: {image_context}")
     else:
-        try:
-            image_context = classify_image_context(image_path, ollama_host_url, model)
-        except Exception as e:
-            logger.warning(f"Context classification failed for {image_path}: {e}, using default")
+        cached_context = read_cached_context(image_path)
+        if cached_context:
+            image_context = cached_context
+            logger.info(f"Using cached context from EXIF: {image_context}")
+        elif skip_context_classification:
             image_context = 'stock_product'
+            logger.debug(f"Context classification disabled, using default: {image_context}")
+        else:
+            try:
+                image_context = classify_image_context(image_path, ollama_host_url, model)
+            except Exception as e:
+                logger.warning(f"Context classification failed for {image_path}: {e}, using default")
+                image_context = 'stock_product'
 
     logger.info(f"Image context for {image_path}: {image_context} ({PROFILE_CONFIG[image_context]['name']})")
 
@@ -1893,6 +1899,61 @@ def sanitize_string(s: str) -> str:
     return s.replace('\x00', '').replace('\n', ' ').replace('\r', ' ')  # Remove null bytes and newlines
 
 
+def _decode_exif_string(value: Union[bytes, str, int, None]) -> str:
+    """Decode EXIF string values safely to plain text."""
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='ignore').strip('\x00').strip()
+    if value is not None:
+        return str(value).strip('\x00').strip()
+    return ''
+
+
+def read_cached_context(image_path: str) -> Optional[str]:
+    """Read cached context from EXIF ImageDescription if it maps to a known profile."""
+    try:
+        file_ext = Path(image_path).suffix.lower()
+
+        context_value: Optional[str] = None
+        if file_ext in RAW_EXTENSIONS:
+            result = subprocess.run(
+                ['exiftool', '-s3', '-ImageDescription', image_path],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                context_value = result.stdout.strip()
+        else:
+            if not PIEXIF_AVAILABLE or piexif is None:
+                logger.debug("piexif not available; cannot inspect ImageDescription for %s", image_path)
+                return None
+
+            with Image.open(image_path) as img:
+                exif_data = img.info.get("exif", b"")
+                if not exif_data:
+                    return None
+
+                exif_dict = piexif.load(exif_data)
+                raw_value = exif_dict["0th"].get(piexif.ImageIFD.ImageDescription)
+                context_value = _decode_exif_string(raw_value)
+
+        if not context_value:
+            return None
+
+        mapped = map_context_to_profile(context_value)
+        if mapped in PROFILE_CONFIG:
+            return mapped
+
+        logger.debug(
+            "Cached context '%s' in %s did not map to a known profile; ignoring",
+            context_value,
+            image_path,
+        )
+        return None
+    except Exception as e:
+        logger.debug(f"Failed to read cached context from EXIF for {image_path}: {e}")
+        return None
+
+
 class Metadata(BaseModel):
     model_config = ConfigDict(extra='allow')  # Allow extra fields without raising an error
     
@@ -2002,6 +2063,7 @@ def embed_metadata_exiftool(image_path: str, metadata: Dict, backup_dir: Optiona
             f'-XPComment={metadata.get("description", "")}',
             f'-XPKeywords={metadata.get("keywords", "")}',
             f'-XPSubject={technical_str}',
+            f'-ImageDescription={sanitize_string(metadata.get("context_label", ""))}',
             image_path
         ]
         
@@ -2084,6 +2146,11 @@ def embed_metadata(image_path: str, metadata: Dict, backup_dir: Optional[str] = 
             exif_dict["0th"][piexif.ImageIFD.XPSubject] = (str(technical_value).encode('utf-16le') + b'\x00\x00')
             if technical_value:
                 print(f"{Fore.BLUE}Embedding technical score:{Fore.RESET} {Fore.GREEN}{technical_value}{Fore.RESET}")
+
+            context_value = sanitize_string(str(metadata.get('context_label', '') or ''))
+            if context_value:
+                exif_dict["0th"][piexif.ImageIFD.ImageDescription] = context_value.encode('utf-8')
+                print(f"{Fore.BLUE}Embedding Context:{Fore.RESET} {Fore.GREEN}{context_value}{Fore.RESET}")
 
             # Prepare Exif data with sanitized strings
             exif_bytes = piexif.dump(exif_dict)
