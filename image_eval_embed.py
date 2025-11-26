@@ -72,15 +72,6 @@ def list_pyiqa_metrics() -> List[str]:
         return []
 
 
-def get_default_pyiqa_shift(model_name: str) -> float:
-    defaults = {
-        DEFAULT_CLIPIQ_MODEL.lower(): 14.0,
-        'maniqa': 14.0,
-        'maniqa-kadid': 14.0,
-        'maniqa-pipal': 14.0,
-    }
-    return defaults.get(model_name.lower(), 0.0)
-
 # Increase PIL decompression bomb limit for large legitimate images
 Image.MAX_IMAGE_PIXELS = None  # Remove limit entirely (or set to a higher value like 500000000)
 
