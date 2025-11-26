@@ -1812,7 +1812,8 @@ def compute_post_process_potential(technical_metrics: Dict, context: str = "stoc
 
 
 def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str,
-                               context_override: Optional[str], skip_context_classification: bool
+                               context_override: Optional[str], skip_context_classification: bool,
+                               stock_eval: bool = False
                                ) -> Tuple[str, Dict, Dict, List[str]]:
     """Determine context, extract EXIF, and compute technical metrics for an image."""
     if context_override:
@@ -1855,7 +1856,7 @@ def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str
     stock_notes, stock_fixable = compute_stock_notes(technical_metrics)
     technical_metrics['stock_notes'] = stock_notes
     technical_metrics['stock_fixable'] = stock_fixable
-    if stock_notes:
+    if stock_eval and stock_notes:
         technical_warnings.extend(stock_notes)
 
     return image_context, exif_data, technical_metrics, technical_warnings
@@ -2275,7 +2276,8 @@ def process_images_with_pyiqa(
                     context_host_url,
                     classification_model,
                     context_override,
-                    skip_context_classification
+                    skip_context_classification,
+                    stock_eval
                 )
             except Exception as exc:
                 logger.error(f"Context/technical analysis failed for {image_path}: {exc}")
