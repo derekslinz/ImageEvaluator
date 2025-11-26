@@ -518,3 +518,41 @@ def get_profile(context: str) -> dict:
 def get_profile_name(context: str) -> str:
     """Get human-readable profile name."""
     return get_profile(context).get("name", context.replace("_", " ").title())
+
+
+# =============================================================================
+# PyIQA Calibration Parameters
+# =============================================================================
+# Baseline statistics derived from a reference dataset of professional images.
+# Used to compute z-scores for profile-weighted scoring.
+
+PYIQA_BASELINE_STATS = {
+    "clipiqa_z": {"mean": 70.40125, "std": 9.290555155864835},
+    "laion_aes_z": {"mean": 57.107083333333335, "std": 3.5580589033519696},
+    "musiq_ava_z": {"mean": 56.75416666666667, "std": 4.285875947678478},
+    "maniqa_z": {"mean": 49.132083333333334, "std": 8.258054895659281},
+    "musiq_paq2piq_z": {"mean": 74.73625, "std": 3.1990914237483117},
+}
+
+# Scoring transformation parameters
+PROFILE_SCORE_CENTER = 70.0  # Base score before adjustments
+PROFILE_SCORE_STD_SCALE = 12.0  # Points per standard deviation
+
+# Default shift values for PyIQA models to align with 0-100 scale
+DEFAULT_PYIQA_SHIFTS = {
+    "clipiqa+_vitl14_512": 14.0,
+    "maniqa": 14.0,
+    "maniqa-kadid": 14.0,
+    "maniqa-pipal": 14.0,
+}
+
+
+def get_baseline_stats(metric_key: str) -> dict:
+    """Get baseline mean/std for a metric, with safe fallback."""
+    return PYIQA_BASELINE_STATS.get(metric_key, {"mean": 50.0, "std": 10.0})
+
+
+def get_default_pyiqa_shift(model_name: str) -> float:
+    """Get default score shift for a PyIQA model."""
+    return DEFAULT_PYIQA_SHIFTS.get(model_name.lower(), 0.0)
+

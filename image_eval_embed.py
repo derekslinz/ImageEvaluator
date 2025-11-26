@@ -30,7 +30,15 @@ from PIL import Image, ImageStat
 from colorama import Fore, Style
 from pydantic import BaseModel, ConfigDict, field_validator
 from tqdm import tqdm
-from profile_config import PROFILE_CONFIG, get_profile, get_profile_name
+from profile_config import (
+    PROFILE_CONFIG,
+    get_profile,
+    get_profile_name,
+    PYIQA_BASELINE_STATS,
+    PROFILE_SCORE_CENTER,
+    PROFILE_SCORE_STD_SCALE,
+    get_default_pyiqa_shift,
+)
 
 try:
     import rawpy
@@ -134,18 +142,6 @@ CONTEXT_PROFILE_MAP = {
     "travel_reportage": "street_documentary",
     "product_catalog": "stock_product",
 }
-
-PYIQA_BASELINE_STATS = {
-    # Means/stds derived from GuruShots top-10 baseline set (pyiqa_comparison.csv)
-    "clipiqa_z": {"mean": 70.40125, "std": 9.290555155864835},
-    "laion_aes_z": {"mean": 57.107083333333335, "std": 3.5580589033519696},
-    "musiq_ava_z": {"mean": 56.75416666666667, "std": 4.285875947678478},
-    "maniqa_z": {"mean": 49.132083333333334, "std": 8.258054895659281},
-    "musiq_paq2piq_z": {"mean": 74.73625, "std": 3.1990914237483117},
-}
-
-PROFILE_SCORE_CENTER = 70.0
-PROFILE_SCORE_STD_SCALE = 12.0
 
 
 def map_context_to_profile(context_label: str) -> str:
