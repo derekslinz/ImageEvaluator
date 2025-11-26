@@ -10,9 +10,9 @@ Each profile defines:
 """
 
 PROFILE_CONFIG = {
-    # 1. Stock / Product
-    "stock_product": {
-        "name": "Stock/Product Photography",
+    # 1. Studio Photography
+    "studio_photography": {
+        "name": "Studio Photography",
         "model_weights": {
             "clipiqa_z": 0.20,
             "laion_aes_z": 0.25,
@@ -655,8 +655,8 @@ PROFILE_CONFIG = {
 
 
 def get_profile(context: str) -> dict:
-    """Get profile config with fallback to stock_product."""
-    return PROFILE_CONFIG.get(context, PROFILE_CONFIG["stock_product"])
+    """Get profile config with fallback to studio_photography."""
+    return PROFILE_CONFIG.get(context, PROFILE_CONFIG["studio_photography"])
 
 
 def get_profile_name(context: str) -> str:

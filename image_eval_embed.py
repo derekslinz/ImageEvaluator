@@ -140,7 +140,7 @@ TECHNICAL SUMMARY:
 
 CONTEXT_PROFILE_MAP = {
     # Preferred contexts (1:1 mapping)
-    "stock_product": "stock_product",
+    "studio_photography": "studio_photography",
     "macro_food": "macro_food",
     "macro_nature": "macro_nature",
     "portrait_neutral": "portrait_neutral",
@@ -159,7 +159,8 @@ CONTEXT_PROFILE_MAP = {
     "travel_story": "street_documentary",
     "travel": "landscape",
     "travel_reportage": "street_documentary",
-    "product_catalog": "stock_product",
+    "stock_product": "studio_photography",
+    "product_catalog": "studio_photography",
     "wildlife": "wildlife_animal",
     "animal": "wildlife_animal",
     "pet": "wildlife_animal",
@@ -182,7 +183,7 @@ ALLOWED_LABELS = [
     "night_artificial_light",
     "night_natural_light",
     "architecture_realestate",
-    "stock_product",
+    "studio_photography",
     "fineart_creative",
 ]
 
@@ -241,13 +242,13 @@ def parse_context_response(raw: str) -> Tuple[str, str]:
 
 
 def map_context_to_profile(context_label: str) -> str:
-    """Map classifier output to one of the 10 defined profile keys."""
+    """Map classifier output to one of the 13 defined profile keys."""
     if not context_label:
-        return "stock_product"
+        return "studio_photography"
     normalized = context_label.strip().lower()
     mapped = CONTEXT_PROFILE_MAP.get(normalized, normalized)
     if mapped not in PROFILE_CONFIG:
-        return "stock_product"
+        return "studio_photography"
     return mapped
 
 
@@ -303,7 +304,7 @@ def categorize_score(score: float) -> str:
 
 def compute_profile_composite(profile_key: str, z_scores: Dict[str, float], diff_z: float) -> Tuple[float, float, Dict[str, Dict[str, float]]]:
     """Return (base_score, composite_z, contributions) before rule penalties."""
-    profile_cfg = PROFILE_CONFIG.get(profile_key, PROFILE_CONFIG["stock_product"])
+    profile_cfg = PROFILE_CONFIG.get(profile_key, PROFILE_CONFIG["studio_photography"])
     weights = normalize_weights(profile_cfg.get("model_weights", {}))
     composite_z = 0.0
     contributions: Dict[str, Dict[str, float]] = {}
@@ -324,7 +325,7 @@ def compute_profile_composite(profile_key: str, z_scores: Dict[str, float], diff
 
 def apply_profile_rules(profile_key: str, technical_metrics: Dict[str, Any]) -> Tuple[float, List[str]]:
     """Apply profile-specific rule penalties/bonuses based on technical metrics."""
-    profile_cfg = PROFILE_CONFIG.get(profile_key, PROFILE_CONFIG["stock_product"])
+    profile_cfg = PROFILE_CONFIG.get(profile_key, PROFILE_CONFIG["studio_photography"])
     rules = profile_cfg.get("rules", {})
     adjustments: List[str] = []
     penalty = 0.0
@@ -1334,7 +1335,7 @@ Categories:
 - street_documentary: candid street scenes, people in public spaces, documentary-style urban life
 - sports_action: sports or fast action (players, running, jumping, flying, strong motion)
 - architecture_realestate: buildings, interiors, rooms, city structures as the main subject
-- stock_product: products or objects presented clearly for commercial use, often on plain or clean backgrounds
+- studio_photography: controlled studio shots of products, objects, or people with deliberate lighting and backgrounds (often plain, seamless, or styled backdrops)
 - night_natural_light: night scenes lit mainly by moonlight or natural low light (e.g. stars, moonlit landscapes)
 - night_artificial_light: night scenes dominated by artificial lights (neon, city lights, concerts, street lamps)
 - fineart_creative: abstract, surreal, heavily stylized or concept-driven images that don’t clearly fit the other categories
@@ -1406,7 +1407,7 @@ def classify_image_context_detailed(image_path: str, ollama_host_url: str, model
     
     Retries on:
     - Network errors (timeout, connection)
-    - Unrecognized responses (fallback to stock_product)
+    - Unrecognized responses
     """
     last_result = None
     last_error = None
@@ -1530,7 +1531,7 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
         '9': 'night_artificial_light',
         '10': 'night_natural_light',
         '11': 'architecture_realestate',
-        '12': 'stock_product',
+        '12': 'studio_photography',
         '13': 'fineart_creative'
     }
     
@@ -1607,7 +1608,7 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
     return ClassificationResult('unknown', 'low', 'fallback', raw_response, 0)
 
 
-def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, context: str = 'stock_product') -> Dict:
+def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, context: str = 'studio_photography') -> Dict:
     """Analyze image for technical quality metrics with camera/ISO-agnostic noise estimation."""
     metrics = {
         'sharpness': 0.0,
@@ -1896,7 +1897,7 @@ def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str
                                ) -> Tuple[str, Dict, Dict, List[str]]:
     """Determine context, extract EXIF, and compute technical metrics for an image."""
     if context_override:
-        image_context = context_override if context_override in PROFILE_CONFIG else 'stock_product'
+        image_context = context_override if context_override in PROFILE_CONFIG else 'studio_photography'
         logger.info(f"Using manual context override: {image_context}")
     else:
         cached_context = read_cached_context(image_path)
@@ -1904,14 +1905,14 @@ def analyze_image_with_context(image_path: str, ollama_host_url: str, model: str
             image_context = cached_context
             logger.info(f"Using cached context from EXIF: {image_context}")
         elif skip_context_classification:
-            image_context = 'stock_product'
+            image_context = 'studio_photography'
             logger.debug(f"Context classification disabled, using default: {image_context}")
         else:
             try:
                 image_context = classify_image_context(image_path, ollama_host_url, model)
             except Exception as e:
                 logger.warning(f"Context classification failed for {image_path}: {e}, using default")
-                image_context = 'stock_product'
+                image_context = 'studio_photography'
 
     logger.info(f"Image context for {image_path}: {image_context} ({PROFILE_CONFIG[image_context]['name']})")
 
@@ -2447,7 +2448,7 @@ def process_context_only(
     
     By default, processes images that:
     - Have no context embedded, OR
-    - Have 'stock_product' context (the fallback)
+    - Have 'studio_photography' context (the fallback)
     
     Use --retry-contexts to also re-classify specific contexts.
     Use --force to re-classify ALL images regardless of existing context.
@@ -2473,7 +2474,7 @@ def process_context_only(
                 if force:
                     # Force mode: process everything
                     image_paths.append(image_path)
-                elif cached and cached != 'stock_product':
+                elif cached and cached != 'studio_photography':
                     # Check if this context should be retried
                     if retry_contexts and cached in retry_contexts:
                         print(f"{Fore.MAGENTA}[Retry]{Style.RESET_ALL} {os.path.basename(image_path)}: was {cached}")
@@ -2483,8 +2484,8 @@ def process_context_only(
                         results.append((image_path, cached, 'cached'))
                         print(f"{Fore.YELLOW}[Cached]{Style.RESET_ALL} {os.path.basename(image_path)}: {cached}")
                 else:
-                    # No context OR stock_product fallback - needs (re)classification
-                    if cached == 'stock_product':
+                    # No context OR studio_photography fallback - needs (re)classification
+                    if cached == 'studio_photography':
                         print(f"{Fore.MAGENTA}[Retry]{Style.RESET_ALL} {os.path.basename(image_path)}: was fallback")
                     image_paths.append(image_path)
     
