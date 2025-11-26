@@ -105,7 +105,7 @@ Guidelines:
 - COMPOSITION_CLARITY: subject readability, copy space, framing.
 - KEYWORD_POTENTIAL: count of accurate, high-demand concepts.
 - RELEASE_CONCERNS: legal risk (people/property/logos). 100 = safe.
-- REJECTION_RISKS: chance a reviewer rejects (noise, focus, clichés).
+- REJECTION_RISKS: likelihood image passes review. 100 = very likely to pass (noise, focus, clichés).
 - OVERALL_STOCK_SCORE = 0.4*TQ + 0.25*CV + 0.2*CC + 0.1*KP + 0.05*(RC+RR)/2, then subtract 5 points for highlight or shadow clipping >12% and 5 points for sharpness<30 (stackable). Clamp 0-100.
 - RECOMMENDATION >=85=EXCELLENT, 70-84=GOOD, 50-69=MARGINAL, else REJECT.
 - PRIMARY_CATEGORY: pick the best single commercial category.
