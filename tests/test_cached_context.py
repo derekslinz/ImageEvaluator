@@ -6,9 +6,8 @@ from PIL import Image
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-from image_eval_embed import CONTEXT_PROFILE_MAP, PROFILE_CONFIG, read_cached_context
-
-
+from image_eval_embed import CONTEXT_PROFILE_MAP, read_cached_context
+from profile_config import PROFILE_CONFIG
 def _make_image_with_description(tmp_path, description: str):
     img = Image.new("RGB", (1, 1), (255, 255, 255))
     exif_dict = {
