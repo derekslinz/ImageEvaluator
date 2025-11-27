@@ -3329,6 +3329,51 @@ def load_results_from_csv(csv_path: str) -> List[Tuple[str, Optional[Dict]]]:
             if row.get('status') == 'failed':
                 metadata = None
             else:
+                # Build technical_metrics dict from CSV columns
+                technical_metrics: Dict[str, Any] = {}
+                
+                # Parse numeric technical metrics
+                for metric_key in ['sharpness', 'brightness', 'contrast', 
+                                   'histogram_clipping_highlights', 'histogram_clipping_shadows',
+                                   'noise_score', 'noise_sigma', 'resolution_mp']:
+                    val_str = row.get(metric_key, '')
+                    if val_str:
+                        try:
+                            technical_metrics[metric_key] = float(val_str)
+                        except ValueError:
+                            pass
+                
+                # Rename resolution_mp to megapixels for consistency
+                if 'resolution_mp' in technical_metrics:
+                    technical_metrics['megapixels'] = technical_metrics.pop('resolution_mp')
+                
+                # Parse color_cast_delta from color_cast field if present
+                color_cast = row.get('color_cast', '')
+                if color_cast:
+                    technical_metrics['color_cast'] = color_cast
+                
+                # Parse IQA model scores from description
+                # Format: "clipiqa_z:56.6 (z=-1.48); laion_aes_z:46.8 (z=-2.91); ..."
+                pyiqa_details: Dict[str, Dict[str, float]] = {}
+                description = row.get('description', '')
+                if 'Model breakdown:' in description:
+                    breakdown_part = description.split('Model breakdown:')[1]
+                    # Find where breakdown ends (usually at "Disagreement" or end of string)
+                    if 'Disagreement' in breakdown_part:
+                        breakdown_part = breakdown_part.split('Disagreement')[0]
+                    
+                    # Parse each model: "clipiqa_z:56.6 (z=-1.48)"
+                    import re
+                    pattern = r'(\w+):([0-9.]+)\s*\(z=([+-]?[0-9.]+)\)'
+                    for match in re.finditer(pattern, breakdown_part):
+                        model_name = match.group(1)
+                        calibrated = float(match.group(2))
+                        z_score = float(match.group(3))
+                        pyiqa_details[model_name] = {'calibrated': calibrated, 'z': z_score}
+                
+                if pyiqa_details:
+                    technical_metrics['pyiqa_metric_details'] = pyiqa_details
+                
                 metadata = {
                     'overall_score': row.get('overall_score', ''),
                     'score': row.get('overall_score', ''),
@@ -3341,6 +3386,7 @@ def load_results_from_csv(csv_path: str) -> List[Tuple[str, Optional[Dict]]]:
                     'keywords': row.get('keywords', ''),
                     'technical_warnings': row.get('technical_warnings', '').split('; ') if row.get('technical_warnings') else [],
                     'post_process_potential': row.get('post_process_potential', ''),
+                    'technical_metrics': technical_metrics,
                 }
             results.append((row.get('file_path', ''), metadata))
     return results
@@ -3605,16 +3651,66 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
     }
 
 
+# Threshold annotations for histogram display
+# Format: metric_name -> list of (threshold_value, label, direction)
+# direction: "below" means values below threshold are flagged, "above" means values above are flagged
+METRIC_THRESHOLDS: Dict[str, List[Tuple[float, str, str]]] = {
+    'sharpness': [
+        (STOCK_SHARPNESS_CRITICAL, "CRITICAL", "below"),
+        (STOCK_SHARPNESS_OPTIMAL, "optimal", "below"),
+    ],
+    'noise_score': [
+        (STOCK_NOISE_WARN, "warn", "above"),
+        (STOCK_NOISE_HIGH, "HIGH", "above"),
+    ],
+    'histogram_clipping_highlights': [
+        (STOCK_CLIPPING_THRESHOLD, "CLIPPING", "above"),
+    ],
+    'histogram_clipping_shadows': [
+        (STOCK_CLIPPING_THRESHOLD, "CLIPPING", "above"),
+    ],
+    'color_cast_delta': [
+        (COLOR_CAST_THRESHOLD, "CAST", "above"),
+    ],
+}
+
+
 def print_metric_stats(name: str, stat: Dict[str, Any], show_histogram: bool = True):
-    """Print statistics and histogram for a single metric."""
+    """Print statistics and histogram for a single metric with threshold annotations."""
     if not stat:
         return
     
-    print(f"\n  {name}:")
+    # Get thresholds for this metric
+    thresholds = METRIC_THRESHOLDS.get(name, [])
+    
+    # Build threshold info string
+    threshold_info = ""
+    if thresholds:
+        parts = []
+        for thresh_val, label, direction in thresholds:
+            symbol = "<" if direction == "below" else ">"
+            parts.append(f"{label}{symbol}{thresh_val:.1f}")
+        threshold_info = f"  [Thresholds: {', '.join(parts)}]"
+    
+    print(f"\n  {name}:{threshold_info}")
     print(f"    Count: {stat['count']}")
     print(f"    Mean: {stat['mean']:.2f}  Std: {stat['std']:.2f}")
     print(f"    Range: {stat['min']:.2f} - {stat['max']:.2f}")
     print(f"    Quartiles: Q1={stat['q1']:.2f}  Median={stat['median']:.2f}  Q3={stat['q3']:.2f}")
+    
+    # Count values that exceed thresholds
+    if thresholds and stat.get('values'):
+        flagged_counts = []
+        for thresh_val, label, direction in thresholds:
+            if direction == "below":
+                count = sum(1 for v in stat['values'] if v < thresh_val)
+            else:
+                count = sum(1 for v in stat['values'] if v > thresh_val)
+            if count > 0:
+                pct = 100 * count / len(stat['values'])
+                flagged_counts.append(f"{label}: {count} ({pct:.1f}%)")
+        if flagged_counts:
+            print(f"    Flagged: {', '.join(flagged_counts)}")
     
     if show_histogram and stat.get('values'):
         histogram = build_histogram(stat['values'], bins=10, max_width=30)
@@ -3622,7 +3718,23 @@ def print_metric_stats(name: str, stat: Dict[str, Any], show_histogram: bool = T
             print(f"    Distribution:")
             for label, count, bar in histogram:
                 if count > 0:
-                    print(f"      {label:>15}: {bar} ({count})")
+                    # Check if this bin crosses any threshold
+                    bin_parts = label.split('-')
+                    try:
+                        bin_start = float(bin_parts[0])
+                        bin_end = float(bin_parts[1])
+                        
+                        markers = []
+                        for thresh_val, thresh_label, direction in thresholds:
+                            if bin_start <= thresh_val <= bin_end:
+                                markers.append(f"◄{thresh_label}")
+                        marker_str = ' '.join(markers)
+                        if marker_str:
+                            print(f"      {label:>15}: {bar} ({count}) {marker_str}")
+                        else:
+                            print(f"      {label:>15}: {bar} ({count})")
+                    except (ValueError, IndexError):
+                        print(f"      {label:>15}: {bar} ({count})")
 
 
 def print_statistics(stats: Dict):
