@@ -429,7 +429,7 @@ def apply_profile_rules(profile_key: str, technical_metrics: Dict[str, Any]) -> 
     color_cast_label = technical_metrics.get("color_cast")
     color_cast_delta = technical_metrics.get("color_cast_delta", 0.0)
     color_rules = rules.get("color_cast") or {}
-    color_threshold = color_rules.get("threshold", COLOR_CAST_WARN_THRESHOLD)
+    color_threshold = color_rules.get("threshold", COLOR_CAST_WARN)
     color_penalty = color_rules.get("penalty", 0.0)
     if color_cast_label and color_cast_label != "neutral":
         if color_cast_delta >= color_threshold:
