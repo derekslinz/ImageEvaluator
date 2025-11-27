@@ -14,10 +14,14 @@ import re
 import subprocess
 import sys
 import time
+import warnings
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+# Suppress FutureWarning from timm (used by PyIQA)
+warnings.filterwarnings("ignore", message="Importing from timm.models.layers is deprecated")
 
 import math
 import numpy as np
@@ -92,7 +96,7 @@ Image.MAX_IMAGE_PIXELS = None  # Remove limit entirely (or set to a higher value
 # =============================================================================
 
 # PyIQA configuration
-PYIQA_MAX_LONG_EDGE = 2048
+PYIQA_MAX_LONG_EDGE = 1024
 DEFAULT_CLIPIQ_MODEL = "clipiqa+_vitL14_512"
 
 # Stock evaluation thresholds
@@ -100,11 +104,54 @@ STOCK_MIN_RESOLUTION_MP = 4.0
 STOCK_RECOMMENDED_MP = 12.0
 STOCK_MIN_DPI = 300
 STOCK_DPI_FIXABLE = 240
-STOCK_SHARPNESS_CRITICAL = 30.0
-STOCK_SHARPNESS_OPTIMAL = 60.0
-STOCK_NOISE_WARN = 45.0
-STOCK_NOISE_HIGH = 65.0
-STOCK_CLIPPING_THRESHOLD = 12.0  # percent
+
+# Technical metric baseline statistics (mean, std) for outlier detection
+# Thresholds are calculated as: mean ± 1.5*std
+# These can be recalibrated based on your image corpus
+TECHNICAL_BASELINES = {
+    # Sharpness: lower is worse, flag if < mean - 1.5*std
+    "sharpness": {"mean": 45.0, "std": 20.0},  # threshold ~15
+    # Noise: higher is worse, flag if > mean + 1.5*std  
+    "noise_score": {"mean": 30.0, "std": 15.0},  # threshold ~52.5
+    # Highlight clipping %: higher is worse, flag if > mean + 1.5*std
+    "histogram_clipping_highlights": {"mean": 2.0, "std": 5.0},  # threshold ~9.5
+    # Shadow clipping %: higher is worse, flag if > mean + 1.5*std
+    "histogram_clipping_shadows": {"mean": 2.0, "std": 5.0},  # threshold ~9.5
+    # Color cast delta: higher is worse, flag if > mean + 1.5*std
+    "color_cast_delta": {"mean": 8.0, "std": 6.0},  # threshold ~17
+}
+
+# Multiplier for outlier detection (1.5 = mild outliers, 2.0 = strong outliers)
+OUTLIER_SIGMA_MULTIPLIER = 1.5
+
+
+def get_technical_threshold(metric_name: str, direction: str = "high") -> float:
+    """Calculate threshold for a metric based on baseline statistics.
+    
+    Args:
+        metric_name: Name of the metric in TECHNICAL_BASELINES
+        direction: "high" for metrics where higher is worse (noise, clipping)
+                   "low" for metrics where lower is worse (sharpness)
+    
+    Returns:
+        Threshold value (mean ± 1.5*std)
+    """
+    baseline = TECHNICAL_BASELINES.get(metric_name, {"mean": 50.0, "std": 25.0})
+    mean = baseline["mean"]
+    std = baseline["std"]
+    
+    if direction == "low":
+        return mean - (OUTLIER_SIGMA_MULTIPLIER * std)
+    else:  # high
+        return mean + (OUTLIER_SIGMA_MULTIPLIER * std)
+
+
+# Legacy thresholds (kept for backward compatibility, now computed dynamically)
+STOCK_SHARPNESS_CRITICAL = get_technical_threshold("sharpness", "low")
+STOCK_SHARPNESS_OPTIMAL = TECHNICAL_BASELINES["sharpness"]["mean"]
+STOCK_NOISE_WARN = TECHNICAL_BASELINES["noise_score"]["mean"]
+STOCK_NOISE_HIGH = get_technical_threshold("noise_score", "high")
+STOCK_CLIPPING_THRESHOLD = get_technical_threshold("histogram_clipping_highlights", "high")
 
 # Score validation bounds
 SCORE_MIN = 1
@@ -774,7 +821,8 @@ def resolve_metric_model_name(metric_key: str, args) -> Optional[str]:
 
 
 # Configure basic logging (will be updated based on verbose flag)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Default to WARNING for quiet operation; setup_logging() adjusts based on CLI flags
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Default to suppressing PyIQA chatter unless explicitly enabled
@@ -799,13 +847,66 @@ def load_image_tensor_with_max_edge(image_path: str, max_long_edge: int) -> Opti
             if long_edge > max_long_edge and max_long_edge > 0:
                 scale = max_long_edge / float(long_edge)
                 new_size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
-                img = img.resize(new_size, Image.Resampling.LANCZOS)
+                img = img.resize(new_size, Image.Resampling.BILINEAR)  # BILINEAR for speed
             np_img = np.asarray(img).astype('float32') / 255.0
     except Exception as exc:
         logger.error(f'Failed to load image for PyIQA preprocessing {image_path}: {exc}')
         return None
     tensor = torch.from_numpy(np_img).permute(2, 0, 1).unsqueeze(0)
     return tensor
+
+
+class TensorCache:
+    """LRU cache for image tensors to avoid reloading for each model."""
+    
+    def __init__(self, max_size: int = 32, device: Optional[str] = None):
+        self.max_size = max_size
+        self.device = device or ('cuda' if torch and torch.cuda.is_available() else 'cpu')
+        self._cache: Dict[str, "torch.Tensor"] = {}
+        self._order: List[str] = []  # LRU order
+    
+    def get(self, image_path: str, max_long_edge: int) -> Optional["torch.Tensor"]:
+        """Get tensor from cache or load from disk."""
+        cache_key = f"{image_path}:{max_long_edge}"
+        
+        if cache_key in self._cache:
+            # Move to end (most recently used)
+            self._order.remove(cache_key)
+            self._order.append(cache_key)
+            return self._cache[cache_key]
+        
+        # Load and cache
+        tensor = load_image_tensor_with_max_edge(image_path, max_long_edge)
+        if tensor is None:
+            return None
+        
+        # Move to device
+        tensor = tensor.to(self.device)
+        
+        # Evict oldest if at capacity
+        while len(self._cache) >= self.max_size:
+            oldest_key = self._order.pop(0)
+            old_tensor = self._cache.pop(oldest_key, None)
+            if old_tensor is not None:
+                del old_tensor
+        
+        self._cache[cache_key] = tensor
+        self._order.append(cache_key)
+        return tensor
+    
+    def clear(self):
+        """Clear all cached tensors."""
+        for tensor in self._cache.values():
+            del tensor
+        self._cache.clear()
+        self._order.clear()
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    def preload(self, image_paths: List[str], max_long_edge: int):
+        """Preload multiple images into cache."""
+        for path in image_paths:
+            self.get(path, max_long_edge)
 
 
 class PyIqaScorer:
@@ -840,7 +941,8 @@ class PyIqaScorer:
         self.max_long_edge = max_long_edge
         self.use_amp = bool(torch) and self.device.startswith('cuda')
 
-    def score_batch(self, image_paths: List[str]) -> Dict[str, float]:
+    def score_batch(self, image_paths: List[str], tensor_cache: Optional[TensorCache] = None) -> Dict[str, float]:
+        """Score a batch of images, optionally using cached tensors."""
         results: Dict[str, float] = {}
         if self.use_amp and torch is not None:
             def autocast_ctx():
@@ -854,9 +956,15 @@ class PyIqaScorer:
                 image_tensor = None
                 score = None
                 try:
-                    image_tensor = load_image_tensor_with_max_edge(image_path, self.max_long_edge)
+                    # Use tensor cache if provided
+                    if tensor_cache is not None:
+                        image_tensor = tensor_cache.get(image_path, self.max_long_edge)
+                    else:
+                        image_tensor = load_image_tensor_with_max_edge(image_path, self.max_long_edge)
+                        if image_tensor is not None:
+                            image_tensor = image_tensor.to(self.device)
+                    
                     if image_tensor is not None:
-                        image_tensor = image_tensor.to(self.device)
                         with autocast_ctx():
                             score = self.metric(image_tensor)
                     else:
@@ -867,11 +975,70 @@ class PyIqaScorer:
                 except Exception as exc:
                     logger.error(f"PyIQA scoring failed for {image_path}: {exc}")
                 finally:
-                    # Explicit tensor cleanup to prevent memory leaks
-                    if image_tensor is not None:
+                    # Only delete if we loaded it ourselves (not from cache)
+                    if tensor_cache is None and image_tensor is not None:
                         del image_tensor
                     if score is not None:
                         del score
+        return results
+
+    def score_tensors_stacked(self, tensors: List["torch.Tensor"], image_paths: List[str]) -> Dict[str, float]:
+        """Score pre-loaded tensors using true batch stacking for parallel inference.
+        
+        Note: Only works if all tensors have the same spatial dimensions.
+        Falls back to sequential if shapes differ.
+        """
+        if not tensors or torch is None:
+            return {}
+        
+        results: Dict[str, float] = {}
+        
+        if self.use_amp:
+            def autocast_ctx():
+                return torch.amp.autocast('cuda')
+        else:
+            def autocast_ctx():
+                return nullcontext()
+        
+        # Check if all tensors have same shape for true batching
+        shapes = [t.shape[1:] for t in tensors]  # Ignore batch dim
+        can_stack = len(set(shapes)) == 1
+        
+        with torch.no_grad():
+            if can_stack and len(tensors) > 1:
+                # True batch inference - stack all tensors
+                try:
+                    stacked = torch.cat(tensors, dim=0)  # [N, C, H, W]
+                    with autocast_ctx():
+                        scores = self.metric(stacked)
+                    # Handle different output formats
+                    if hasattr(scores, 'shape') and len(scores.shape) > 0:
+                        for i, path in enumerate(image_paths):
+                            results[path] = float(scores[i].item() if hasattr(scores[i], 'item') else scores[i])
+                    else:
+                        # Single score returned - shouldn't happen but handle it
+                        results[image_paths[0]] = float(scores.item() if hasattr(scores, 'item') else scores)
+                    del stacked
+                except Exception as exc:
+                    logger.debug(f"Stacked batch failed, falling back to sequential: {exc}")
+                    # Fall back to sequential
+                    for tensor, path in zip(tensors, image_paths):
+                        try:
+                            with autocast_ctx():
+                                score = self.metric(tensor)
+                            results[path] = float(score.item() if hasattr(score, 'item') else score)
+                        except Exception as inner_exc:
+                            logger.error(f"PyIQA scoring failed for {path}: {inner_exc}")
+            else:
+                # Sequential inference (different shapes or single image)
+                for tensor, path in zip(tensors, image_paths):
+                    try:
+                        with autocast_ctx():
+                            score = self.metric(tensor)
+                        results[path] = float(score.item() if hasattr(score, 'item') else score)
+                    except Exception as exc:
+                        logger.error(f"PyIQA scoring failed for {path}: {exc}")
+        
         return results
 
     def score_single(self, image_path: str) -> float:
@@ -911,13 +1078,16 @@ class PyiqaManager:
         scale_factor: Optional[float],
         shift_overrides: Optional[Dict[str, float]] = None,
         max_cached_models: int = 1,
+        tensor_cache_size: int = 32,
     ):
-        self.device = device
+        self.device = device or ('cuda' if torch and torch.cuda.is_available() else 'cpu')
         self.scale_factor = scale_factor
         self.shift_overrides = {k.lower(): v for k, v in (shift_overrides or {}).items()}
         self.max_cached_models = max(1, int(max_cached_models))
         self.scorers: Dict[str, PyIqaScorer] = {}
         self.scorer_usage: List[str] = []
+        # Tensor cache to avoid reloading images for each model
+        self.tensor_cache = TensorCache(max_size=tensor_cache_size, device=self.device)
 
     def _mark_used(self, model_name: str):
         if model_name in self.scorer_usage:
@@ -948,7 +1118,12 @@ class PyiqaManager:
         return self.scorers[model_name]
 
     def score_metrics(self, image_path: str, metric_keys: List[str], args) -> Dict[str, Dict[str, float]]:
+        """Score a single image across all requested metrics, reusing cached tensor."""
         scores: Dict[str, Dict[str, float]] = {}
+        
+        # Pre-load tensor into cache once for all models
+        tensor = self.tensor_cache.get(image_path, PYIQA_MAX_LONG_EDGE)
+        
         for metric_key in metric_keys:
             if metric_key == "pyiqa_diff_z":
                 continue
@@ -957,11 +1132,18 @@ class PyiqaManager:
                 continue
             scorer = self.get_scorer(model_name)
             try:
-                raw, scaled, calibrated = scorer.score_image(image_path)
+                # Use cached tensor via score_batch with tensor_cache
+                batch_scores = scorer.score_batch([image_path], tensor_cache=self.tensor_cache)
+                raw = batch_scores.get(image_path)
+                if raw is None:
+                    continue
+                scaled = scorer.convert_score(raw)
+                calibrated = scorer._apply_shift(scaled)
             except RuntimeError as exc:
                 logger.error(f"PyIQA metric {model_name} failed for {image_path}: {exc}")
                 if "out of memory" in str(exc).lower() and torch is not None and torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                    self.tensor_cache.clear()
                 continue
             scores[metric_key] = {
                 "raw": float(raw),
@@ -970,6 +1152,115 @@ class PyiqaManager:
                 "model_name": model_name,
             }
         return scores
+
+    def score_batch(
+        self,
+        image_paths: List[str],
+        metric_keys: List[str],
+        args,
+        batch_size: int = 8
+    ) -> Dict[str, Dict[str, Dict[str, float]]]:
+        """Score multiple images in batches for improved efficiency.
+        
+        Uses tensor caching (load once, score with all models) and true batch
+        stacking for parallel GPU inference when possible.
+        
+        Args:
+            image_paths: List of image paths to score
+            metric_keys: List of metric keys to compute (e.g., 'clipiqa_z', 'maniqa_z')
+            args: CLI arguments containing model configuration
+            batch_size: Number of images to process per batch
+            
+        Returns:
+            Dict mapping image_path -> metric_key -> {raw, scaled, calibrated, model_name}
+        """
+        # Initialize results dict for all images
+        all_results: Dict[str, Dict[str, Dict[str, float]]] = {
+            path: {} for path in image_paths
+        }
+        
+        # Group by model to minimize model switching
+        model_to_metrics: Dict[str, List[str]] = {}
+        for metric_key in metric_keys:
+            if metric_key == "pyiqa_diff_z":
+                continue
+            model_name = resolve_metric_model_name(metric_key, args)
+            if model_name:
+                if model_name not in model_to_metrics:
+                    model_to_metrics[model_name] = []
+                model_to_metrics[model_name].append(metric_key)
+        
+        # Pre-load all tensors into cache for this batch
+        for path in image_paths:
+            self.tensor_cache.get(path, PYIQA_MAX_LONG_EDGE)
+        
+        # Process each model's metrics
+        for model_name, metrics in model_to_metrics.items():
+            scorer = self.get_scorer(model_name)
+            
+            # Process images in batches with true stacking
+            for i in range(0, len(image_paths), batch_size):
+                batch_paths = image_paths[i:i + batch_size]
+                
+                # Collect pre-loaded tensors for stacked batch inference
+                batch_tensors = []
+                valid_paths = []
+                for path in batch_paths:
+                    tensor = self.tensor_cache.get(path, PYIQA_MAX_LONG_EDGE)
+                    if tensor is not None:
+                        batch_tensors.append(tensor)
+                        valid_paths.append(path)
+                
+                if not batch_tensors:
+                    continue
+                
+                try:
+                    # Use true batch stacking for parallel inference
+                    batch_scores = scorer.score_tensors_stacked(batch_tensors, valid_paths)
+                except RuntimeError as exc:
+                    logger.error(f"PyIQA batch scoring failed for model {model_name}: {exc}")
+                    if "out of memory" in str(exc).lower() and torch is not None and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        self.tensor_cache.clear()
+                        # Retry with tensor cache (sequential)
+                        logger.info(f"Retrying sequentially after OOM")
+                        for path in batch_paths:
+                            try:
+                                single_scores = scorer.score_batch([path], tensor_cache=self.tensor_cache)
+                                raw = single_scores.get(path)
+                                if raw is not None:
+                                    scaled = scorer.convert_score(raw)
+                                    calibrated = scorer._apply_shift(scaled)
+                                    for metric_key in metrics:
+                                        all_results[path][metric_key] = {
+                                            "raw": float(raw),
+                                            "scaled": float(scaled),
+                                            "calibrated": float(calibrated),
+                                            "model_name": model_name,
+                                        }
+                            except Exception as inner_exc:
+                                logger.error(f"PyIQA single-image scoring failed for {path}: {inner_exc}")
+                    continue
+                
+                # Process batch results
+                for path in valid_paths:
+                    raw = batch_scores.get(path)
+                    if raw is None:
+                        continue
+                    scaled = scorer.convert_score(raw)
+                    calibrated = scorer._apply_shift(scaled)
+                    for metric_key in metrics:
+                        all_results[path][metric_key] = {
+                            "raw": float(raw),
+                            "scaled": float(scaled),
+                            "calibrated": float(calibrated),
+                            "model_name": model_name,
+                        }
+        
+        # Clear tensor cache after batch to free memory
+        self.tensor_cache.clear()
+        
+        return all_results
 
 
 def _is_raw_image(image_path: str) -> bool:
@@ -1005,8 +1296,8 @@ RETRY_DELAY_BASE = 2  # seconds
 DEFAULT_MODEL = "qwen3-vl:8b"
 CACHE_DIR = ".image_eval_cache"
 CACHE_VERSION = "v1"
-# Technical analysis constants
-COLOR_CAST_THRESHOLD = 15.0  # Mean difference threshold for color cast detection
+# Technical analysis constants - now using statistical thresholds from TECHNICAL_BASELINES
+COLOR_CAST_THRESHOLD = get_technical_threshold("color_cast_delta", "high")
 HISTOGRAM_HIGHLIGHT_RANGE = (250, 256)  # Histogram bins considered as highlights
 HISTOGRAM_SHADOW_RANGE = (0, 6)  # Histogram bins considered as shadows
 MIN_LONG_EDGE = 850  # Minimum pixels required on the long edge
@@ -1171,11 +1462,34 @@ def encode_image_for_classification(image_path: str) -> str:
             raise
 
 
+def _downsample_image(img: Image.Image, max_long_edge: int) -> Image.Image:
+    """Downsample image so longest edge is at most max_long_edge pixels."""
+    w, h = img.size
+    long_edge = max(w, h)
+    if long_edge <= max_long_edge:
+        return img
+    
+    scale = max_long_edge / long_edge
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    return img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
+
+# Max resolution for technical analysis (long edge in pixels)
+# 2048 is a good balance between speed and accuracy for sharpness/noise detection.
+ANALYSIS_MAX_LONG_EDGE = 2048
+
+
 @contextmanager
-def open_image_for_analysis(image_path: str):
+def open_image_for_analysis(image_path: str, max_long_edge: int = ANALYSIS_MAX_LONG_EDGE):
     """Context manager to open image files (including RAW) for analysis.
     
-    Yields a PIL Image object. For RAW files, uses rawpy to decode.
+    Yields a PIL Image object downsampled to max_long_edge for faster processing.
+    For RAW files, uses rawpy for full-quality demosaic then downsamples.
+    
+    Args:
+        image_path: Path to image file
+        max_long_edge: Maximum pixels for longest edge (default 2048)
     """
     ext = Path(image_path).suffix.lower()
     if ext in RAW_EXTENSIONS:
@@ -1184,23 +1498,33 @@ def open_image_for_analysis(image_path: str):
             raise RuntimeError("rawpy is required to process RAW files")
         raw = rawpy.imread(image_path)  # type: ignore
         try:
+            # Full demosaic for accurate sharpness detection
+            # Use sRGB gamma for proper tonal distribution (critical for Laplacian sharpness)
+            # Linear gamma (1.0, 1.0) produces very dark images with no edge contrast
             rgb = raw.postprocess(
                 use_camera_wb=True,
                 no_auto_bright=True,
                 output_bps=8,
-                gamma=(1.0, 1.0)
+                gamma=(2.222, 4.5)  # sRGB-like gamma for proper contrast
             )
         finally:
             raw.close()
 
         img = Image.fromarray(rgb.astype('uint8'))
+        # Downsample to target resolution
+        img = _downsample_image(img, max_long_edge)
         try:
             yield img
         finally:
             img.close()
     else:
-        with Image.open(image_path) as img:
-            yield img
+        with Image.open(image_path) as orig_img:
+            img = _downsample_image(orig_img, max_long_edge)
+            try:
+                yield img
+            finally:
+                if img is not orig_img:
+                    img.close()
 
 
 def validate_image(image_path: str) -> bool:
@@ -1734,7 +2058,16 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
                 h, w = gray_array.shape
                 mp = (h * w) / 1_000_000
                 scale_factor = np.sqrt(max(mp, 0.1))  # Avoid division by zero
-                metrics['sharpness'] = float(laplacian_var / scale_factor)
+                raw_sharpness = laplacian_var / scale_factor
+                
+                # Map to 0-100 scale using square root transform
+                # sqrt compresses outliers less aggressively than log
+                # Calibrated: sqrt(25)=5->25, sqrt(100)=10->50, sqrt(400)=20->100
+                import math
+                sqrt_sharp = math.sqrt(max(0, raw_sharpness))
+                # Scale so sqrt(400)=20 maps to 100
+                normalized = sqrt_sharp * 5.0
+                metrics['sharpness'] = float(max(0, min(100, normalized)))
 
                 # --- Camera/ISO-agnostic noise estimation ---
                 # 1) Standardize size
@@ -2001,7 +2334,13 @@ def configure_pyiqa_logging(verbose: bool = False, debug: bool = False):
 def setup_logging(log_file: Optional[str] = None, verbose: bool = False, debug: bool = False):
     """Configure logging with file handler and appropriate level."""
     # Set level based on verbose/debug flags
-    log_level = logging.DEBUG if (verbose or debug) else logging.INFO
+    # Default to WARNING for quiet operation; --verbose enables INFO, --debug enables DEBUG
+    if debug:
+        log_level = logging.DEBUG
+    elif verbose:
+        log_level = logging.INFO
+    else:
+        log_level = logging.WARNING
     
     # Clear root logger handlers (from basicConfig at module load)
     root_logger = logging.getLogger()
@@ -2670,6 +3009,10 @@ def process_images_with_pyiqa(
 ) -> List[Tuple[str, Optional[Dict]]]:
     """Profile-aware PyIQA pipeline with context detection and rule weighting."""
     results: List[Tuple[str, Optional[Dict]]] = []
+    
+    # Timing accumulators for performance analysis
+    timing_stats = {"context": 0.0, "pyiqa": 0.0, "metadata": 0.0, "embed": 0.0, "count": 0}
+    
     with tqdm(total=len(image_paths), desc="Processing images", unit="img") as pbar:
         for image_path in image_paths:
             immediate = _handle_cached_or_dry_run(
@@ -2689,6 +3032,7 @@ def process_images_with_pyiqa(
                 pbar.update(1)
                 continue
 
+            t0 = time.time()
             try:
                 image_context, _, technical_metrics, technical_warnings = analyze_image_with_context(
                     image_path,
@@ -2708,6 +3052,8 @@ def process_images_with_pyiqa(
                 results.append((image_path, None))
                 pbar.update(1)
                 continue
+            t1 = time.time()
+            timing_stats["context"] += t1 - t0
 
             profile_key = map_context_to_profile(image_context)
             profile_cfg = PROFILE_CONFIG.get(profile_key, PROFILE_CONFIG["studio_photography"])
@@ -2719,6 +3065,8 @@ def process_images_with_pyiqa(
                 results.append((image_path, None))
                 pbar.update(1)
                 continue
+            t2 = time.time()
+            timing_stats["pyiqa"] += t2 - t1
 
             if not metric_details:
                 logger.error(f"No PyIQA metrics computed for {image_path}")
@@ -2774,6 +3122,8 @@ def process_images_with_pyiqa(
 
             if cache_dir:
                 save_to_cache(image_path, cache_model_label, metadata, cache_dir)
+            t3 = time.time()
+            timing_stats["metadata"] += t3 - t2
 
             try:
                 embed_metadata(image_path, metadata, backup_dir, verify)
@@ -2782,6 +3132,9 @@ def process_images_with_pyiqa(
                 results.append((image_path, None))
                 pbar.update(1)
                 continue
+            t4 = time.time()
+            timing_stats["embed"] += t4 - t3
+            timing_stats["count"] += 1
 
             logger.info(f"Composite PyIQA score for {image_path}: {metadata.get('score')}")
 
@@ -2796,6 +3149,17 @@ def process_images_with_pyiqa(
 
             results.append((image_path, metadata))
             pbar.update(1)
+
+    # Print timing summary
+    if timing_stats["count"] > 0:
+        n = timing_stats["count"]
+        print(f"\n{Fore.CYAN}Timing Summary ({n} images):{Style.RESET_ALL}")
+        print(f"  Context/Technical: {timing_stats['context']:.1f}s total, {timing_stats['context']/n:.2f}s/img")
+        print(f"  PyIQA Scoring:     {timing_stats['pyiqa']:.1f}s total, {timing_stats['pyiqa']/n:.2f}s/img")
+        print(f"  Metadata Build:    {timing_stats['metadata']:.1f}s total, {timing_stats['metadata']/n:.2f}s/img")
+        print(f"  Embed to EXIF:     {timing_stats['embed']:.1f}s total, {timing_stats['embed']/n:.2f}s/img")
+        total = timing_stats['context'] + timing_stats['pyiqa'] + timing_stats['metadata'] + timing_stats['embed']
+        print(f"  {Fore.GREEN}Total:               {total:.1f}s, {total/n:.2f}s/img{Style.RESET_ALL}")
 
     return results
 
@@ -3000,6 +3364,76 @@ def get_cache_stats(cache_dir: str) -> Dict:
         return {'enabled': False, 'entries': 0, 'size_mb': 0}
 
 
+def compute_metric_stats(values: List[float]) -> Dict[str, Any]:
+    """Compute comprehensive statistics for a list of values."""
+    if not values:
+        return {}
+    n = len(values)
+    sorted_vals = sorted(values)
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / n if n > 1 else 0
+    std_dev = variance ** 0.5
+    
+    # Quartiles
+    median = sorted_vals[n // 2] if n % 2 == 1 else (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2
+    q1 = sorted_vals[n // 4] if n >= 4 else sorted_vals[0]
+    q3 = sorted_vals[(3 * n) // 4] if n >= 4 else sorted_vals[-1]
+    
+    return {
+        'count': n,
+        'mean': mean,
+        'std': std_dev,
+        'min': min(values),
+        'max': max(values),
+        'median': median,
+        'q1': q1,
+        'q3': q3,
+        'values': values,  # Keep raw values for histogram
+    }
+
+
+def build_histogram(values: List[float], bins: int = 10, max_width: int = 40) -> List[Tuple[str, int, str]]:
+    """Build ASCII histogram bins from values.
+    
+    Returns list of (bin_label, count, bar_string) tuples.
+    """
+    if not values:
+        return []
+    
+    min_val = min(values)
+    max_val = max(values)
+    
+    # Handle edge case where all values are the same
+    if min_val == max_val:
+        return [(f"{min_val:.1f}", len(values), '█' * max_width)]
+    
+    bin_width = (max_val - min_val) / bins
+    histogram: List[Tuple[str, int]] = []
+    
+    for i in range(bins):
+        bin_start = min_val + i * bin_width
+        bin_end = bin_start + bin_width
+        if i == bins - 1:
+            # Last bin includes max value
+            count = sum(1 for v in values if bin_start <= v <= bin_end)
+        else:
+            count = sum(1 for v in values if bin_start <= v < bin_end)
+        label = f"{bin_start:.1f}-{bin_end:.1f}"
+        histogram.append((label, count))
+    
+    # Build bar strings
+    max_count = max(c for _, c in histogram) if histogram else 1
+    scale = max_count / max_width if max_count > max_width else 1
+    
+    result = []
+    for label, count in histogram:
+        bar_len = max(1, int(count / scale)) if count > 0 else 0
+        bar = '█' * bar_len
+        result.append((label, count, bar))
+    
+    return result
+
+
 def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
     """Calculate statistics from processing results."""
     scores = []
@@ -3007,6 +3441,21 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
     raw_count = 0
     pil_count = 0
     potentials = []
+    
+    # Collect all technical metrics
+    technical_metrics_collected: Dict[str, List[float]] = {
+        'sharpness': [],
+        'noise_score': [],
+        'histogram_clipping_highlights': [],
+        'histogram_clipping_shadows': [],
+        'color_cast_delta': [],
+        'brightness': [],
+        'contrast': [],
+        'megapixels': [],
+    }
+    
+    # Collect all IQA metric scores
+    iqa_metrics_collected: Dict[str, List[float]] = {}
     
     for image_path, metadata in results:
         # Track format types
@@ -3041,6 +3490,24 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
                 potentials.append(int(metadata['post_process_potential']))
             except (ValueError, TypeError):
                 pass
+        
+        # Collect technical metrics from metadata
+        if metadata:
+            tech_metrics = metadata.get('technical_metrics', {})
+            for metric_name in technical_metrics_collected.keys():
+                val = tech_metrics.get(metric_name)
+                if isinstance(val, (int, float)) and not (isinstance(val, float) and (val != val)):  # Exclude NaN
+                    technical_metrics_collected[metric_name].append(float(val))
+            
+            # Collect IQA metric details
+            pyiqa_details = tech_metrics.get('pyiqa_metric_details', {})
+            for model_name, detail in pyiqa_details.items():
+                if isinstance(detail, dict) and 'calibrated' in detail:
+                    cal_val = detail['calibrated']
+                    if isinstance(cal_val, (int, float)):
+                        if model_name not in iqa_metrics_collected:
+                            iqa_metrics_collected[model_name] = []
+                        iqa_metrics_collected[model_name].append(float(cal_val))
     
     warning_images = sum(1 for _, md in results if md and md.get('technical_warnings'))
 
@@ -3132,7 +3599,30 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
         'technical_q1': tech_q1,
         'technical_q3': tech_q3,
         'technical_std_dev': tech_std,
+        # New: comprehensive metric statistics
+        'technical_metrics_stats': {k: compute_metric_stats(v) for k, v in technical_metrics_collected.items() if v},
+        'iqa_metrics_stats': {k: compute_metric_stats(v) for k, v in iqa_metrics_collected.items() if v},
     }
+
+
+def print_metric_stats(name: str, stat: Dict[str, Any], show_histogram: bool = True):
+    """Print statistics and histogram for a single metric."""
+    if not stat:
+        return
+    
+    print(f"\n  {name}:")
+    print(f"    Count: {stat['count']}")
+    print(f"    Mean: {stat['mean']:.2f}  Std: {stat['std']:.2f}")
+    print(f"    Range: {stat['min']:.2f} - {stat['max']:.2f}")
+    print(f"    Quartiles: Q1={stat['q1']:.2f}  Median={stat['median']:.2f}  Q3={stat['q3']:.2f}")
+    
+    if show_histogram and stat.get('values'):
+        histogram = build_histogram(stat['values'], bins=10, max_width=30)
+        if histogram:
+            print(f"    Distribution:")
+            for label, count, bar in histogram:
+                if count > 0:
+                    print(f"      {label:>15}: {bar} ({count})")
 
 
 def print_statistics(stats: Dict):
@@ -3209,6 +3699,33 @@ def print_statistics(stats: Dict):
             for bin_range, count in tech_bins_sorted:
                 bar = '█' * max(1, int(count / scale_tech))
                 print(f"{bin_range:>8}: {bar} ({count})")
+        
+        # Print detailed technical metrics statistics
+        tech_metrics_stats = stats.get('technical_metrics_stats', {})
+        if tech_metrics_stats:
+            print(f"\n{'='*60}")
+            print(f"TECHNICAL METRICS DETAILS")
+            print(f"{'='*60}")
+            # Order metrics for consistent display
+            metric_order = ['sharpness', 'noise_score', 'histogram_clipping_highlights', 
+                          'histogram_clipping_shadows', 'color_cast_delta', 'brightness', 
+                          'contrast', 'megapixels']
+            for metric_name in metric_order:
+                if metric_name in tech_metrics_stats:
+                    print_metric_stats(metric_name, tech_metrics_stats[metric_name])
+            # Print any additional metrics not in the order list
+            for metric_name, stat in tech_metrics_stats.items():
+                if metric_name not in metric_order:
+                    print_metric_stats(metric_name, stat)
+        
+        # Print IQA model statistics
+        iqa_metrics_stats = stats.get('iqa_metrics_stats', {})
+        if iqa_metrics_stats:
+            print(f"\n{'='*60}")
+            print(f"IQA MODEL SCORE DETAILS")
+            print(f"{'='*60}")
+            for model_name in sorted(iqa_metrics_stats.keys()):
+                print_metric_stats(model_name, iqa_metrics_stats[model_name])
     
     print(f"\n{'='*60}")
     print(f"Note: JPEG/PNG use PIL, RAW/TIFF use exiftool for metadata embedding")
@@ -3330,8 +3847,10 @@ if __name__ == "__main__":
                                help='Additive adjustment (0-100 scale) applied to PyIQA scores (default: model-specific)')
     process_parser.add_argument('--pyiqa-scale-factor', type=float, default=None,
                                help='Optional multiplier applied to PyIQA raw scores before calibration (auto-detect if omitted)')
-    process_parser.add_argument('--pyiqa-max-models', type=int, default=1,
-                               help='Maximum PyIQA models kept in GPU memory at once (default: 1, lower = less VRAM)')
+    process_parser.add_argument('--pyiqa-max-models', type=int, default=5,
+                               help='Maximum PyIQA models kept in GPU memory at once (default: 5, lower = less VRAM)')
+    process_parser.add_argument('--pyiqa-batch-size', type=int, default=8,
+                               help='Number of images to score per PyIQA batch (default: 8, lower = less VRAM)')
     process_parser.add_argument('--context-host-url', type=str, default=None,
                                help='Override endpoint for context classification (default: same as Ollama host)')
     process_parser.add_argument('--ollama-metadata', action='store_true',
@@ -3354,7 +3873,7 @@ if __name__ == "__main__":
     process_parser.add_argument('--context', type=str, default=None,
                               help='Manual context override (e.g., landscape, portrait_neutral, studio_photography)')
     process_parser.add_argument('--no-context-classification', action='store_true',
-                              help='Skip automatic context classification, use studio_photography for all')
+                              help='Skip automatic context classification (still uses EXIF-cached context if available, otherwise studio_photography)')
     
     # Prep-context command - classify and embed context only (no scoring)
     prep_parser = subparsers.add_parser('prep-context', help='Classify images and embed context only (no scoring)')
