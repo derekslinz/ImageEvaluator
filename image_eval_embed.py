@@ -551,30 +551,38 @@ def compute_stock_notes(technical_metrics: Dict[str, Any]) -> Tuple[List[str], L
     sharpness = technical_metrics.get('sharpness')
     if isinstance(sharpness, (int, float)):
         if sharpness < STOCK_SHARPNESS_CRITICAL:
+            notes.append(f"critically soft (sharpness {sharpness:.1f})")
+        elif sharpness < STOCK_SHARPNESS_WARN:
             notes.append(f"soft focus (sharpness {sharpness:.1f})")
-        elif sharpness < STOCK_SHARPNESS_OPTIMAL:
-            notes.append(f"moderate softness (sharpness {sharpness:.1f})")
 
     noise_score = technical_metrics.get('noise_score')
     if isinstance(noise_score, (int, float)):
-        if noise_score > STOCK_NOISE_HIGH:
+        if noise_score > STOCK_NOISE_CRITICAL:
             notes.append(f"high noise ({noise_score:.1f})")
         elif noise_score > STOCK_NOISE_WARN:
             notes.append(f"moderate noise ({noise_score:.1f})")
 
     highlights = technical_metrics.get('histogram_clipping_highlights')
-    if isinstance(highlights, (int, float)) and highlights > STOCK_CLIPPING_THRESHOLD:
-        notes.append(f"highlight clipping {highlights:.1f}%")
+    if isinstance(highlights, (int, float)):
+        if highlights > STOCK_CLIPPING_HIGHLIGHTS_CRITICAL:
+            notes.append(f"severe highlight clipping {highlights:.1f}%")
+        elif highlights > STOCK_CLIPPING_HIGHLIGHTS_WARN:
+            notes.append(f"highlight clipping {highlights:.1f}%")
 
     shadows = technical_metrics.get('histogram_clipping_shadows')
-    if isinstance(shadows, (int, float)) and shadows > STOCK_CLIPPING_THRESHOLD:
-        notes.append(f"shadow clipping {shadows:.1f}%")
+    if isinstance(shadows, (int, float)):
+        if shadows > STOCK_CLIPPING_SHADOWS_CRITICAL:
+            notes.append(f"severe shadow clipping {shadows:.1f}%")
+        elif shadows > STOCK_CLIPPING_SHADOWS_WARN:
+            notes.append(f"shadow clipping {shadows:.1f}%")
 
     dpi_x = technical_metrics.get('dpi_x')
     if isinstance(dpi_x, (int, float)) and dpi_x < STOCK_MIN_DPI:
         notes.append(f"low DPI ({dpi_x:.0f})")
         if dpi_x >= STOCK_DPI_FIXABLE:
             fixable.append(f"DPI metadata: {dpi_x:.0f} → {STOCK_MIN_DPI}")
+
+    return notes, fixable
 
     return notes, fixable
 
@@ -1321,7 +1329,7 @@ DEFAULT_MODEL = "qwen3-vl:8b"
 CACHE_DIR = ".image_eval_cache"
 CACHE_VERSION = "v1"
 # Technical analysis constants - now using statistical thresholds from TECHNICAL_BASELINES
-COLOR_CAST_THRESHOLD = get_technical_threshold("color_cast_delta", "high")
+# COLOR_CAST_WARN and COLOR_CAST_CRITICAL are defined at module level with other thresholds
 HISTOGRAM_HIGHLIGHT_RANGE = (250, 256)  # Histogram bins considered as highlights
 HISTOGRAM_SHADOW_RANGE = (0, 6)  # Histogram bins considered as shadows
 MIN_LONG_EDGE = 850  # Minimum pixels required on the long edge
@@ -3247,7 +3255,7 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
             'lighting_score', 'creativity_score', 'title', 'description',
             'keywords', 'status', 'context', 'context_profile', 'sharpness', 'brightness', 'contrast',
             'histogram_clipping_highlights', 'histogram_clipping_shadows',
-            'color_cast', 'noise_sigma', 'noise_score', 'technical_warnings', 'post_process_potential',
+            'color_cast', 'color_cast_delta', 'noise_sigma', 'noise_score', 'technical_warnings', 'post_process_potential',
             'resolution_mp', 'dpi', 'stock_notes', 'stock_fixable',
             'stock_overall_score', 'stock_recommendation', 'stock_primary_category',
             'stock_commercial_viability', 'stock_technical_quality', 'stock_composition_clarity',
@@ -3280,6 +3288,7 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'histogram_clipping_highlights': technical_metrics.get('histogram_clipping_highlights', ''),
                     'histogram_clipping_shadows': technical_metrics.get('histogram_clipping_shadows', ''),
                     'color_cast': technical_metrics.get('color_cast', ''),
+                    'color_cast_delta': technical_metrics.get('color_cast_delta', ''),
                     'noise_sigma': technical_metrics.get('noise_sigma', ''),
                     'noise_score': technical_metrics.get('noise_score', ''),
                     'technical_warnings': warnings_str,
@@ -3321,6 +3330,7 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'histogram_clipping_highlights': '',
                     'histogram_clipping_shadows': '',
                     'color_cast': '',
+                    'color_cast_delta': '',
                     'noise_sigma': '',
                     'noise_score': '',
                     'technical_warnings': '',
@@ -3359,7 +3369,7 @@ def load_results_from_csv(csv_path: str) -> List[Tuple[str, Optional[Dict]]]:
                 # Parse numeric technical metrics
                 for metric_key in ['sharpness', 'brightness', 'contrast', 
                                    'histogram_clipping_highlights', 'histogram_clipping_shadows',
-                                   'noise_score', 'noise_sigma', 'resolution_mp']:
+                                   'color_cast_delta', 'noise_score', 'noise_sigma', 'resolution_mp']:
                     val_str = row.get(metric_key, '')
                     if val_str:
                         try:
@@ -3681,20 +3691,23 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
 METRIC_THRESHOLDS: Dict[str, List[Tuple[float, str, str]]] = {
     'sharpness': [
         (STOCK_SHARPNESS_CRITICAL, "CRITICAL", "below"),
-        (STOCK_SHARPNESS_OPTIMAL, "optimal", "below"),
+        (STOCK_SHARPNESS_WARN, "warn", "below"),
     ],
     'noise_score': [
         (STOCK_NOISE_WARN, "warn", "above"),
-        (STOCK_NOISE_HIGH, "HIGH", "above"),
+        (STOCK_NOISE_CRITICAL, "CRITICAL", "above"),
     ],
     'histogram_clipping_highlights': [
-        (STOCK_CLIPPING_THRESHOLD, "CLIPPING", "above"),
+        (STOCK_CLIPPING_HIGHLIGHTS_WARN, "warn", "above"),
+        (STOCK_CLIPPING_HIGHLIGHTS_CRITICAL, "CRITICAL", "above"),
     ],
     'histogram_clipping_shadows': [
-        (STOCK_CLIPPING_THRESHOLD, "CLIPPING", "above"),
+        (STOCK_CLIPPING_SHADOWS_WARN, "warn", "above"),
+        (STOCK_CLIPPING_SHADOWS_CRITICAL, "CRITICAL", "above"),
     ],
     'color_cast_delta': [
-        (COLOR_CAST_THRESHOLD, "CAST", "above"),
+        (COLOR_CAST_WARN, "warn", "above"),
+        (COLOR_CAST_CRITICAL, "CRITICAL", "above"),
     ],
 }
 
