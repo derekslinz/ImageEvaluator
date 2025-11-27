@@ -3438,7 +3438,7 @@ def compute_metric_stats(values: List[float]) -> Dict[str, Any]:
     }
 
 
-def build_histogram(values: List[float], bins: int = 10, max_width: int = 40) -> List[Tuple[str, int, str]]:
+def build_histogram(values: List[float], bins: int = 10, max_width: int = 25) -> List[Tuple[str, int, str]]:
     """Build ASCII histogram bins from values.
     
     Returns list of (bin_label, count, bar_string) tuples.
@@ -3713,7 +3713,7 @@ def print_metric_stats(name: str, stat: Dict[str, Any], show_histogram: bool = T
             print(f"    Flagged: {', '.join(flagged_counts)}")
     
     if show_histogram and stat.get('values'):
-        histogram = build_histogram(stat['values'], bins=10, max_width=30)
+        histogram = build_histogram(stat['values'], bins=10, max_width=25)
         if histogram:
             print(f"    Distribution:")
             for label, count, bar in histogram:
@@ -3842,6 +3842,192 @@ def print_statistics(stats: Dict):
     print(f"\n{'='*60}")
     print(f"Note: JPEG/PNG use PIL, RAW/TIFF use exiftool for metadata embedding")
     print(f"{'='*60}\n")
+
+
+def format_metric_stats_markdown(name: str, stat: Dict[str, Any], show_histogram: bool = True) -> List[str]:
+    """Format statistics and histogram for a single metric as markdown lines."""
+    if not stat:
+        return []
+    
+    lines = []
+    thresholds = METRIC_THRESHOLDS.get(name, [])
+    
+    # Header with thresholds
+    threshold_info = ""
+    if thresholds:
+        parts = []
+        for thresh_val, label, direction in thresholds:
+            symbol = "<" if direction == "below" else ">"
+            parts.append(f"`{label}{symbol}{thresh_val:.1f}`")
+        threshold_info = f" — Thresholds: {', '.join(parts)}"
+    
+    lines.append(f"\n#### {name}{threshold_info}")
+    lines.append(f"- **Count:** {stat['count']}")
+    lines.append(f"- **Mean:** {stat['mean']:.2f} | **Std:** {stat['std']:.2f}")
+    lines.append(f"- **Range:** {stat['min']:.2f} – {stat['max']:.2f}")
+    lines.append(f"- **Quartiles:** Q1={stat['q1']:.2f} | Median={stat['median']:.2f} | Q3={stat['q3']:.2f}")
+    
+    # Count values that exceed thresholds
+    if thresholds and stat.get('values'):
+        flagged_parts = []
+        for thresh_val, label, direction in thresholds:
+            if direction == "below":
+                count = sum(1 for v in stat['values'] if v < thresh_val)
+            else:
+                count = sum(1 for v in stat['values'] if v > thresh_val)
+            if count > 0:
+                pct = 100 * count / len(stat['values'])
+                flagged_parts.append(f"**{label}:** {count} ({pct:.1f}%)")
+        if flagged_parts:
+            lines.append(f"- **Flagged:** {', '.join(flagged_parts)}")
+    
+    if show_histogram and stat.get('values'):
+        histogram = build_histogram(stat['values'], bins=10, max_width=25)
+        if histogram:
+            lines.append("")
+            lines.append("```")
+            for label, count, bar in histogram:
+                if count > 0:
+                    bin_parts = label.split('-')
+                    try:
+                        bin_start = float(bin_parts[0])
+                        bin_end = float(bin_parts[1])
+                        markers = []
+                        for thresh_val, thresh_label, direction in thresholds:
+                            if bin_start <= thresh_val <= bin_end:
+                                markers.append(f"◄{thresh_label}")
+                        marker_str = ' '.join(markers)
+                        if marker_str:
+                            lines.append(f"{label:>15}: {bar} ({count}) {marker_str}")
+                        else:
+                            lines.append(f"{label:>15}: {bar} ({count})")
+                    except (ValueError, IndexError):
+                        lines.append(f"{label:>15}: {bar} ({count})")
+            lines.append("```")
+    
+    return lines
+
+
+def generate_statistics_markdown(stats: Dict, csv_path: str = "") -> str:
+    """Generate markdown-formatted statistics report."""
+    lines = []
+    
+    # Title
+    if csv_path:
+        lines.append(f"# Image Evaluation Statistics")
+        lines.append(f"**Source:** `{csv_path}`\n")
+    else:
+        lines.append("# Image Evaluation Statistics\n")
+    
+    # Processing Summary
+    lines.append("## Processing Summary")
+    lines.append(f"| Metric | Value |")
+    lines.append(f"|--------|-------|")
+    lines.append(f"| Total Processed | {stats['total_processed']} |")
+    lines.append(f"| Successful | {stats['successful']} |")
+    lines.append(f"| Failed | {stats['failed']} |")
+    if stats.get('warning_images'):
+        lines.append(f"| Technical Warnings | {stats['warning_images']} |")
+    lines.append(f"| RAW Formats | {stats.get('raw_count', 0)} |")
+    lines.append(f"| Standard Formats | {stats.get('pil_count', 0)} |")
+    
+    # Timing
+    if 'elapsed_time' in stats:
+        elapsed = stats['elapsed_time']
+        lines.append("")
+        lines.append("## Timing")
+        lines.append(f"- **Total Time:** {elapsed:.2f}s ({elapsed/60:.2f} min)")
+        if stats['total_processed'] > 0:
+            lines.append(f"- **Per Image:** {elapsed/stats['total_processed']:.2f}s")
+    
+    if stats['successful'] > 0:
+        # Score Statistics
+        lines.append("")
+        lines.append("## Score Statistics")
+        lines.append(f"| Metric | Value |")
+        lines.append(f"|--------|-------|")
+        lines.append(f"| Average | {stats['avg_score']:.2f} |")
+        lines.append(f"| Median | {stats.get('median_score', 0):.2f} |")
+        lines.append(f"| Std Dev | {stats.get('std_dev', 0):.2f} |")
+        lines.append(f"| Range | {stats['min_score']} – {stats['max_score']} |")
+        lines.append(f"| Q1 / Q3 | {stats.get('q1', 0):.0f} / {stats.get('q3', 0):.0f} |")
+        
+        # Technical Score Summary
+        if stats.get('technical_score_distribution') and stats.get('avg_technical_score') is not None:
+            lines.append("")
+            lines.append("### Technical Score Summary")
+            lines.append(f"| Metric | Value |")
+            lines.append(f"|--------|-------|")
+            lines.append(f"| Average | {stats.get('avg_technical_score', 0):.2f} |")
+            lines.append(f"| Median | {stats.get('technical_median_score', 0):.2f} |")
+            lines.append(f"| Std Dev | {stats.get('technical_std_dev', 0):.2f} |")
+            lines.append(f"| Range | {stats.get('technical_min_score', 0)} – {stats.get('technical_max_score', 0)} |")
+            lines.append(f"| Q1 / Q3 | {stats.get('technical_q1', 0):.0f} / {stats.get('technical_q3', 0):.0f} |")
+        
+        avg_post = stats.get('avg_post_process_potential')
+        if avg_post is not None:
+            lines.append(f"| Post-Process Potential | {avg_post:.1f}/100 |")
+        
+        # Score Distribution
+        lines.append("")
+        lines.append("## Score Distribution")
+        lines.append("```")
+        score_bins_sorted = sorted(
+            stats['score_distribution'].items(),
+            key=lambda item: int(item[0].split('-')[0])
+        )
+        max_overall = max((count for _, count in score_bins_sorted), default=1)
+        scale_overall = max_overall / 40 if max_overall > 40 else 1
+        for bin_range, count in score_bins_sorted:
+            bar = '█' * max(1, int(count / scale_overall)) if count > 0 else ''
+            lines.append(f"{bin_range:>8}: {bar} ({count})")
+        lines.append("```")
+        
+        # Technical Score Distribution
+        tech_dist = stats.get('technical_score_distribution')
+        if tech_dist and stats.get('avg_technical_score') is not None:
+            lines.append("")
+            lines.append("## Technical Score Distribution")
+            lines.append("```")
+            tech_bins_sorted = sorted(
+                tech_dist.items(),
+                key=lambda item: int(item[0].split('-')[0])
+            )
+            max_tech = max((count for _, count in tech_bins_sorted), default=1)
+            scale_tech = max_tech / 40 if max_tech > 40 else 1
+            for bin_range, count in tech_bins_sorted:
+                bar = '█' * max(1, int(count / scale_tech)) if count > 0 else ''
+                lines.append(f"{bin_range:>8}: {bar} ({count})")
+            lines.append("```")
+        
+        # Technical Metrics Details
+        tech_metrics_stats = stats.get('technical_metrics_stats', {})
+        if tech_metrics_stats:
+            lines.append("")
+            lines.append("## Technical Metrics Details")
+            metric_order = ['sharpness', 'noise_score', 'histogram_clipping_highlights', 
+                          'histogram_clipping_shadows', 'color_cast_delta', 'brightness', 
+                          'contrast', 'megapixels']
+            for metric_name in metric_order:
+                if metric_name in tech_metrics_stats:
+                    lines.extend(format_metric_stats_markdown(metric_name, tech_metrics_stats[metric_name]))
+            for metric_name, stat in tech_metrics_stats.items():
+                if metric_name not in metric_order:
+                    lines.extend(format_metric_stats_markdown(metric_name, stat))
+        
+        # IQA Model Details
+        iqa_metrics_stats = stats.get('iqa_metrics_stats', {})
+        if iqa_metrics_stats:
+            lines.append("")
+            lines.append("## IQA Model Score Details")
+            for model_name in sorted(iqa_metrics_stats.keys()):
+                lines.extend(format_metric_stats_markdown(model_name, iqa_metrics_stats[model_name]))
+    
+    lines.append("")
+    lines.append("---")
+    lines.append("*Note: JPEG/PNG use PIL, RAW/TIFF use exiftool for metadata embedding*")
+    
+    return '\n'.join(lines)
 
 
 def rollback_images(folder_path: str, backup_dir: Optional[str] = None):
@@ -4019,6 +4205,8 @@ if __name__ == "__main__":
     # Stats command
     stats_parser = subparsers.add_parser('stats', help='Print statistics for an existing CSV report')
     stats_parser.add_argument('csv_path', type=str, help='Path to a CSV created by this tool')
+    stats_parser.add_argument('--output', '-o', type=str, default=None, 
+                             help='Output markdown file (default: prints to console)')
     
     raw_cli_args = sys.argv[1:]
     normalized_args, inferred_command = prepare_cli_args(raw_cli_args)
@@ -4046,6 +4234,23 @@ if __name__ == "__main__":
             sys.exit(1)
         results = load_results_from_csv(args.csv_path)
         stats = calculate_statistics(results)
+        
+        # Generate markdown output
+        markdown_content = generate_statistics_markdown(stats, args.csv_path)
+        
+        if args.output:
+            # Write to specified file
+            output_path = args.output
+        else:
+            # Default: derive output filename from CSV path
+            csv_base = os.path.splitext(args.csv_path)[0]
+            output_path = f"{csv_base}_stats.md"
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(markdown_content)
+        print(f"Statistics saved to: {output_path}")
+        
+        # Also print to console
         print_statistics(stats)
         sys.exit(0)
     
