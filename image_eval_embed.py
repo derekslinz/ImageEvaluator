@@ -108,50 +108,74 @@ STOCK_DPI_FIXABLE = 240
 # Technical metric baseline statistics (mean, std) for outlier detection
 # Thresholds are calculated as: mean ± 1.5*std
 # These can be recalibrated based on your image corpus
+# Based on empirical data from 2400-image GuruShots dataset (Nov 2025)
 TECHNICAL_BASELINES = {
     # Sharpness: lower is worse, flag if < mean - 1.5*std
-    "sharpness": {"mean": 45.0, "std": 20.0},  # threshold ~15
+    "sharpness": {"mean": 94.40, "std": 14.25},  # warn < 73.0, critical < 52.0
     # Noise: higher is worse, flag if > mean + 1.5*std  
-    "noise_score": {"mean": 30.0, "std": 15.0},  # threshold ~52.5
+    "noise_score": {"mean": 16.62, "std": 16.65},  # warn > 41.6, critical > 54.1
     # Highlight clipping %: higher is worse, flag if > mean + 1.5*std
-    "histogram_clipping_highlights": {"mean": 2.0, "std": 5.0},  # threshold ~9.5
+    "histogram_clipping_highlights": {"mean": 2.81, "std": 4.86},  # warn > 10.1, critical > 13.8
     # Shadow clipping %: higher is worse, flag if > mean + 1.5*std
-    "histogram_clipping_shadows": {"mean": 2.0, "std": 5.0},  # threshold ~9.5
+    "histogram_clipping_shadows": {"mean": 8.22, "std": 9.32},  # warn > 22.2, critical > 29.2
     # Color cast delta: higher is worse, flag if > mean + 1.5*std
     "color_cast_delta": {"mean": 8.0, "std": 6.0},  # threshold ~17
 }
 
-# Multiplier for outlier detection (1.5 = mild outliers, 2.0 = strong outliers)
-OUTLIER_SIGMA_MULTIPLIER = 1.5
+# Multiplier for outlier detection
+OUTLIER_SIGMA_MULTIPLIER_WARN = 1.5    # Mild outliers (warning)
+OUTLIER_SIGMA_MULTIPLIER_CRITICAL = 2.5  # Strong outliers (critical)
 
 
-def get_technical_threshold(metric_name: str, direction: str = "high") -> float:
+def get_technical_threshold(metric_name: str, direction: str = "high", severity: str = "warn") -> float:
     """Calculate threshold for a metric based on baseline statistics.
     
     Args:
         metric_name: Name of the metric in TECHNICAL_BASELINES
         direction: "high" for metrics where higher is worse (noise, clipping)
                    "low" for metrics where lower is worse (sharpness)
+        severity: "warn" for mild outliers (1.5σ), "critical" for strong (2.5σ)
     
     Returns:
-        Threshold value (mean ± 1.5*std)
+        Threshold value (mean ± multiplier*std)
     """
     baseline = TECHNICAL_BASELINES.get(metric_name, {"mean": 50.0, "std": 25.0})
     mean = baseline["mean"]
     std = baseline["std"]
     
+    multiplier = OUTLIER_SIGMA_MULTIPLIER_CRITICAL if severity == "critical" else OUTLIER_SIGMA_MULTIPLIER_WARN
+    
     if direction == "low":
-        return mean - (OUTLIER_SIGMA_MULTIPLIER * std)
+        return mean - (multiplier * std)
     else:  # high
-        return mean + (OUTLIER_SIGMA_MULTIPLIER * std)
+        return mean + (multiplier * std)
 
 
-# Legacy thresholds (kept for backward compatibility, now computed dynamically)
-STOCK_SHARPNESS_CRITICAL = get_technical_threshold("sharpness", "low")
-STOCK_SHARPNESS_OPTIMAL = TECHNICAL_BASELINES["sharpness"]["mean"]
-STOCK_NOISE_WARN = TECHNICAL_BASELINES["noise_score"]["mean"]
-STOCK_NOISE_HIGH = get_technical_threshold("noise_score", "high")
-STOCK_CLIPPING_THRESHOLD = get_technical_threshold("histogram_clipping_highlights", "high")
+# Thresholds computed from empirical baselines
+# Sharpness: lower is worse
+STOCK_SHARPNESS_WARN = get_technical_threshold("sharpness", "low", "warn")      # ~73.0
+STOCK_SHARPNESS_CRITICAL = get_technical_threshold("sharpness", "low", "critical")  # ~58.8
+STOCK_SHARPNESS_OPTIMAL = TECHNICAL_BASELINES["sharpness"]["mean"]  # ~94.4
+
+# Noise: higher is worse
+STOCK_NOISE_WARN = get_technical_threshold("noise_score", "high", "warn")       # ~41.6
+STOCK_NOISE_CRITICAL = get_technical_threshold("noise_score", "high", "critical")  # ~58.2
+
+# Highlight clipping: higher is worse
+STOCK_CLIPPING_HIGHLIGHTS_WARN = get_technical_threshold("histogram_clipping_highlights", "high", "warn")  # ~10.1
+STOCK_CLIPPING_HIGHLIGHTS_CRITICAL = get_technical_threshold("histogram_clipping_highlights", "high", "critical")  # ~15.0
+
+# Shadow clipping: higher is worse  
+STOCK_CLIPPING_SHADOWS_WARN = get_technical_threshold("histogram_clipping_shadows", "high", "warn")  # ~22.2
+STOCK_CLIPPING_SHADOWS_CRITICAL = get_technical_threshold("histogram_clipping_shadows", "high", "critical")  # ~31.5
+
+# Color cast
+COLOR_CAST_WARN = get_technical_threshold("color_cast_delta", "high", "warn")
+COLOR_CAST_CRITICAL = get_technical_threshold("color_cast_delta", "high", "critical")
+
+# Legacy aliases for backward compatibility
+STOCK_NOISE_HIGH = STOCK_NOISE_CRITICAL
+STOCK_CLIPPING_THRESHOLD = STOCK_CLIPPING_HIGHLIGHTS_WARN
 
 # Score validation bounds
 SCORE_MIN = 1
