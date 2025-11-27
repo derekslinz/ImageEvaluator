@@ -26,7 +26,7 @@ warnings.filterwarnings("ignore", message="Importing from timm.models.layers is 
 import math
 import numpy as np
 import requests
-from PIL import Image, ImageStat
+from PIL import Image, ImageFilter, ImageStat
 from colorama import Fore, Style
 from pydantic import BaseModel, ConfigDict, field_validator
 from tqdm import tqdm
@@ -428,10 +428,12 @@ def apply_profile_rules(profile_key: str, technical_metrics: Dict[str, Any]) -> 
 
     color_cast_label = technical_metrics.get("color_cast")
     color_cast_delta = technical_metrics.get("color_cast_delta", 0.0)
-    color_rules = rules.get("color_cast")
-    if color_rules and color_cast_label and color_cast_label != "neutral":
-        if color_cast_delta >= color_rules.get("threshold", 0.0):
-            penalty += color_rules.get("penalty", 0.0)
+    color_rules = rules.get("color_cast") or {}
+    color_threshold = color_rules.get("threshold", COLOR_CAST_WARN_THRESHOLD)
+    color_penalty = color_rules.get("penalty", 0.0)
+    if color_cast_label and color_cast_label != "neutral":
+        if color_cast_delta >= color_threshold:
+            penalty += color_penalty
             adjustments.append("color_cast")
 
     brightness = technical_metrics.get("brightness")
@@ -2173,9 +2175,83 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
                 metrics['noise'] = float(noise_score)  # backward-compatible alias
             else:
                 logger.debug("OpenCV not available, skipping Laplacian/denoise metrics for %s", image_path)
-                # Fallback sharpness proxy using grayscale standard deviation
-                gray_stat = ImageStat.Stat(img_gray)
-                metrics['sharpness'] = float(sum(gray_stat.stddev) / len(gray_stat.stddev))
+                gray_float = gray_array.astype(np.float32)
+                # Fallback Laplacian variance (discrete) to avoid wrapped edges
+                padded = np.pad(gray_float, 1, mode='edge')
+                laplacian = (
+                    -4 * gray_float
+                    + padded[1:-1, :-2]
+                    + padded[1:-1, 2:]
+                    + padded[:-2, 1:-1]
+                    + padded[2:, 1:-1]
+                )
+                laplacian_var = float(laplacian.var())
+
+                h, w = gray_array.shape
+                mp = (h * w) / 1_000_000
+                scale_factor = np.sqrt(max(mp, 0.1))
+                raw_sharpness = laplacian_var / scale_factor
+                sqrt_sharp = math.sqrt(max(0, raw_sharpness))
+                normalized = sqrt_sharp * 5.0
+                metrics['sharpness'] = float(max(0, min(100, normalized)))
+
+                # Basic noise estimate without OpenCV
+                target_long = 2048
+                scale = target_long / float(max(h, w))
+                if scale < 1.0:
+                    gray_small = np.array(
+                        Image.fromarray(gray_array).resize(
+                            (int(w * scale), int(h * scale)), resample=Image.BILINEAR
+                        )
+                    )
+                else:
+                    gray_small = gray_array
+
+                gray_f = gray_small.astype(np.float32) / 255.0
+                blurred = np.array(
+                    Image.fromarray(gray_small).filter(ImageFilter.GaussianBlur(radius=1.0)),
+                    dtype=np.float32,
+                ) / 255.0
+                residual = gray_f - blurred
+
+                gx = np.zeros_like(gray_f)
+                gy = np.zeros_like(gray_f)
+                gx[:, 1:] = np.diff(gray_f, axis=1)
+                gy[1:, :] = np.diff(gray_f, axis=0)
+                grad_mag = np.sqrt(gx**2 + gy**2)
+
+                edge_thresh = np.percentile(grad_mag, 75.0)
+                flat_mask = grad_mag < edge_thresh
+
+                p_low, p_high = np.percentile(gray_f, [5.0, 95.0])
+                luminance_mask = (gray_f > p_low) & (gray_f < p_high)
+
+                final_mask = flat_mask & luminance_mask
+                flat_residuals = residual[final_mask]
+                min_pixels = int(0.01 * residual.size)
+                if flat_residuals.size < min_pixels:
+                    flat_residuals = residual.flatten()
+                    logger.debug(f"Noise estimation using full image for {image_path} (insufficient flat regions)")
+
+                med = float(np.median(flat_residuals))  # type: ignore
+                mad = float(np.median(np.abs(flat_residuals - med)))  # type: ignore
+                if mad < 1e-6:
+                    sigma_noise = 0.0
+                else:
+                    sigma_noise = 1.4826 * mad
+
+                p1, p99 = np.percentile(gray_f, [1.0, 99.0])
+                dynamic_range = max(float(p99 - p1), 1e-6)
+                relative_noise = sigma_noise / dynamic_range
+
+                REL_NOISE_MIN = 0.002
+                REL_NOISE_MAX = 0.04
+                rn_clipped = min(max(relative_noise, REL_NOISE_MIN), REL_NOISE_MAX)
+                noise_score = (rn_clipped - REL_NOISE_MIN) / (REL_NOISE_MAX - REL_NOISE_MIN) * 100.0
+
+                metrics['noise_sigma'] = float(sigma_noise)
+                metrics['noise_score'] = float(noise_score)
+                metrics['noise'] = float(noise_score)
     
     except ImageResolutionTooSmallError:
         raise
