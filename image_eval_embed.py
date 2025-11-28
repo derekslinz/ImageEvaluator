@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 import warnings
+from bisect import bisect_left
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -98,6 +99,7 @@ Image.MAX_IMAGE_PIXELS = None  # Remove limit entirely (or set to a higher value
 # PyIQA configuration
 PYIQA_MAX_LONG_EDGE = 1024
 DEFAULT_CLIPIQ_MODEL = "clipiqa+_vitL14_512"
+DEFAULT_IQA_CALIBRATION_PATH = Path(__file__).with_name("iqa_calibration.json")
 
 # Stock evaluation thresholds
 STOCK_MIN_RESOLUTION_MP = 4.0
@@ -335,21 +337,85 @@ def normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
     return {k: v / total for k, v in positive_items.items()}
 
 
-def compute_metric_z_scores(metric_scores: Dict[str, float]) -> Dict[str, float]:
-    """Convert calibrated metric scores to z-scores using baseline statistics."""
+# IQA calibration (loaded from JSON at startup)
+IQA_CALIBRATION: Dict[str, Dict[str, Any]] = {}
+
+
+def _baseline_fallback() -> Dict[str, Dict[str, Any]]:
+    return {k: {"mu": v.get("mean", 0.0), "sigma": v.get("std", 0.0)} for k, v in PYIQA_BASELINE_STATS.items()}
+
+
+def load_iqa_calibration(calibration_path: Optional[Union[str, Path]]) -> Dict[str, Dict[str, Any]]:
+    """Load IQA calibration (mu, sigma, optional sorted values) from JSON."""
+
+    def _normalize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+        mu = entry.get("mu", entry.get("mean", 0.0))
+        sigma = entry.get("sigma", entry.get("std", 0.0))
+        normalized = {
+            "mu": float(mu) if mu is not None else 0.0,
+            "sigma": float(sigma) if sigma is not None else 0.0,
+        }
+        if isinstance(entry.get("sorted_values"), list):
+            normalized["sorted_values"] = entry["sorted_values"]
+        return normalized
+
+    if calibration_path:
+        path = Path(calibration_path).expanduser()
+    else:
+        path = DEFAULT_IQA_CALIBRATION_PATH
+
+    if path.is_file():
+        try:
+            payload = json.loads(path.read_text())
+            models = payload.get("iqa_models", payload)
+            calibration = {k: _normalize_entry(v) for k, v in models.items()}
+            logger.info("Loaded IQA calibration for %d models from %s", len(calibration), path)
+            return calibration
+        except Exception as exc:
+            logger.warning("Failed to load IQA calibration from %s: %s", path, exc)
+
+    logger.warning("Using fallback IQA calibration baselines; calibration file not found at %s", path)
+    return _baseline_fallback()
+
+
+def _compute_percentile(value: float, sorted_values: Optional[List[float]]) -> Optional[float]:
+    if not sorted_values:
+        return None
+    idx = bisect_left(sorted_values, value)
+    percentile = 100.0 * idx / len(sorted_values)
+    return max(0.0, min(100.0, percentile))
+
+
+def z_to_fused_score(z_score: float) -> float:
+    z_clamped = max(-3.0, min(3.0, z_score))
+    return (z_clamped + 3.0) / 6.0 * 100.0
+
+
+def compute_metric_z_scores(metric_scores: Dict[str, float]) -> Tuple[Dict[str, float], Dict[str, Optional[float]], Dict[str, float]]:
+    """Convert calibrated metric scores to z-scores using loaded calibration.
+
+    Returns:
+        z_scores: Clamped z-scores (±3)
+        percentiles: Empirical percentile estimates when sorted calibration values exist
+        fused_scores: Linear mapping of z to [0, 100]
+    """
+
     z_scores: Dict[str, float] = {}
+    percentiles: Dict[str, Optional[float]] = {}
+    fused_scores: Dict[str, float] = {}
     for key, value in metric_scores.items():
-        stats = PYIQA_BASELINE_STATS.get(key)
-        if not stats:
-            z_scores[key] = 0.0
-            continue
-        std = stats.get("std") or 0.0
-        if std <= 1e-6:
-            z_scores[key] = 0.0
-            continue
-        mean = stats.get("mean", 0.0)
-        z_scores[key] = (value - mean) / std
-    return z_scores
+        stats = IQA_CALIBRATION.get(key) or _baseline_fallback().get(key, {})
+        sigma = stats.get("sigma") or 0.0
+        if sigma <= 1e-6:
+            z = 0.0
+        else:
+            mu = stats.get("mu", 0.0)
+            z = (value - mu) / sigma
+        z_clamped = max(-3.0, min(3.0, z))
+        z_scores[key] = z_clamped
+        fused_scores[key] = z_to_fused_score(z_clamped)
+        percentiles[key] = _compute_percentile(value, stats.get("sorted_values"))
+    return z_scores, percentiles, fused_scores
 
 
 def compute_disagreement_z(z_scores: Dict[str, float]) -> float:
@@ -470,7 +536,10 @@ def build_profile_metadata(
     technical_warnings: List[str],
     metric_details: Dict[str, Dict[str, float]],
     z_scores: Dict[str, float],
+    percentiles: Dict[str, Optional[float]],
+    fused_scores: Dict[str, float],
     diff_z: float,
+    composite_z: float,
     base_score: float,
     final_score: float,
     rule_penalty: float,
@@ -495,9 +564,11 @@ def build_profile_metadata(
     metric_summary_parts = []
     for metric, detail in metric_details.items():
         z_val = z_scores.get(metric, 0.0)
-        metric_summary_parts.append(
-            f"{metric}:{detail['calibrated']:.1f} (z={z_val:+.2f})"
-        )
+        percentile = percentiles.get(metric)
+        summary = f"{metric}:{detail['calibrated']:.1f} (z={z_val:+.2f})"
+        if percentile is not None:
+            summary += f" p{percentile:.1f}"
+        metric_summary_parts.append(summary)
     metric_summary = "; ".join(metric_summary_parts)
 
     description_lines = [
@@ -514,6 +585,10 @@ def build_profile_metadata(
         "pyiqa_profile": profile_key,
         "pyiqa_metric_details": metric_details,
         "pyiqa_z_scores": z_scores,
+        "pyiqa_percentiles": percentiles,
+        "pyiqa_fused_scores": fused_scores,
+        "pyiqa_composite_z": composite_z,
+        "pyiqa_composite_fused_score": z_to_fused_score(composite_z),
         "pyiqa_disagreement_z": diff_z,
         "pyiqa_contributions": contributions,
         "pyiqa_rule_penalty": rule_penalty,
@@ -3261,7 +3336,11 @@ def process_images_with_pyiqa(
                 continue
 
             calibrated_scores = {k: v["calibrated"] for k, v in metric_details.items()}
-            z_scores = compute_metric_z_scores(calibrated_scores)
+            z_scores, percentiles, fused_scores = compute_metric_z_scores(calibrated_scores)
+            for metric_key, detail in metric_details.items():
+                detail["z"] = z_scores.get(metric_key, 0.0)
+                detail["percentile"] = percentiles.get(metric_key)
+                detail["fused_score"] = fused_scores.get(metric_key)
             diff_z = compute_disagreement_z(z_scores)
             base_score, composite_z, contributions = compute_profile_composite(profile_key, z_scores, diff_z)
             rule_penalty, rule_notes = apply_profile_rules(profile_key, technical_metrics)
@@ -3274,7 +3353,10 @@ def process_images_with_pyiqa(
                 technical_warnings=technical_warnings,
                 metric_details=metric_details,
                 z_scores=z_scores,
+                percentiles=percentiles,
+                fused_scores=fused_scores,
                 diff_z=diff_z,
+                composite_z=composite_z,
                 base_score=base_score,
                 final_score=final_score,
                 rule_penalty=rule_penalty,
@@ -3404,6 +3486,15 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
     """
     """Save processing results to CSV file."""
     with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+        model_fieldnames: List[str] = []
+        for model_key in sorted(IQA_CALIBRATION.keys()):
+            model_fieldnames.extend([
+                f"{model_key}_calibrated",
+                f"{model_key}_z",
+                f"{model_key}_percentile",
+                f"{model_key}_fused_score",
+            ])
+
         fieldnames = [
             'file_path', 'overall_score', 'technical_score', 'composition_score',
             'lighting_score', 'creativity_score', 'title', 'description',
@@ -3414,8 +3505,9 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
             'stock_overall_score', 'stock_recommendation', 'stock_primary_category',
             'stock_commercial_viability', 'stock_technical_quality', 'stock_composition_clarity',
             'stock_keyword_potential', 'stock_release_concerns', 'stock_rejection_risks',
-            'stock_llm_notes', 'stock_llm_issues'
-        ]
+            'stock_llm_notes', 'stock_llm_issues',
+            'pyiqa_composite_z', 'pyiqa_composite_fused_score', 'pyiqa_disagreement_z'
+        ] + model_fieldnames
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         writer.writeheader()
@@ -3424,7 +3516,8 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                 technical_metrics = metadata.get('technical_metrics', {})
                 warnings = metadata.get('technical_warnings', [])
                 warnings_str = '; '.join(warnings) if warnings else ''
-                writer.writerow({
+                pyiqa_details = technical_metrics.get('pyiqa_metric_details', {})
+                row: Dict[str, Any] = {
                     'file_path': file_path,
                     'overall_score': metadata.get('overall_score', metadata.get('score', '')),
                     'technical_score': metadata.get('technical_score', ''),
@@ -3462,10 +3555,27 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'stock_rejection_risks': metadata.get('stock_rejection_risks', ''),
                     'stock_llm_notes': metadata.get('stock_llm_notes', ''),
                     'stock_llm_issues': metadata.get('stock_llm_issues', ''),
+                    'pyiqa_composite_z': technical_metrics.get('pyiqa_composite_z', ''),
+                    'pyiqa_composite_fused_score': technical_metrics.get('pyiqa_composite_fused_score', ''),
+                    'pyiqa_disagreement_z': technical_metrics.get('pyiqa_disagreement_z', ''),
                     'status': 'success'
-                })
+                }
+
+                for model_key in sorted(IQA_CALIBRATION.keys()):
+                    detail = pyiqa_details.get(model_key, {}) if isinstance(pyiqa_details, dict) else {}
+                    row[f"{model_key}_calibrated"] = detail.get('calibrated', '')
+                    row[f"{model_key}_z"] = detail.get('z', '')
+                    row[f"{model_key}_percentile"] = detail.get('percentile', '')
+                    row[f"{model_key}_fused_score"] = detail.get('fused_score', '')
+
+                writer.writerow(row)
             else:
-                writer.writerow({
+                empty_model_fields = {
+                    f"{model_key}_{suffix}": ''
+                    for model_key in sorted(IQA_CALIBRATION.keys())
+                    for suffix in ["calibrated", "z", "percentile", "fused_score"]
+                }
+                failure_row = {
                     'file_path': file_path,
                     'overall_score': '',
                     'technical_score': '',
@@ -3504,7 +3614,12 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'stock_rejection_risks': '',
                     'stock_llm_notes': '',
                     'stock_llm_issues': '',
-                })
+                    'pyiqa_composite_z': '',
+                    'pyiqa_composite_fused_score': '',
+                    'pyiqa_disagreement_z': '',
+                }
+                failure_row.update(empty_model_fields)
+                writer.writerow(failure_row)
 
 
 def load_results_from_csv(csv_path: str) -> List[Tuple[str, Optional[Dict]]]:
@@ -4346,6 +4461,8 @@ if __name__ == "__main__":
                                help='Maximum PyIQA models kept in GPU memory at once (default: 5, lower = less VRAM)')
     process_parser.add_argument('--pyiqa-batch-size', type=int, default=8,
                                help='Number of images to score per PyIQA batch (default: 8, lower = less VRAM)')
+    process_parser.add_argument('--iqa-calibration', type=str, default=str(DEFAULT_IQA_CALIBRATION_PATH),
+                               help='Path to iqa_calibration.json containing mu/sigma (default: ./iqa_calibration.json)')
     process_parser.add_argument('--context-host-url', type=str, default=None,
                                help='Override endpoint for context classification (default: same as Ollama host)')
     process_parser.add_argument('--ollama-metadata', action='store_true',
@@ -4579,6 +4696,7 @@ if __name__ == "__main__":
     if not PYIQA_AVAILABLE:
         logger.error("PyIQA backend is required but torch/pyiqa are missing.")
         sys.exit(1)
+    IQA_CALIBRATION = load_iqa_calibration(getattr(args, "iqa_calibration", None))
     shift_overrides: Dict[str, float] = {}
     if args.pyiqa_score_shift is not None:
         shift_overrides[args.pyiqa_model.lower()] = args.pyiqa_score_shift
@@ -4614,6 +4732,7 @@ if __name__ == "__main__":
         print(f"PyIQA scale factor: {args.pyiqa_scale_factor}")
     if args.pyiqa_score_shift is not None:
         print(f"PyIQA custom score shift: {args.pyiqa_score_shift:+.2f}")
+    print(f"IQA calibration file: {getattr(args, 'iqa_calibration', '') or DEFAULT_IQA_CALIBRATION_PATH}")
     print("PyIQA composite models: clipiqa+_vitL14_512, laion_aes, musiq-ava, musiq-paq2piq, maniqa, disagreement penalty")
     print(f"Workers: {args.workers}")
     print(f"Skip existing: {args.skip_existing}")
