@@ -364,6 +364,8 @@ def load_iqa_calibration(calibration_path: Optional[Union[str, Path]]) -> Dict[s
 
     The optional 'sorted_values' field, if present, is used for percentile calculations.
     """
+
+    def _normalize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         mu = entry.get("mu", entry.get("mean", 0.0))
         sigma = entry.get("sigma", entry.get("std", 0.0))
         normalized = {
@@ -425,8 +427,9 @@ def compute_metric_z_scores(metric_scores: Dict[str, float]) -> Tuple[Dict[str, 
     z_scores: Dict[str, float] = {}
     percentiles: Dict[str, Optional[float]] = {}
     fused_scores: Dict[str, float] = {}
+    baseline = _baseline_fallback()
     for key, value in metric_scores.items():
-        stats = IQA_CALIBRATION.get(key) or _baseline_fallback().get(key, {})
+        stats = IQA_CALIBRATION.get(key) or baseline.get(key, {})
         sigma = stats.get("sigma") or 0.0
         if sigma <= 1e-6:
             z = 0.0
