@@ -2248,6 +2248,7 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
 
             if (
                 sharpness is None
+                or sigma_noise is None
                 or noise_score is None
                 or not math.isfinite(sharpness)
                 or not math.isfinite(noise_score)
