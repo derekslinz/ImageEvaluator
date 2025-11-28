@@ -66,6 +66,33 @@ RAWPY_AVAILABLE = rawpy is not None
 RAWPY_IMPORT_WARNINGED = False
 RAW_EXTENSIONS = {'.nef', '.cr2', '.cr3', '.arw', '.rw2', '.raf', '.orf', '.dng'}
 
+# SSL certificate workaround for corporate proxies/firewalls with SSL inspection
+# This allows PyIQA/timm to download model weights through SSL-inspecting proxies
+import ssl
+import certifi
+
+def _configure_ssl_for_model_downloads():
+    """Configure SSL context to handle self-signed certificates in proxy chains."""
+    try:
+        # Try to use certifi's certificate bundle
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        # Fall back to unverified context if certifi fails
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+    
+    # Patch urllib to use our context
+    import urllib.request
+    urllib.request.install_opener(
+        urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ssl_context)
+        )
+    )
+
+# Apply SSL fix before importing torch/pyiqa
+_configure_ssl_for_model_downloads()
+
 try:
     import torch  # type: ignore
     import pyiqa  # type: ignore
