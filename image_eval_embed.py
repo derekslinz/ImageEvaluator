@@ -3508,15 +3508,20 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
     """
     """Save processing results to CSV file."""
     with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+        # Collect all model keys from actual results
+        model_keys = set()
+        for _, metadata in results:
+            if metadata:
+                pyiqa_details = metadata.get('technical_metrics', {}).get('pyiqa_metric_details', {})
+                model_keys.update(pyiqa_details.keys())
         model_fieldnames: List[str] = []
-        for model_key in sorted(IQA_CALIBRATION.keys()):
+        for model_key in sorted(model_keys):
             model_fieldnames.extend([
                 f"{model_key}_calibrated",
                 f"{model_key}_z",
                 f"{model_key}_percentile",
                 f"{model_key}_fused_score",
             ])
-
         fieldnames = [
             'file_path', 'overall_score', 'technical_score', 'composition_score',
             'lighting_score', 'creativity_score', 'title', 'description',
