@@ -205,4 +205,5 @@ def test_analyze_image_technical_falls_back_on_degenerate_cv2(monkeypatch, tmp_p
 
     assert fallback_calls["count"] == 1
     assert metrics["sharpness"] == pytest.approx(12.5)
+    assert metrics["noise_sigma"] == pytest.approx(0.01)
     assert metrics["noise_score"] == pytest.approx(55.0)
