@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 warnings.filterwarnings("ignore", message="Importing from timm.models.layers is deprecated")
 
 import math
+from functools import lru_cache
 import numpy as np
 import requests
 from PIL import Image, ImageFilter, ImageStat
@@ -1664,6 +1665,56 @@ def open_image_for_analysis(image_path: str, max_long_edge: int = ANALYSIS_MAX_L
                     img.close()
 
 
+@lru_cache(maxsize=16)
+def _center_weight_mask(height: int, width: int, sigma_ratio: float = 0.35) -> np.ndarray:
+    """Return a normalized center-weighted mask favoring likely subject areas."""
+
+    y = np.linspace(-1.0, 1.0, height, dtype=np.float32)
+    x = np.linspace(-1.0, 1.0, width, dtype=np.float32)
+    yy, xx = np.meshgrid(y, x, indexing="ij")
+
+    sigma = sigma_ratio
+    gaussian = np.exp(-0.5 * ((xx / sigma) ** 2 + (yy / sigma) ** 2))
+    normalized = gaussian / max(gaussian.sum(), 1e-8)
+    return normalized
+
+
+def _compute_perceptual_sharpness(laplacian_map: np.ndarray) -> float:
+    """Estimate perceptual sharpness with subject weighting and DOF tolerance."""
+
+    if laplacian_map.size == 0:
+        return 0.0
+
+    lap_float = laplacian_map.astype(np.float32)
+    focus_abs = np.abs(lap_float)
+
+    height, width = focus_abs.shape
+    megapixels = (height * width) / 1_000_000
+
+    laplacian_var = float(focus_abs.var())
+    scale_factor = math.sqrt(max(megapixels, 0.1))
+    base_sharpness = math.sqrt(max(0.0, laplacian_var / scale_factor)) * 5.0
+
+    edge_95 = float(np.percentile(focus_abs, 95.0))
+    strength_norm = focus_abs / max(edge_95, focus_abs.mean() + 1e-6)
+    strength_norm = np.clip(strength_norm, 0.0, 2.0)
+
+    center_mask = _center_weight_mask(height, width)
+    subject_focus = float(np.sum(strength_norm * center_mask))
+
+    edge_threshold = edge_95 * 0.5 if edge_95 > 0 else focus_abs.mean()
+    coverage_ratio = float(np.mean(focus_abs > max(edge_threshold, 1e-6)))
+    coverage_score = min(1.0, coverage_ratio / 0.2)
+
+    perceptual = (
+        0.6 * base_sharpness
+        + 25.0 * min(subject_focus, 1.5) / 1.5
+        + 15.0 * coverage_score
+    )
+
+    return float(max(0.0, min(100.0, perceptual)))
+
+
 def _compute_sharpness_noise_fallback(gray_array: np.ndarray) -> Tuple[float, float, float]:
     """Estimate sharpness and noise without relying on OpenCV."""
 
@@ -1678,17 +1729,10 @@ def _compute_sharpness_noise_fallback(gray_array: np.ndarray) -> Tuple[float, fl
         + padded[:-2, 1:-1]
         + padded[2:, 1:-1]
     )
-    laplacian_var = float(laplacian.var())
-
-    h, w = gray_array.shape
-    mp = (h * w) / 1_000_000
-    scale_factor = np.sqrt(max(mp, 0.1))
-    raw_sharpness = laplacian_var / scale_factor
-    sqrt_sharp = math.sqrt(max(0, raw_sharpness))
-    normalized_sharpness = sqrt_sharp * 5.0
-    sharpness = float(max(0, min(100, normalized_sharpness)))
+    sharpness = _compute_perceptual_sharpness(laplacian)
 
     # Basic noise estimate using blurred residuals in flat regions
+    h, w = gray_array.shape
     target_long = 2048
     scale = target_long / float(max(h, w))
     if scale < 1.0:
@@ -2274,17 +2318,10 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
 
             if CV2_AVAILABLE and cv2 is not None:
                 try:
-                    laplacian_var = cv2.Laplacian(gray_array, cv2.CV_64F).var()
+                    laplacian_map = cv2.Laplacian(gray_array, cv2.CV_32F)
+                    sharpness = _compute_perceptual_sharpness(laplacian_map)
 
                     h, w = gray_array.shape
-                    mp = (h * w) / 1_000_000
-                    scale_factor = np.sqrt(max(mp, 0.1))
-                    raw_sharpness = laplacian_var / scale_factor
-
-                    sqrt_sharp = math.sqrt(max(0, raw_sharpness))
-                    normalized = sqrt_sharp * 5.0
-                    sharpness = float(max(0, min(100, normalized)))
-
                     target_long = 2048
                     scale = target_long / float(max(h, w))
                     if scale < 1.0:
