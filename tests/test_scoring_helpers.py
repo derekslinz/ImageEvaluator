@@ -2,6 +2,7 @@ import os
 import sys
 from contextlib import contextmanager
 
+import numpy as np
 import pytest
 from PIL import Image
 
@@ -142,3 +143,66 @@ def test_analyze_image_technical_enforces_min_long_edge(tmp_path, monkeypatch):
 
     with pytest.raises(ImageResolutionTooSmallError):
         analyze_image_technical(str(image_path))
+
+
+def test_analyze_image_technical_reports_sharpness_and_noise(tmp_path):
+    width, height = 900, 900
+    gradient = np.tile(np.linspace(0, 255, width, dtype=np.uint8), (height, 1))
+    noise = np.random.default_rng(123).integers(0, 30, size=(height, width), dtype=np.uint8)
+    channel = np.clip(gradient + noise, 0, 255).astype(np.uint8)
+    rgb = np.stack([channel, np.flipud(channel), channel], axis=2)
+
+    image_path = tmp_path / "textured.jpg"
+    Image.fromarray(rgb, mode="RGB").save(image_path)
+
+    metrics = analyze_image_technical(str(image_path))
+
+    assert metrics["status"] == "success"
+    assert metrics["sharpness"] > 0.0
+    assert metrics["noise_score"] > 0.0
+
+
+def test_analyze_image_technical_falls_back_on_degenerate_cv2(monkeypatch, tmp_path):
+    width, height = 900, 900
+    gradient = np.tile(np.linspace(0, 255, width, dtype=np.uint8), (height, 1))
+    image_path = tmp_path / "cv2_zeroed.jpg"
+    Image.fromarray(np.stack([gradient, gradient, gradient], axis=2), mode="RGB").save(image_path)
+
+    class DummyCV2:
+        CV_64F = 0
+        CV_32F = 0
+        INTER_AREA = 0
+
+        @staticmethod
+        def Laplacian(arr, dtype):
+            return np.zeros_like(arr, dtype=np.float64)
+
+        @staticmethod
+        def resize(arr, dsize=None, fx=1.0, fy=1.0, interpolation=None):
+            target_h = max(1, int(arr.shape[0] * fy))
+            target_w = max(1, int(arr.shape[1] * fx))
+            return np.zeros((target_h, target_w), dtype=arr.dtype)
+
+        @staticmethod
+        def GaussianBlur(arr, ksize, sigmaX=0.0, sigmaY=0.0):
+            return np.zeros_like(arr, dtype=np.float32)
+
+        @staticmethod
+        def Sobel(arr, ddepth, dx, dy, ksize):
+            return np.zeros_like(arr, dtype=np.float32)
+
+    fallback_calls = {"count": 0}
+
+    def fake_fallback(gray_array):
+        fallback_calls["count"] += 1
+        return 12.5, 0.01, 55.0
+
+    monkeypatch.setattr("image_eval_embed.cv2", DummyCV2())
+    monkeypatch.setattr("image_eval_embed.CV2_AVAILABLE", True)
+    monkeypatch.setattr("image_eval_embed._compute_sharpness_noise_fallback", fake_fallback)
+
+    metrics = analyze_image_technical(str(image_path))
+
+    assert fallback_calls["count"] == 1
+    assert metrics["sharpness"] == pytest.approx(12.5)
+    assert metrics["noise_score"] == pytest.approx(55.0)
