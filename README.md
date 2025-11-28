@@ -183,6 +183,17 @@ SCORE DISTRIBUTION
 
 ## Additional Tools
 
+### IQA Calibration Builder
+
+Generate stable PyIQA calibration parameters from a scored reference set (the default points to `/root/gurushots_facebook_challenge_winners/all.csv`). This writes `iqa_calibration.json` with per-model mean/std and optional percentile support.
+
+```bash
+python calibrate_iqa.py \
+  --input /root/gurushots_facebook_challenge_winners/all.csv \
+  --output iqa_calibration.json \
+  --overwrite
+```
+
 ### Stock Photo Evaluator
 
 Specialized assessment for stock photography submission:
