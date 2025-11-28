@@ -2275,6 +2275,71 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
     return metrics
 
 
+def count_technical_flags(technical_metrics: Dict) -> Tuple[int, int]:
+    """Count critical and warn-level technical flags for an image.
+    
+    Returns:
+        Tuple of (critical_count, warn_count) where:
+        - critical_count: number of metrics exceeding critical threshold
+        - warn_count: number of metrics exceeding warn but not critical threshold
+    """
+    critical_count = 0
+    warn_count = 0
+    
+    # Sharpness: lower is worse
+    sharpness = technical_metrics.get('sharpness')
+    if isinstance(sharpness, (int, float)):
+        if sharpness < STOCK_SHARPNESS_CRITICAL:
+            critical_count += 1
+        elif sharpness < STOCK_SHARPNESS_WARN:
+            warn_count += 1
+    
+    # Noise: higher is worse
+    noise_score = technical_metrics.get('noise_score')
+    if isinstance(noise_score, (int, float)):
+        if noise_score > STOCK_NOISE_CRITICAL:
+            critical_count += 1
+        elif noise_score > STOCK_NOISE_WARN:
+            warn_count += 1
+    
+    # Highlight clipping: higher is worse
+    highlights = technical_metrics.get('histogram_clipping_highlights')
+    if isinstance(highlights, (int, float)):
+        if highlights > STOCK_CLIPPING_HIGHLIGHTS_CRITICAL:
+            critical_count += 1
+        elif highlights > STOCK_CLIPPING_HIGHLIGHTS_WARN:
+            warn_count += 1
+    
+    # Shadow clipping: higher is worse
+    shadows = technical_metrics.get('histogram_clipping_shadows')
+    if isinstance(shadows, (int, float)):
+        if shadows > STOCK_CLIPPING_SHADOWS_CRITICAL:
+            critical_count += 1
+        elif shadows > STOCK_CLIPPING_SHADOWS_WARN:
+            warn_count += 1
+    
+    # Color cast: higher delta is worse
+    color_cast_delta = technical_metrics.get('color_cast_delta')
+    if isinstance(color_cast_delta, (int, float)):
+        if color_cast_delta > COLOR_CAST_CRITICAL:
+            critical_count += 1
+        elif color_cast_delta > COLOR_CAST_WARN:
+            warn_count += 1
+    
+    return critical_count, warn_count
+
+
+def is_technically_warned(technical_metrics: Dict) -> bool:
+    """Determine if an image should be counted as 'technically warned'.
+    
+    An image is technically warned if it has:
+    - At least one critical flag, OR
+    - At least two different metrics with warn flags
+    """
+    critical_count, warn_count = count_technical_flags(technical_metrics)
+    return critical_count >= 1 or warn_count >= 2
+
+
 def assess_technical_metrics(technical_metrics: Dict, context: str = "studio_photography") -> List[str]:
     """Generate human-readable warnings based on measured metrics and context."""
     profile = get_profile(context)
@@ -3678,7 +3743,13 @@ def calculate_statistics(results: List[Tuple[str, Optional[Dict]]]) -> Dict:
                             iqa_metrics_collected[model_name] = []
                         iqa_metrics_collected[model_name].append(float(cal_val))
     
-    warning_images = sum(1 for _, md in results if md and md.get('technical_warnings'))
+    # Count images with significant technical issues:
+    # - At least one critical flag, OR
+    # - At least two different metrics with warn flags
+    warning_images = sum(
+        1 for _, md in results 
+        if md and is_technically_warned(md.get('technical_metrics', {}))
+    )
 
     if not scores:
         return {

@@ -16,6 +16,8 @@ from image_eval_embed import (
     compute_disagreement_z,
     compute_metric_z_scores,
     compute_post_process_potential,
+    count_technical_flags,
+    is_technically_warned,
     map_context_to_profile,
     normalize_weights,
     prompt_for_image_folder,
@@ -207,3 +209,85 @@ def test_analyze_image_technical_falls_back_on_degenerate_cv2(monkeypatch, tmp_p
     assert metrics["sharpness"] == pytest.approx(12.5)
     assert metrics["noise_sigma"] == pytest.approx(0.01)
     assert metrics["noise_score"] == pytest.approx(55.0)
+
+
+def test_count_technical_flags_identifies_critical_and_warn():
+    """Test that count_technical_flags correctly counts critical vs warn flags."""
+    # No issues - clean image
+    clean = {
+        'sharpness': 100.0,
+        'noise_score': 10.0,
+        'histogram_clipping_highlights': 1.0,
+        'histogram_clipping_shadows': 2.0,
+        'color_cast_delta': 5.0,
+    }
+    critical, warn = count_technical_flags(clean)
+    assert critical == 0
+    assert warn == 0
+    
+    # One critical sharpness issue
+    critical_sharpness = {
+        'sharpness': 40.0,  # Below critical threshold (~58.8)
+        'noise_score': 10.0,
+        'histogram_clipping_highlights': 1.0,
+        'histogram_clipping_shadows': 2.0,
+        'color_cast_delta': 5.0,
+    }
+    critical, warn = count_technical_flags(critical_sharpness)
+    assert critical == 1
+    assert warn == 0
+    
+    # One warn-level issue (sharpness between warn and critical)
+    warn_sharpness = {
+        'sharpness': 65.0,  # Between warn (~73) and critical (~58.8)
+        'noise_score': 10.0,
+        'histogram_clipping_highlights': 1.0,
+        'histogram_clipping_shadows': 2.0,
+        'color_cast_delta': 5.0,
+    }
+    critical, warn = count_technical_flags(warn_sharpness)
+    assert critical == 0
+    assert warn == 1
+
+
+def test_is_technically_warned_requires_critical_or_two_warns():
+    """Test that is_technically_warned follows the 1 critical OR 2+ warns rule."""
+    # Clean image - not warned
+    clean = {
+        'sharpness': 100.0,
+        'noise_score': 10.0,
+        'histogram_clipping_highlights': 1.0,
+        'histogram_clipping_shadows': 2.0,
+        'color_cast_delta': 5.0,
+    }
+    assert is_technically_warned(clean) is False
+    
+    # One warn only - not warned
+    one_warn = {
+        'sharpness': 65.0,  # warn level
+        'noise_score': 10.0,
+        'histogram_clipping_highlights': 1.0,
+        'histogram_clipping_shadows': 2.0,
+        'color_cast_delta': 5.0,
+    }
+    assert is_technically_warned(one_warn) is False
+    
+    # One critical - warned
+    one_critical = {
+        'sharpness': 40.0,  # critical level
+        'noise_score': 10.0,
+        'histogram_clipping_highlights': 1.0,
+        'histogram_clipping_shadows': 2.0,
+        'color_cast_delta': 5.0,
+    }
+    assert is_technically_warned(one_critical) is True
+    
+    # Two warns (different metrics) - warned
+    two_warns = {
+        'sharpness': 65.0,  # warn level
+        'noise_score': 45.0,  # warn level (above ~41.6)
+        'histogram_clipping_highlights': 1.0,
+        'histogram_clipping_shadows': 2.0,
+        'color_cast_delta': 5.0,
+    }
+    assert is_technically_warned(two_warns) is True
