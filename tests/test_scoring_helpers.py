@@ -43,12 +43,12 @@ def test_normalize_weights_handles_negative_and_zero_totals():
 
 
 def test_compute_metric_z_scores_known_and_unknown_metrics():
-    z_scores = compute_metric_z_scores({
+    z_scores, percentiles, fused_scores = compute_metric_z_scores({
         "clipiqa_z": 80.40125,
         "unknown_metric": 10,
     })
     expected = (80.40125 - 70.40125) / 9.290555155864835
-    assert z_scores["clipiqa_z"] == pytest.approx(expected)
+    assert z_scores["clipiqa_z"] == pytest.approx(expected, abs=1e-6)
     assert z_scores["unknown_metric"] == 0.0
 
 

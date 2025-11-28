@@ -364,6 +364,8 @@ def load_iqa_calibration(calibration_path: Optional[Union[str, Path]]) -> Dict[s
 
     The optional 'sorted_values' field, if present, is used for percentile calculations.
     """
+
+    def _normalize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         mu = entry.get("mu", entry.get("mean", 0.0))
         sigma = entry.get("sigma", entry.get("std", 0.0))
         normalized = {
