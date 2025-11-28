@@ -346,9 +346,24 @@ def _baseline_fallback() -> Dict[str, Dict[str, Any]]:
 
 
 def load_iqa_calibration(calibration_path: Optional[Union[str, Path]]) -> Dict[str, Dict[str, Any]]:
-    """Load IQA calibration (mu, sigma, optional sorted values) from JSON."""
+    """
+    Load IQA calibration (mu, sigma, optional sorted values) from JSON.
 
-    def _normalize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    Expected JSON structure:
+        {
+          "iqa_models": {
+            "model_name": {
+              "mu": float,         # Mean value for z-score normalization
+              "sigma": float,      # Standard deviation for z-score normalization
+              "sorted_values": [float, ...]  # Optional: sorted calibration values for percentile calculation
+            }
+          }
+        }
+
+    If the file is missing or cannot be parsed, falls back to PYIQA_BASELINE_STATS.
+
+    The optional 'sorted_values' field, if present, is used for percentile calculations.
+    """
         mu = entry.get("mu", entry.get("mean", 0.0))
         sigma = entry.get("sigma", entry.get("std", 0.0))
         normalized = {
