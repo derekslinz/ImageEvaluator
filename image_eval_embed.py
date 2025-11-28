@@ -356,7 +356,14 @@ def load_iqa_calibration(calibration_path: Optional[Union[str, Path]]) -> Dict[s
             "sigma": float(sigma) if sigma is not None else 0.0,
         }
         if isinstance(entry.get("sorted_values"), list):
-            normalized["sorted_values"] = entry["sorted_values"]
+            try:
+                values = [float(x) for x in entry["sorted_values"]]
+                if values == sorted(values):
+                    normalized["sorted_values"] = values
+                else:
+                    logger.warning("IQA calibration: 'sorted_values' for entry %r are not sorted; ignoring.", entry)
+            except (TypeError, ValueError):
+                logger.warning("IQA calibration: 'sorted_values' for entry %r contain non-numeric values; ignoring.", entry)
         return normalized
 
     if calibration_path:
