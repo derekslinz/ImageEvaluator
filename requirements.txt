@@ -16,11 +16,10 @@ piexif>=1.1.3
 # Database (optional - for metadata storage)
 psycopg2-binary>=2.9
 
-# Data analysis (optional - for stats/reporting)
+# Data analysis (for stats/reporting)
 pandas>=1.5.0
 
-# PyIQA models (optional - for AI-based quality assessment)
-# Uncomment these for full PyIQA support:
-# torch>=2.0.0
-# pyiqa>=0.1.12
-# timm>=0.9.0
+# PyIQA models (for AI-based quality assessment)
+torch>=2.0.0
+pyiqa>=0.1.12
+timm>=0.9.0
