@@ -2261,7 +2261,7 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
                 sharpness, sigma_noise, noise_score = _compute_sharpness_noise_fallback(gray_array)
 
             metrics['sharpness'] = float(sharpness)
-            metrics['noise_sigma'] = float(sigma_noise or 0.0)
+            metrics['noise_sigma'] = float(sigma_noise) if sigma_noise is not None else 0.0
             metrics['noise_score'] = float(noise_score)
             metrics['noise'] = float(noise_score)
     
