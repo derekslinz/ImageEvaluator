@@ -138,10 +138,11 @@ STOCK_DPI_FIXABLE = 240
 # Technical metric baseline statistics (mean, std) for outlier detection
 # Thresholds are calculated as: mean ± 1.5*std
 # These can be recalibrated based on your image corpus
-# Based on empirical data from 2400-image GuruShots dataset (Nov 2025)
+# Based on empirical data from 9,200-image Lightroom library (Nov 2025)
 TECHNICAL_BASELINES = {
     # Sharpness: lower is worse, flag if < mean - 1.5*std
-    "sharpness": {"mean": 94.40, "std": 14.25},  # warn < 73.0, critical < 52.0
+    # Perceptual sharpness metric typically ranges 20-50 for normal images
+    "sharpness": {"mean": 33.0, "std": 8.0},  # warn < 21.0, critical < 13.0
     # Noise: higher is worse, flag if > mean + 1.5*std
     "noise_score": {"mean": 16.62, "std": 16.65},  # warn > 41.6, critical > 54.1
     # Highlight clipping %: higher is worse, flag if > mean + 1.5*std
