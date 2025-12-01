@@ -627,7 +627,7 @@ def build_profile_metadata(
 
     description_lines = [
         f"Composite profile '{display_name}' score {rounded}/100 ({category}).",
-        f"Base model blend before rules: {base_rounded}/100 (penalty {rule_penalty:+.1f}).",
+        f"Base model blend before rules: {base_rounded}/100 (penalty {-rule_penalty:+.1f}).",
         f"Model breakdown: {metric_summary}",
         f"Disagreement penalty (pyiqa_diff_z): {diff_z:+.2f}",
     ]
