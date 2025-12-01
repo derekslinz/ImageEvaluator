@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -75,6 +76,72 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def extract_iqa_from_description(description: str, columns: Iterable[str]) -> Dict[str, Optional[float]]:
+    """Extract IQA scores from the description field.
+    
+    The description contains patterns like:
+    'clipiqa_z:73.6 (z=+0.35); laion_aes_z:46.9 (z=-2.52); ...'
+    
+    Returns a dict mapping column name to its calibrated value (or None if not found).
+    """
+    result: Dict[str, Optional[float]] = {col: None for col in columns}
+    
+    if not isinstance(description, str):
+        return result
+    
+    # Pattern matches "model_name:value" where value is a float
+    for col in columns:
+        # Match patterns like "clipiqa_z:73.6" 
+        pattern = rf'{re.escape(col)}:([0-9.]+)'
+        match = re.search(pattern, description)
+        if match:
+            try:
+                result[col] = float(match.group(1))
+            except ValueError:
+                pass
+    
+    return result
+
+
+def extract_iqa_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+    """Extract IQA columns from description field if not present as direct columns.
+    
+    If the IQA columns exist directly in the DataFrame, return as-is.
+    Otherwise, parse them from the 'description' field.
+    """
+    columns_list = list(columns)
+    available = set(df.columns)
+    
+    # Check if all columns are directly available
+    missing = [col for col in columns_list if col not in available]
+    
+    if not missing:
+        # All columns present directly
+        return df
+    
+    # Need to extract from description
+    if 'description' not in df.columns:
+        raise ValueError(
+            f"IQA columns {missing} not found and no 'description' field to parse from."
+        )
+    
+    print(f"Extracting IQA scores from 'description' field for: {', '.join(missing)}")
+    
+    # Extract IQA values from each row's description
+    extracted_data = df['description'].apply(
+        lambda desc: extract_iqa_from_description(desc, columns_list)
+    )
+    
+    # Convert to DataFrame and merge
+    extracted_df = pd.DataFrame(extracted_data.tolist(), index=df.index)
+    
+    # Only add columns that were missing
+    for col in missing:
+        df[col] = extracted_df[col]
+    
+    return df
+
+
 def validate_columns(df_columns: Iterable[str], required: Iterable[str]) -> List[str]:
     available = set(df_columns)
     missing = [col for col in required if col not in available]
@@ -125,6 +192,13 @@ def main() -> None:
 
     df = pd.read_csv(input_path)
 
+    # Try to extract IQA columns from description field if not directly available
+    try:
+        df = extract_iqa_columns(df, args.columns)
+    except ValueError as e:
+        raise SystemExit(str(e))
+
+    # Validate that we now have all required columns
     missing_columns = validate_columns(df.columns, args.columns)
     if missing_columns:
         missing_list = ", ".join(missing_columns)
