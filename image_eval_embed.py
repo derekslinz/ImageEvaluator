@@ -226,10 +226,10 @@ HISTOGRAM_SHADOW_END = 6
 
 STOCK_EVALUATION_PROMPT = """You are a senior stock photography reviewer for major agencies (Adobe Stock, Shutterstock, Getty).
 Given the attached image and technical summary, output STRICT JSON with these keys:
-{"COMMERCIAL_VIABILITY": int, "TECHNICAL_QUALITY": int, "COMPOSITION_CLARITY": int, "KEYWORD_POTENTIAL": int,
+{{"COMMERCIAL_VIABILITY": int, "TECHNICAL_QUALITY": int, "COMPOSITION_CLARITY": int, "KEYWORD_POTENTIAL": int,
  "RELEASE_CONCERNS": int, "REJECTION_RISKS": int, "OVERALL_STOCK_SCORE": int,
  "RECOMMENDATION": "EXCELLENT|GOOD|MARGINAL|REJECT", "PRIMARY_CATEGORY": "Business|Lifestyle|Nature|Food|Technology|Travel|Other",
- "NOTES": "short sentence", "ISSUES": "comma list"}
+ "NOTES": "short sentence", "ISSUES": "comma list"}}
 
 Guidelines:
 - Scores 0-100 integers. Be conservative; mediocre images cluster 50-65.
@@ -838,7 +838,8 @@ def compute_stock_notes(technical_metrics: Dict[str, Any]) -> Tuple[List[str], L
     mp = technical_metrics.get('megapixels')
     if isinstance(mp, (int, float)):
         if mp < STOCK_MIN_RESOLUTION_MP:
-            notes.append(f"low resolution ({mp:.1f}MP < {STOCK_MIN_RESOLUTION_MP}MP)")
+            # Skip warning; agencies already see resolution in metadata
+            pass
         elif mp < STOCK_RECOMMENDED_MP:
             notes.append(f"below recommended resolution ({mp:.1f}MP)")
 
@@ -872,7 +873,6 @@ def compute_stock_notes(technical_metrics: Dict[str, Any]) -> Tuple[List[str], L
 
     dpi_x = technical_metrics.get('dpi_x')
     if isinstance(dpi_x, (int, float)) and dpi_x < STOCK_MIN_DPI:
-        notes.append(f"low DPI ({dpi_x:.0f})")
         if dpi_x >= STOCK_DPI_FIXABLE:
             fixable.append(f"DPI metadata: {dpi_x:.0f} → {STOCK_MIN_DPI}")
 
@@ -3609,13 +3609,16 @@ def verify_metadata(image_path: str, expected_metadata: Dict) -> bool:
         # For RAW/TIFF files, use exiftool to verify
         if file_ext in ['.dng', '.nef', '.tif', '.tiff']:
             result = subprocess.run(
-                ['exiftool', '-UserComment', '-XPTitle', '-XPComment', '-XPKeywords', '-s', '-s', '-s', image_path],
+                ['exiftool', '-UserComment', '-s3', image_path],
                 capture_output=True, text=True
             )
             if result.returncode == 0:
-                output = result.stdout
-                # Basic check - see if score appears in output
-                return str(expected_metadata.get('score', '')) in output
+                output = result.stdout.strip()
+                try:
+                    payload = json.loads(output)
+                    return str(expected_metadata.get('score', '')) == str(payload.get('score'))
+                except Exception:
+                    return str(expected_metadata.get('score', '')) in output
             return False
         
         # For JPEG/PNG, use PIL
@@ -3632,9 +3635,14 @@ def verify_metadata(image_path: str, expected_metadata: Dict) -> bool:
             user_comment = exif_dict["Exif"].get(piexif.ExifIFD.UserComment)
             
             if user_comment:
-                # Check if score is in UserComment
-                comment_str = str(user_comment)
-                return str(expected_metadata.get('score', '')) in comment_str
+                comment_str = user_comment
+                if isinstance(comment_str, bytes):
+                    comment_str = comment_str.decode(errors="ignore")
+                try:
+                    payload = json.loads(comment_str.strip())
+                    return str(expected_metadata.get('score', '')) == str(payload.get('score'))
+                except Exception:
+                    return str(expected_metadata.get('score', '')) in str(comment_str)
             
         return False
     except Exception as e:
@@ -3650,22 +3658,37 @@ def embed_metadata_exiftool(image_path: str, metadata: Dict, backup_dir: Optiona
         # Create backup first
         backup_image_path = get_backup_path(image_path, backup_dir)
         
-        # Build exiftool command
-        # UserComment for score, XPTitle, XPComment (description), XPKeywords
-        technical_str = metadata.get("technical_score", "")
+        # Build compact JSON payload in UserComment to stay unobtrusive
+        payload = {
+            "score": metadata.get("score", ""),
+            "profile": metadata.get("pyiqa_profile", metadata.get("context_label", "")),
+            "context": metadata.get("context_label", ""),
+            "stock_overall": metadata.get("stock_overall_score", ""),
+            "stock_rec": metadata.get("stock_recommendation", ""),
+            "stock_cat": metadata.get("stock_primary_category", ""),
+            "calibration": metadata.get("iqa_calibration_path", ""),
+        }
+        user_comment_value = json.dumps(payload, separators=(',', ':'), ensure_ascii=True)
+        score_val = metadata.get("score", "")
+        try:
+            score_int = int(float(score_val))
+        except (TypeError, ValueError):
+            score_int = 0
+        rating_percent = max(0, min(100, score_int))
+        rating_5 = max(0, min(5, int(round(rating_percent / 20.0))))
+        context_label = sanitize_string(metadata.get("context_label", ""))
+        xp_subject = context_label
 
         cmd = [
             'exiftool',
             '-overwrite_original',  # Don't create _original files
-            f'-UserComment={metadata.get("score", "")}',
-            f'-XPTitle={metadata.get("title", "")}',
-            f'-XPComment={metadata.get("description", "")}',
-            f'-XPKeywords={metadata.get("keywords", "")}',
-            f'-XPSubject={technical_str}',
+            f'-UserComment={user_comment_value}',
+            f'-Rating={rating_5}',
+            f'-RatingPercent={rating_percent}',
         ]
-        context_label = sanitize_string(metadata.get("context_label", ""))
         if context_label:
             cmd.append(f'-ImageDescription={context_label}')
+            cmd.append(f'-XPSubject={xp_subject}')
         cmd.append(image_path)
         
         # Create manual backup before modifying
@@ -3676,12 +3699,7 @@ def embed_metadata_exiftool(image_path: str, metadata: Dict, backup_dir: Optiona
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode == 0:
-            print(f"{Fore.BLUE}Embedding score:{Fore.RESET} {Fore.GREEN}{metadata.get('score', '')}{Fore.RESET}")
-            if technical_str:
-                print(f"{Fore.BLUE}Embedding technical score:{Fore.RESET} {Fore.GREEN}{technical_str}{Fore.RESET}")
-            print(f"{Fore.BLUE}Embedding Title:{Fore.RESET} {Fore.GREEN}{metadata.get('title', '')}{Fore.RESET}")
-            print(f"{Fore.BLUE}Embedding Description:{Fore.RESET} {Fore.GREEN}{metadata.get('description', '')}{Fore.RESET}")
-            print(f"{Fore.BLUE}Embedding Keywords:{Fore.RESET} {Fore.GREEN}{metadata.get('keywords', '')}{Fore.RESET}")
+            print(f"{Fore.BLUE}Embedding metadata blob:{Fore.RESET} {Fore.GREEN}UserComment (JSON){Fore.RESET}")
             
             # Verify if requested
             if verify:
@@ -3724,34 +3742,34 @@ def embed_metadata(image_path: str, metadata: Dict, backup_dir: Optional[str] = 
             else:
                 exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}  # Create a new EXIF structure
 
-            user_comment = piexif.helper.UserComment.dump(str(metadata.get('score', '')))
+            payload = {
+                "score": metadata.get("score", ""),
+                "profile": metadata.get("pyiqa_profile", metadata.get("context_label", "")),
+                "context": metadata.get("context_label", ""),
+                "stock_overall": metadata.get("stock_overall_score", ""),
+                "stock_rec": metadata.get("stock_recommendation", ""),
+                "stock_cat": metadata.get("stock_primary_category", ""),
+                "calibration": metadata.get("iqa_calibration_path", ""),
+            }
+            payload_str = json.dumps(payload, separators=(',', ':'), ensure_ascii=True)
+            user_comment = piexif.helper.UserComment.dump(payload_str)
             exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment
-            print(f"{Fore.BLUE}Embedding score:{Fore.RESET} {Fore.GREEN}{metadata.get('score', '')}{Fore.RESET}")
+            print(f"{Fore.BLUE}Embedding metadata blob:{Fore.RESET} {Fore.GREEN}UserComment (JSON){Fore.RESET}")
 
-            # Embedding Title (UTF-16LE with BOM for Windows compatibility)
-            title = metadata.get('title', '').encode('utf-16le') + b'\x00\x00'
-            exif_dict["0th"][piexif.ImageIFD.XPTitle] = title
-            print(f"{Fore.BLUE}Embedding Title:{Fore.RESET} {Fore.GREEN}{metadata.get('title', '')}{Fore.RESET}")
+            # Rating fields: map 0-100 score to RatingPercent and 0-5 Rating
+            try:
+                score_int = int(float(metadata.get("score", 0)))
+            except (TypeError, ValueError):
+                score_int = 0
+            rating_percent = max(0, min(100, score_int))
+            rating_5 = max(0, min(5, int(round(rating_percent / 20.0))))
+            exif_dict["0th"][0x4749] = int(rating_percent)  # RatingPercent
+            exif_dict["0th"][0x4746] = int(rating_5)        # Rating
 
-            # Embedding Description
-            description = metadata.get('description', '').encode('utf-16le') + b'\x00\x00'
-            exif_dict["0th"][piexif.ImageIFD.XPComment] = description
-            print(f"{Fore.BLUE}Embedding Description:{Fore.RESET} {Fore.GREEN}{metadata.get('description', '')}{Fore.RESET}")
-
-            # Embedding Keywords
-            keywords = metadata.get('keywords', '').encode('utf-16le') + b'\x00\x00'
-            exif_dict["0th"][piexif.ImageIFD.XPKeywords] = keywords
-            print(f"{Fore.BLUE}Embedding Keywords:{Fore.RESET} {Fore.GREEN}{metadata.get('keywords', '')}{Fore.RESET}")
-
-            technical_value = metadata.get('technical_score', '')
-            exif_dict["0th"][piexif.ImageIFD.XPSubject] = (str(technical_value).encode('utf-16le') + b'\x00\x00')
-            if technical_value:
-                print(f"{Fore.BLUE}Embedding technical score:{Fore.RESET} {Fore.GREEN}{technical_value}{Fore.RESET}")
-
+            # Context profile into XPSubject (UTF-16LE)
             context_value = sanitize_string(metadata.get('context_label', ''))
             if context_value:
-                exif_dict["0th"][piexif.ImageIFD.ImageDescription] = context_value.encode('utf-8')
-                print(f"{Fore.BLUE}Embedding Context:{Fore.RESET} {Fore.GREEN}{context_value}{Fore.RESET}")
+                exif_dict["0th"][piexif.ImageIFD.XPSubject] = context_value.encode('utf-16le') + b'\x00\x00'
 
             # Prepare Exif data with sanitized strings
             exif_bytes = piexif.dump(exif_dict)
