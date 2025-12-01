@@ -373,13 +373,17 @@ def normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
 
 # IQA calibration (loaded from JSON at startup)
 IQA_CALIBRATION: Dict[str, Dict[str, Any]] = {}
+IQA_CALIBRATION_META: Dict[str, Any] = {}
 
 
 def _baseline_fallback() -> Dict[str, Dict[str, Any]]:
     return {k: {"mu": v.get("mean", 0.0), "sigma": v.get("std", 0.0)} for k, v in PYIQA_BASELINE_STATS.items()}
 
 
-def load_iqa_calibration(calibration_path: Optional[Union[str, Path]]) -> Dict[str, Dict[str, Any]]:
+def load_iqa_calibration(
+    calibration_path: Optional[Union[str, Path]],
+    allow_fallback: bool = False
+) -> Dict[str, Dict[str, Any]]:
     """
     Load IQA calibration (mu, sigma, optional sorted values) from JSON.
 
@@ -398,6 +402,9 @@ def load_iqa_calibration(calibration_path: Optional[Union[str, Path]]) -> Dict[s
 
     The optional 'sorted_values' field, if present, is used for percentile calculations.
     """
+
+    global IQA_CALIBRATION_META
+    IQA_CALIBRATION_META = {}
 
     def _normalize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         mu = entry.get("mu", entry.get("mean", 0.0))
@@ -427,12 +434,33 @@ def load_iqa_calibration(calibration_path: Optional[Union[str, Path]]) -> Dict[s
             payload = json.loads(path.read_text())
             models = payload.get("iqa_models", payload)
             calibration = {k: _normalize_entry(v) for k, v in models.items()}
+            if not calibration:
+                raise ValueError("Calibration file contained no entries")
+            IQA_CALIBRATION_META = {
+                "path": str(path),
+                "generated_at": payload.get("generated_at"),
+                "source_csv": payload.get("source_csv"),
+                "row_count": payload.get("row_count"),
+                "fallback": False,
+            }
             logger.info("Loaded IQA calibration for %d models from %s", len(calibration), path)
             return calibration
         except Exception as exc:
+            if not allow_fallback:
+                raise RuntimeError(f"Failed to load IQA calibration from {path}: {exc}") from exc
             logger.warning("Failed to load IQA calibration from %s: %s", path, exc)
 
-    logger.warning("Using fallback IQA calibration baselines; calibration file not found at %s", path)
+    if not allow_fallback:
+        raise RuntimeError(f"IQA calibration file not found at {path}")
+
+    logger.warning("Using fallback IQA calibration baselines; calibration file not found or unreadable at %s", path)
+    IQA_CALIBRATION_META = {
+        "path": str(path),
+        "generated_at": None,
+        "source_csv": None,
+        "row_count": None,
+        "fallback": True,
+    }
     return _baseline_fallback()
 
 
@@ -771,10 +799,12 @@ def build_profile_metadata(
         "pyiqa_category": category,
         "pyiqa_component_scores": component_scores,
     })
+    extended_metrics["iqa_calibration_meta"] = IQA_CALIBRATION_META or {}
 
     composition_score = component_scores["composition"]
     lighting_score = component_scores["lighting"]
     creativity_score = component_scores["creativity"]
+    cal_meta = IQA_CALIBRATION_META or {}
 
     metadata = {
         'overall_score': str(rounded),
@@ -793,6 +823,9 @@ def build_profile_metadata(
         'pyiqa_profile': profile_key,
         'pyiqa_category': category,
         'context_label': context_label,
+        'iqa_calibration_path': cal_meta.get("path", ""),
+        'iqa_calibration_generated_at': cal_meta.get("generated_at", ""),
+        'iqa_calibration_row_count': cal_meta.get("row_count", ""),
     }
     return metadata
 
@@ -990,6 +1023,51 @@ def build_stock_technical_context(
     return "\n".join(parts)
 
 
+def _normalize_clip_percent(value: Any) -> float:
+    """Normalize clipping input (fraction or percent) to percent scale."""
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return val * 100.0 if val <= 1.0 else val
+
+
+def recompute_stock_overall_score(components: Dict[str, float], technical_metrics: Dict[str, Any]) -> Tuple[int, float]:
+    """Recompute stock overall score from component fields and technical penalties."""
+    cv = components.get("commercial_viability", 0.0)
+    tq = components.get("technical_quality", 0.0)
+    cc = components.get("composition_clarity", 0.0)
+    kp = components.get("keyword_potential", 0.0)
+    rc = components.get("release_concerns", 0.0)
+    rr = components.get("rejection_risks", 0.0)
+
+    base = (
+        0.4 * tq
+        + 0.25 * cv
+        + 0.2 * cc
+        + 0.1 * kp
+        + 0.05 * ((rc + rr) / 2.0)
+    )
+
+    highlight_pct = _normalize_clip_percent(technical_metrics.get('histogram_clipping_highlights', 0.0))
+    shadow_pct = _normalize_clip_percent(technical_metrics.get('histogram_clipping_shadows', 0.0))
+    sharpness = float(technical_metrics.get('sharpness', 0.0) or 0.0)
+
+    clip_flag = highlight_pct > 12.0 or shadow_pct > 12.0
+    sharp_flag = sharpness < 30.0
+
+    penalty = 0.0
+    if clip_flag:
+        penalty += 5.0
+    if sharp_flag:
+        penalty += 5.0
+    if clip_flag and sharp_flag:
+        penalty += 5.0  # stacked penalty when both apply
+
+    final = int(round(max(0.0, min(100.0, base - penalty))))
+    return final, base
+
+
 def generate_stock_assessment(
     image_path: str,
     ollama_host_url: str,
@@ -1088,6 +1166,28 @@ def generate_stock_assessment(
             logger.error(f"Failed to parse {field}='{val}' as float for {image_path}")
             return None
         result[out_key] = int(max(0, min(100, round(score))))
+
+    # Enforce local recomputation of the overall score using measured technicals
+    llm_overall = result.get("stock_overall_score", 0)
+    recomputed, base = recompute_stock_overall_score(
+        {
+            "commercial_viability": result.get("stock_commercial_viability", 0),
+            "technical_quality": result.get("stock_technical_quality", 0),
+            "composition_clarity": result.get("stock_composition_clarity", 0),
+            "keyword_potential": result.get("stock_keyword_potential", 0),
+            "release_concerns": result.get("stock_release_concerns", 0),
+            "rejection_risks": result.get("stock_rejection_risks", 0),
+        },
+        technical_metrics,
+    )
+    result["stock_overall_score_llm"] = llm_overall
+    result["stock_overall_score"] = recomputed
+    result["stock_overall_score_delta"] = recomputed - llm_overall
+    if abs(recomputed - llm_overall) > 3:
+        logger.info(
+            "Adjusted stock overall score for %s: LLM %s -> recomputed %s (base %.2f)",
+            image_path, llm_overall, recomputed, base,
+        )
 
     result["stock_recommendation"] = str(stock_obj.get("RECOMMENDATION", "")).upper()
     result["stock_primary_category"] = str(stock_obj.get("PRIMARY_CATEGORY", "")).title()
@@ -1347,9 +1447,11 @@ class PyIqaScorer:
             return raw_score * 10.0
         return raw_score
 
-    def _apply_shift(self, scaled_score: float) -> float:
+    def _apply_shift(self, scaled_score: float, clamp: bool = True) -> float:
         shifted = scaled_score + self.score_shift
-        return max(0.0, min(100.0, shifted))
+        if clamp:
+            return max(0.0, min(100.0, shifted))
+        return shifted
 
     def score_image(self, image_path: str) -> Tuple[float, float, float]:
         """Return (raw, scaled, calibrated) scores for a single image."""
@@ -1431,7 +1533,8 @@ class PyiqaManager:
                 if raw is None:
                     continue
                 scaled = scorer.convert_score(raw)
-                calibrated = scorer._apply_shift(scaled)
+                calibrated_unclamped = scorer._apply_shift(scaled, clamp=False)
+                calibrated = max(0.0, min(100.0, calibrated_unclamped))
             except RuntimeError as exc:
                 logger.error(f"PyIQA metric {model_name} failed for {image_path}: {exc}")
                 if "out of memory" in str(exc).lower() and torch is not None and torch.cuda.is_available():
@@ -1441,6 +1544,7 @@ class PyiqaManager:
             scores[metric_key] = {
                 "raw": float(raw),
                 "scaled": float(scaled),
+                "calibrated_unclamped": float(calibrated_unclamped),
                 "calibrated": float(calibrated),
                 "model_name": model_name,
             }
@@ -1523,11 +1627,13 @@ class PyiqaManager:
                                 raw = single_scores.get(path)
                                 if raw is not None:
                                     scaled = scorer.convert_score(raw)
-                                    calibrated = scorer._apply_shift(scaled)
+                                    calibrated_unclamped = scorer._apply_shift(scaled, clamp=False)
+                                    calibrated = max(0.0, min(100.0, calibrated_unclamped))
                                     for metric_key in metrics:
                                         all_results[path][metric_key] = {
                                             "raw": float(raw),
                                             "scaled": float(scaled),
+                                            "calibrated_unclamped": float(calibrated_unclamped),
                                             "calibrated": float(calibrated),
                                             "model_name": model_name,
                                         }
@@ -1541,11 +1647,13 @@ class PyiqaManager:
                     if raw is None:
                         continue
                     scaled = scorer.convert_score(raw)
-                    calibrated = scorer._apply_shift(scaled)
+                    calibrated_unclamped = scorer._apply_shift(scaled, clamp=False)
+                    calibrated = max(0.0, min(100.0, calibrated_unclamped))
                     for metric_key in metrics:
                         all_results[path][metric_key] = {
                             "raw": float(raw),
                             "scaled": float(scaled),
+                            "calibrated_unclamped": float(calibrated_unclamped),
                             "calibrated": float(calibrated),
                             "model_name": model_name,
                         }
@@ -2003,6 +2111,45 @@ def _detect_blur_type(gray_array: np.ndarray) -> Tuple[str, float]:
         return 'unknown', 0.0
 
 
+def _compute_color_cast_metrics(img_rgb: Image.Image, context: str) -> Tuple[float, str, float]:
+    """Estimate color cast using Lab mean deviation with context-aware thresholds."""
+    context_multiplier = {
+        "landscape": 1.3,
+        "night_artificial_light": 1.5,
+        "night_natural_light": 1.4,
+        "fineart_creative": 1.4,
+    }.get(context, 1.0)
+    threshold = COLOR_CAST_WARN * context_multiplier
+
+    try:
+        if CV2_AVAILABLE and cv2 is not None:
+            arr = np.array(img_rgb.convert("RGB"), dtype=np.uint8)
+            lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB).astype(np.float32)
+        else:
+            lab = np.array(img_rgb.convert("LAB"), dtype=np.float32)
+        a_mean = float(lab[..., 1].mean() - 128.0)
+        b_mean = float(lab[..., 2].mean() - 128.0)
+        delta_lab = math.sqrt(a_mean ** 2 + b_mean ** 2)
+    except Exception:
+        # Fallback to channel mean differences if Lab conversion fails
+        stat = ImageStat.Stat(img_rgb)
+        r_mean, g_mean, b_mean = stat.mean[:3]
+        delta_lab = float(max(abs(r_mean - g_mean), abs(g_mean - b_mean), abs(r_mean - b_mean)))
+        a_mean = r_mean - g_mean
+        b_mean = b_mean - g_mean if isinstance(b_mean, (int, float)) else 0.0
+
+    label = "neutral"
+    if delta_lab >= threshold:
+        if abs(a_mean) > abs(b_mean) * 1.1:
+            label = "warm/red" if a_mean > 0 else "green"
+        elif abs(b_mean) > abs(a_mean) * 1.1:
+            label = "cool/blue" if b_mean < 0 else "yellow"
+        else:
+            label = "mixed"
+
+    return delta_lab, label, threshold
+
+
 def _compute_perceptual_sharpness_v2(
     gray_array: np.ndarray,
     context: str = 'studio_photography'
@@ -2197,7 +2344,8 @@ def _compute_perceptual_sharpness(laplacian_map: np.ndarray) -> float:
 def _compute_sharpness_noise_fallback(gray_array: np.ndarray) -> Tuple[float, float, float]:
     """Estimate sharpness and noise without relying on OpenCV."""
 
-    gray_float = gray_array.astype(np.float32)
+    gray_uint8 = np.clip(gray_array, 0, 255).astype(np.uint8)
+    gray_float = gray_uint8.astype(np.float32)
 
     # Discrete Laplacian to approximate focus/edge strength
     padded = np.pad(gray_float, 1, mode='edge')
@@ -2211,17 +2359,17 @@ def _compute_sharpness_noise_fallback(gray_array: np.ndarray) -> Tuple[float, fl
     sharpness = _compute_perceptual_sharpness(laplacian)
 
     # Basic noise estimate using blurred residuals in flat regions
-    h, w = gray_array.shape
+    h, w = gray_uint8.shape
     target_long = 2048
     scale = target_long / float(max(h, w))
     if scale < 1.0:
         gray_small = np.array(
-            Image.fromarray(gray_array).resize(
+            Image.fromarray(gray_uint8).resize(
                 (int(w * scale), int(h * scale)), resample=Image.BILINEAR
             )
         )
     else:
-        gray_small = gray_array
+        gray_small = gray_uint8
 
     gray_f = gray_small.astype(np.float32) / 255.0
     blurred = np.array(
@@ -2786,22 +2934,11 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
             metrics['histogram_clipping_highlights'] = max(highlights_per_channel)
             metrics['histogram_clipping_shadows'] = max(shadows_per_channel)
 
-            # --- Color cast detection (global) ---
-            r_mean, g_mean, b_mean = stat.mean[:3]
-            max_diff = max(abs(r_mean - g_mean), abs(g_mean - b_mean), abs(r_mean - b_mean))
-            metrics['color_cast_delta'] = float(max_diff)
-            # We only set the label here; the profile decides how/if to penalize.
-            if max_diff > COLOR_CAST_THRESHOLD:
-                # Identify dominant channel with sufficient margin (>5 units)
-                if r_mean > g_mean + 5 and r_mean > b_mean + 5:
-                    metrics['color_cast'] = 'warm/red'
-                elif b_mean > r_mean + 5 and b_mean > g_mean + 5:
-                    metrics['color_cast'] = 'cool/blue'
-                elif g_mean > r_mean + 5 and g_mean > b_mean + 5:
-                    metrics['color_cast'] = 'green'
-                else:
-                    # max_diff > threshold but no clear dominant channel
-                    metrics['color_cast'] = 'mixed'
+            # --- Color cast detection (global, Lab-aware with context gate) ---
+            delta_lab, color_label, threshold_used = _compute_color_cast_metrics(img_rgb, context)
+            metrics['color_cast_delta'] = float(delta_lab)
+            metrics['color_cast'] = color_label
+            metrics['color_cast_threshold'] = float(threshold_used)
 
             # --- Sharpness via Laplacian variance (scale-normalized) ---
             img_gray = img_rgb.convert('L')
@@ -2912,7 +3049,45 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
                     REL_NOISE_MIN = 0.002
                     REL_NOISE_MAX = 0.04
                     rn_clipped = min(max(relative_noise, REL_NOISE_MIN), REL_NOISE_MAX)
+                    # Optional per-channel refinement on flat regions (helps chroma noise detection)
+                    try:
+                        color_small = np.array(
+                            img_rgb.resize((gray_small.shape[1], gray_small.shape[0]), resample=Image.BILINEAR)
+                        ).astype(np.float32) / 255.0
+                        channel_mask = final_mask
+                        if channel_mask.shape != color_small.shape[:2]:
+                            channel_mask = cv2.resize(
+                                channel_mask.astype(np.uint8),
+                                (color_small.shape[1], color_small.shape[0]),
+                                interpolation=cv2.INTER_NEAREST
+                            ) > 0
+                        channel_sigmas: List[float] = []
+                        for ch in range(3):
+                            blurred_ch = cv2.GaussianBlur(color_small[..., ch], (0, 0), sigmaX=1.0, sigmaY=1.0)
+                            residual_ch = color_small[..., ch] - blurred_ch
+                            flat_ch = residual_ch[channel_mask]
+                            if flat_ch.size:
+                                med_ch = float(np.median(flat_ch))
+                                mad_ch = float(np.median(np.abs(flat_ch - med_ch)))
+                                channel_sigmas.append(1.4826 * mad_ch)
+                        if channel_sigmas:
+                            sigma_noise = max(sigma_noise or 0.0, max(channel_sigmas))
+                    except Exception as exc:
+                        logger.debug(f"Channel noise estimation fallback for {image_path}: {exc}")
+
                     noise_score = (rn_clipped - REL_NOISE_MIN) / (REL_NOISE_MAX - REL_NOISE_MIN) * 100.0
+                    # Soften penalty for legitimately high ISO captures
+                    if iso_value:
+                        try:
+                            iso_int = int(float(iso_value))
+                            if iso_int > 6400:
+                                noise_score *= 0.75
+                            elif iso_int > 3200:
+                                noise_score *= 0.80
+                            elif iso_int > 1600:
+                                noise_score *= 0.90
+                        except (TypeError, ValueError):
+                            pass
                 except Exception as err:
                     logger.debug("OpenCV-based sharpness/noise failed for %s: %s", image_path, err)
 
@@ -3938,7 +4113,10 @@ def process_images_with_pyiqa(
                 pbar.update(1)
                 continue
 
-            calibrated_scores = {k: v["calibrated"] for k, v in metric_details.items()}
+            calibrated_scores = {
+                k: v.get("calibrated_unclamped", v.get("calibrated", 0.0))
+                for k, v in metric_details.items()
+            }
             z_scores, percentiles, fused_scores = compute_metric_z_scores(calibrated_scores)
             for metric_key, detail in metric_details.items():
                 detail["z"] = z_scores.get(metric_key, 0.0)
@@ -4116,11 +4294,13 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
             'subject_sharpness', 'background_sharpness', 'dof_ratio',
             # Stock/resolution metrics
             'resolution_mp', 'dpi', 'stock_notes', 'stock_fixable',
-            'stock_overall_score', 'stock_recommendation', 'stock_primary_category',
+            'stock_overall_score', 'stock_overall_score_llm', 'stock_overall_score_delta',
+            'stock_recommendation', 'stock_primary_category',
             'stock_commercial_viability', 'stock_technical_quality', 'stock_composition_clarity',
             'stock_keyword_potential', 'stock_release_concerns', 'stock_rejection_risks',
             'stock_llm_notes', 'stock_llm_issues',
-            'pyiqa_composite_z', 'pyiqa_composite_fused_score', 'pyiqa_disagreement_z'
+            'pyiqa_composite_z', 'pyiqa_composite_fused_score', 'pyiqa_disagreement_z',
+            'iqa_calibration_path', 'iqa_calibration_generated_at', 'iqa_calibration_row_count'
         ] + model_fieldnames
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
@@ -4168,6 +4348,8 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'stock_notes': '; '.join(technical_metrics.get('stock_notes', [])),
                     'stock_fixable': '; '.join(technical_metrics.get('stock_fixable', [])),
                     'stock_overall_score': metadata.get('stock_overall_score', ''),
+                    'stock_overall_score_llm': metadata.get('stock_overall_score_llm', ''),
+                    'stock_overall_score_delta': metadata.get('stock_overall_score_delta', ''),
                     'stock_recommendation': metadata.get('stock_recommendation', ''),
                     'stock_primary_category': metadata.get('stock_primary_category', ''),
                     'stock_commercial_viability': metadata.get('stock_commercial_viability', ''),
@@ -4181,6 +4363,9 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'pyiqa_composite_z': technical_metrics.get('pyiqa_composite_z', ''),
                     'pyiqa_composite_fused_score': technical_metrics.get('pyiqa_composite_fused_score', ''),
                     'pyiqa_disagreement_z': technical_metrics.get('pyiqa_disagreement_z', ''),
+                    'iqa_calibration_path': metadata.get('iqa_calibration_path', ''),
+                    'iqa_calibration_generated_at': metadata.get('iqa_calibration_generated_at', ''),
+                    'iqa_calibration_row_count': metadata.get('iqa_calibration_row_count', ''),
                     'status': 'success'
                 }
 
@@ -4227,6 +4412,8 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'stock_notes': '',
                     'stock_fixable': '',
                     'stock_overall_score': '',
+                    'stock_overall_score_llm': '',
+                    'stock_overall_score_delta': '',
                     'stock_recommendation': '',
                     'stock_primary_category': '',
                     'stock_commercial_viability': '',
@@ -4240,6 +4427,9 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'pyiqa_composite_z': '',
                     'pyiqa_composite_fused_score': '',
                     'pyiqa_disagreement_z': '',
+                    'iqa_calibration_path': '',
+                    'iqa_calibration_generated_at': '',
+                    'iqa_calibration_row_count': '',
                 }
                 failure_row.update(empty_model_fields)
                 writer.writerow(failure_row)
@@ -4286,6 +4476,16 @@ def load_results_from_csv(csv_path: str) -> List[Tuple[str, Optional[Dict]]]:
                 if color_cast:
                     technical_metrics['color_cast'] = color_cast
                 
+                cal_meta: Dict[str, Any] = {}
+                if row.get('iqa_calibration_path'):
+                    cal_meta['path'] = row.get('iqa_calibration_path')
+                if row.get('iqa_calibration_generated_at'):
+                    cal_meta['generated_at'] = row.get('iqa_calibration_generated_at')
+                if row.get('iqa_calibration_row_count'):
+                    cal_meta['row_count'] = row.get('iqa_calibration_row_count')
+                if cal_meta:
+                    technical_metrics['iqa_calibration_meta'] = cal_meta
+                
                 # Parse IQA model scores from description
                 # Format: "clipiqa_z:56.6 (z=-1.48); laion_aes_z:46.8 (z=-2.91); ..."
                 pyiqa_details: Dict[str, Dict[str, float]] = {}
@@ -4318,9 +4518,25 @@ def load_results_from_csv(csv_path: str) -> List[Tuple[str, Optional[Dict]]]:
                     'title': row.get('title', ''),
                     'description': row.get('description', ''),
                     'keywords': row.get('keywords', ''),
+                    'stock_overall_score': row.get('stock_overall_score', ''),
+                    'stock_overall_score_llm': row.get('stock_overall_score_llm', ''),
+                    'stock_overall_score_delta': row.get('stock_overall_score_delta', ''),
+                    'stock_recommendation': row.get('stock_recommendation', ''),
+                    'stock_primary_category': row.get('stock_primary_category', ''),
+                    'stock_commercial_viability': row.get('stock_commercial_viability', ''),
+                    'stock_technical_quality': row.get('stock_technical_quality', ''),
+                    'stock_composition_clarity': row.get('stock_composition_clarity', ''),
+                    'stock_keyword_potential': row.get('stock_keyword_potential', ''),
+                    'stock_release_concerns': row.get('stock_release_concerns', ''),
+                    'stock_rejection_risks': row.get('stock_rejection_risks', ''),
+                    'stock_llm_notes': row.get('stock_llm_notes', ''),
+                    'stock_llm_issues': row.get('stock_llm_issues', ''),
                     'technical_warnings': row.get('technical_warnings', '').split('; ') if row.get('technical_warnings') else [],
                     'post_process_potential': row.get('post_process_potential', ''),
                     'technical_metrics': technical_metrics,
+                    'iqa_calibration_path': row.get('iqa_calibration_path', ''),
+                    'iqa_calibration_generated_at': row.get('iqa_calibration_generated_at', ''),
+                    'iqa_calibration_row_count': row.get('iqa_calibration_row_count', ''),
                 }
             results.append((row.get('file_path', ''), metadata))
     return results
@@ -5094,6 +5310,8 @@ if __name__ == "__main__":
                                help='Number of images to score per PyIQA batch (default: 8, lower = less VRAM)')
     process_parser.add_argument('--iqa-calibration', type=str, default=str(DEFAULT_IQA_CALIBRATION_PATH),
                                help='Path to iqa_calibration.json containing mu/sigma (default: ./iqa_calibration.json)')
+    process_parser.add_argument('--allow-calibration-fallback', action='store_true',
+                               help='Allow built-in baseline if calibration file is missing or invalid (default: fail fast)')
     process_parser.add_argument('--context-host-url', type=str, default=None,
                                help='Override endpoint for context classification (default: same as Ollama host)')
     process_parser.add_argument('--ollama-metadata', action='store_true',
@@ -5327,7 +5545,10 @@ if __name__ == "__main__":
     if not PYIQA_AVAILABLE:
         logger.error("PyIQA backend is required but torch/pyiqa are missing.")
         sys.exit(1)
-    IQA_CALIBRATION = load_iqa_calibration(getattr(args, "iqa_calibration", None))
+    IQA_CALIBRATION = load_iqa_calibration(
+        getattr(args, "iqa_calibration", None),
+        allow_fallback=getattr(args, "allow_calibration_fallback", False)
+    )
     shift_overrides: Dict[str, float] = {}
     if args.pyiqa_score_shift is not None:
         shift_overrides[args.pyiqa_model.lower()] = args.pyiqa_score_shift
@@ -5363,7 +5584,20 @@ if __name__ == "__main__":
         print(f"PyIQA scale factor: {args.pyiqa_scale_factor}")
     if args.pyiqa_score_shift is not None:
         print(f"PyIQA custom score shift: {args.pyiqa_score_shift:+.2f}")
-    print(f"IQA calibration file: {getattr(args, 'iqa_calibration', '') or DEFAULT_IQA_CALIBRATION_PATH}")
+    cal_meta = IQA_CALIBRATION_META or {}
+    cal_path_display = cal_meta.get("path") or getattr(args, 'iqa_calibration', '') or DEFAULT_IQA_CALIBRATION_PATH
+    if cal_meta.get("fallback"):
+        cal_info = f"{cal_path_display} (fallback baselines)"
+    else:
+        extras = []
+        if cal_meta.get("row_count") is not None:
+            extras.append(f"rows:{cal_meta['row_count']}")
+        if cal_meta.get("generated_at"):
+            extras.append(f"generated:{cal_meta['generated_at']}")
+        cal_info = cal_path_display
+        if extras:
+            cal_info = f"{cal_info} ({', '.join(extras)})"
+    print(f"IQA calibration file: {cal_info}")
     print("PyIQA composite models: clipiqa+_vitL14_512, laion_aes, musiq-ava, musiq-paq2piq, maniqa, disagreement penalty")
     print(f"Workers: {args.workers}")
     print(f"Skip existing: {args.skip_existing}")

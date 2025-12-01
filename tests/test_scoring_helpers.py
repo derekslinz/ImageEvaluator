@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ from image_eval_embed import (
     normalize_weights,
     prompt_for_image_folder,
     validate_score,
+    load_iqa_calibration,
 )
 
 
@@ -209,6 +211,30 @@ def test_analyze_image_technical_falls_back_on_degenerate_cv2(monkeypatch, tmp_p
     assert metrics["sharpness"] == pytest.approx(12.5)
     assert metrics["noise_sigma"] == pytest.approx(0.01)
     assert metrics["noise_score"] == pytest.approx(55.0)
+
+
+def test_load_iqa_calibration_requires_file(tmp_path):
+    missing = tmp_path / "missing.json"
+
+    # Strict mode should raise when file is absent or invalid
+    with pytest.raises(RuntimeError):
+        load_iqa_calibration(missing, allow_fallback=False)
+
+    payload = {
+        "iqa_models": {"foo": {"mu": 1.0, "sigma": 2.0}},
+        "row_count": 5,
+        "generated_at": "2025-01-01T00:00:00Z",
+        "source_csv": "test.csv",
+    }
+    missing.write_text(json.dumps(payload))
+    calibration = load_iqa_calibration(missing, allow_fallback=False)
+    assert calibration["foo"]["mu"] == pytest.approx(1.0)
+    assert calibration["foo"]["sigma"] == pytest.approx(2.0)
+
+    # Allow fallback explicitly
+    missing.write_text("not json")
+    fallback_calibration = load_iqa_calibration(missing, allow_fallback=True)
+    assert fallback_calibration
 
 
 def test_count_technical_flags_identifies_critical_and_warn():

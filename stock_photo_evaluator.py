@@ -80,6 +80,51 @@ UNFIXABLE_KEYWORDS = [
 ]
 
 
+def _normalize_clip_percent(value: float) -> float:
+    """Normalize clipping metric (fraction or percent) to percent."""
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return val * 100.0 if val <= 1.0 else val
+
+
+def recompute_stock_overall_score(components: Dict[str, float], technical_data: Dict[str, Union[float, str, List[str]]]) -> Tuple[int, float]:
+    """Recompute OVERALL_STOCK_SCORE using the documented formula and technical penalties."""
+    cv = components.get('commercial_viability', 0.0)
+    tq = components.get('technical_quality', 0.0)
+    cc = components.get('composition_clarity', 0.0)
+    kp = components.get('keyword_potential', 0.0)
+    rc = components.get('release_concerns', 0.0)
+    rr = components.get('rejection_risks', 0.0)
+
+    base = (
+        0.4 * tq
+        + 0.25 * cv
+        + 0.2 * cc
+        + 0.1 * kp
+        + 0.05 * ((rc + rr) / 2.0)
+    )
+
+    highlight_pct = _normalize_clip_percent(technical_data.get('highlight_clip', 0.0))
+    shadow_pct = _normalize_clip_percent(technical_data.get('shadow_clip', 0.0))
+    sharpness = float(technical_data.get('sharpness', 0.0) or 0.0)
+
+    clip_flag = highlight_pct > 12.0 or shadow_pct > 12.0
+    sharp_flag = sharpness < 30.0
+
+    penalty = 0.0
+    if clip_flag:
+        penalty += 5.0
+    if sharp_flag:
+        penalty += 5.0
+    if clip_flag and sharp_flag:
+        penalty += 5.0
+
+    final = int(round(max(0.0, min(100.0, base - penalty))))
+    return final, base
+
+
 # Type definition for technical analysis results
 class TechnicalData(TypedDict):
     """Type definition for technical analysis results."""
@@ -620,8 +665,22 @@ def evaluate_image_for_stock(
             fixable_issues_str = '; '.join(fixable_list) if fixable_list else 'None'
             
             recommendation = scores.get('recommendation', 'UNKNOWN')
-            overall_stock_score = scores.get('overall_stock_score', 0)
             issues = scores.get('issues', '')
+
+            # Enforce local recomputation of OVERALL_STOCK_SCORE
+            components = {
+                'commercial_viability': scores.get('commercial_viability', 0),
+                'technical_quality': scores.get('technical_quality', 0),
+                'composition_clarity': scores.get('composition_clarity', 0),
+                'keyword_potential': scores.get('keyword_potential', 0),
+                'release_concerns': scores.get('release_concerns', 0),
+                'rejection_risks': scores.get('rejection_risks', 0),
+            }
+            llm_overall = scores.get('overall_stock_score', 0)
+            recomputed_overall, base_score = recompute_stock_overall_score(components, technical_data)
+            if abs(recomputed_overall - llm_overall) > 3:
+                issues = (issues + " | " if issues else "") + f"LLM overall {llm_overall} adjusted to {recomputed_overall} (base {base_score:.1f})"
+            overall_stock_score = recomputed_overall
             
             # If recommendation is MARGINAL and there are only fixable issues, upgrade to MARGINAL-FIXABLE
             if recommendation == "MARGINAL" and fixable_list and overall_stock_score >= MIN_FIXABLE_SCORE:
