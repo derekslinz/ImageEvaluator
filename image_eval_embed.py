@@ -1712,8 +1712,332 @@ def _center_weight_mask(height: int, width: int, sigma_ratio: float = 0.35) -> n
     return normalized
 
 
+@lru_cache(maxsize=16)
+def _composition_weight_mask(height: int, width: int) -> np.ndarray:
+    """Weight mask favoring rule-of-thirds intersections and center.
+    
+    Creates a mask that weights compositional hotspots where subjects
+    are typically placed in well-composed photographs.
+    """
+    y = np.linspace(0, 1, height, dtype=np.float32)
+    x = np.linspace(0, 1, width, dtype=np.float32)
+    yy, xx = np.meshgrid(y, x, indexing="ij")
+    
+    # Rule of thirds points plus center
+    thirds_points = [
+        (1/3, 1/3), (1/3, 2/3),
+        (2/3, 1/3), (2/3, 2/3),
+        (0.5, 0.5)  # Center (weighted slightly higher)
+    ]
+    weights = [1.0, 1.0, 1.0, 1.0, 1.2]  # Center gets slight boost
+    
+    mask = np.zeros((height, width), dtype=np.float32)
+    sigma = 0.15
+    
+    for (py, px), w in zip(thirds_points, weights):
+        gaussian = np.exp(-0.5 * (((xx - px) / sigma) ** 2 + ((yy - py) / sigma) ** 2))
+        mask += gaussian * w
+    
+    # Normalize to [0, 1]
+    mask_max = mask.max()
+    if mask_max > 0:
+        mask /= mask_max
+    return mask
+
+
+def _compute_multiscale_laplacian(gray_array: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute Laplacian at multiple scales: fine (1), medium (3), coarse (5).
+    
+    Returns:
+        Tuple of (fine_lap, medium_lap, coarse_lap) absolute Laplacian maps
+    """
+    if not CV2_AVAILABLE or cv2 is None:
+        # Fallback to single-scale discrete Laplacian
+        padded = np.pad(gray_array.astype(np.float32), 1, mode='edge')
+        lap = np.abs(
+            -4 * gray_array.astype(np.float32)
+            + padded[1:-1, :-2]
+            + padded[1:-1, 2:]
+            + padded[:-2, 1:-1]
+            + padded[2:, 1:-1]
+        )
+        return lap, lap, lap
+    
+    lap_fine = np.abs(cv2.Laplacian(gray_array, cv2.CV_32F, ksize=1))
+    lap_medium = np.abs(cv2.Laplacian(gray_array, cv2.CV_32F, ksize=3))
+    lap_coarse = np.abs(cv2.Laplacian(gray_array, cv2.CV_32F, ksize=5))
+    
+    return lap_fine, lap_medium, lap_coarse
+
+
+def _compute_content_weight(gray_array: np.ndarray, kernel_size: int = 15) -> np.ndarray:
+    """Compute content weight based on local standard deviation.
+    
+    High-texture regions (content) get higher weight, flat regions (sky, backgrounds)
+    get lower weight.
+    
+    Returns:
+        Normalized content weight map [0, 1]
+    """
+    gray_f = gray_array.astype(np.float32)
+    
+    if CV2_AVAILABLE and cv2 is not None:
+        local_mean = cv2.blur(gray_f, (kernel_size, kernel_size))
+        local_sq_mean = cv2.blur(gray_f ** 2, (kernel_size, kernel_size))
+    else:
+        # PIL fallback
+        from PIL import ImageFilter
+        img_pil = Image.fromarray(gray_array)
+        blurred = img_pil.filter(ImageFilter.BoxBlur(kernel_size // 2))
+        local_mean = np.array(blurred, dtype=np.float32)
+        
+        sq_img = Image.fromarray((gray_f ** 2).astype(np.float32))
+        sq_blurred = sq_img.filter(ImageFilter.BoxBlur(kernel_size // 2))
+        local_sq_mean = np.array(sq_blurred, dtype=np.float32)
+    
+    local_var = np.maximum(local_sq_mean - local_mean ** 2, 0)
+    local_std = np.sqrt(local_var)
+    
+    # Normalize to [0, 1]
+    std_max = local_std.max()
+    if std_max > 0:
+        content_weight = local_std / std_max
+    else:
+        content_weight = np.ones_like(local_std)
+    
+    return content_weight
+
+
+def _detect_blur_type(gray_array: np.ndarray) -> Tuple[str, float]:
+    """Detect whether blur is motion (directional) or soft focus (uniform).
+    
+    Motion blur has gradients concentrated in one direction, while soft focus
+    or camera shake has more uniform gradient distribution.
+    
+    Returns:
+        (blur_type, confidence) where blur_type is 'motion', 'soft', or 'sharp'
+        and confidence is 0-1 indicating how certain we are
+    """
+    if not CV2_AVAILABLE or cv2 is None:
+        return 'unknown', 0.0
+    
+    try:
+        # Compute gradients in X and Y
+        sobel_x = cv2.Sobel(gray_array, cv2.CV_32F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray_array, cv2.CV_32F, 0, 1, ksize=3)
+        
+        # Gradient magnitude and direction
+        magnitude = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
+        direction = np.arctan2(sobel_y, sobel_x)
+        
+        # Average gradient magnitude (sharpness indicator)
+        avg_magnitude = float(magnitude.mean())
+        
+        # Flatten and filter to significant gradients only
+        mag_threshold = np.percentile(magnitude, 50)
+        significant_mask = magnitude > mag_threshold
+        
+        if significant_mask.sum() < 100:
+            return 'soft', 0.8
+        
+        significant_dirs = direction[significant_mask].flatten()
+        significant_mags = magnitude[significant_mask].flatten()
+        
+        # Compute histogram of gradient directions (weighted by magnitude)
+        hist, _ = np.histogram(significant_dirs, bins=36, range=(-np.pi, np.pi),
+                              weights=significant_mags)
+        
+        # Normalize histogram
+        hist_sum = hist.sum()
+        if hist_sum > 0:
+            hist = hist / hist_sum
+        else:
+            return 'unknown', 0.0
+        
+        # Entropy of direction distribution
+        # Low entropy = directional (motion blur), High entropy = uniform
+        hist_nonzero = hist[hist > 0]
+        entropy = -np.sum(hist_nonzero * np.log(hist_nonzero))
+        max_entropy = np.log(36)  # Maximum entropy for uniform distribution
+        
+        direction_uniformity = entropy / max_entropy if max_entropy > 0 else 1.0
+        
+        # Thresholds based on empirical testing
+        SHARP_MAGNITUDE_THRESHOLD = 15.0
+        MOTION_UNIFORMITY_THRESHOLD = 0.65
+        
+        if avg_magnitude > SHARP_MAGNITUDE_THRESHOLD:
+            return 'sharp', min(1.0, avg_magnitude / 30.0)
+        elif direction_uniformity < MOTION_UNIFORMITY_THRESHOLD:
+            # Low entropy = directional blur (motion)
+            confidence = 1.0 - direction_uniformity
+            return 'motion', confidence
+        else:
+            # High entropy = uniform blur (soft focus, shake, or out of focus)
+            return 'soft', direction_uniformity
+            
+    except Exception as e:
+        logger.debug(f"Blur type detection failed: {e}")
+        return 'unknown', 0.0
+
+
+def _compute_perceptual_sharpness_v2(
+    gray_array: np.ndarray,
+    context: str = 'studio_photography'
+) -> Dict[str, Any]:
+    """Enhanced perceptual sharpness with multi-scale analysis and content awareness.
+    
+    Improvements over v1:
+    - Multi-scale Laplacian analysis (fine/medium/coarse detail)
+    - Content-weighted sharpness (ignores flat sky/backgrounds)
+    - Rule-of-thirds composition weighting
+    - Motion blur vs soft focus detection
+    - DOF-aware scoring (doesn't penalize intentional bokeh)
+    - Context-specific weighting
+    
+    Returns dict with:
+        - sharpness: float (0-100 composite score)
+        - fine_detail: float (high-frequency sharpness)
+        - edge_definition: float (medium-frequency sharpness)
+        - blur_type: str ('sharp', 'motion', 'soft', 'unknown')
+        - blur_confidence: float (0-1)
+        - subject_sharpness: float (sharpness in likely subject areas)
+        - background_sharpness: float (sharpness in likely background)
+        - dof_ratio: float (subject/background sharpness ratio)
+    """
+    result = {
+        'sharpness': 0.0,
+        'fine_detail': 0.0,
+        'edge_definition': 0.0,
+        'blur_type': 'unknown',
+        'blur_confidence': 0.0,
+        'subject_sharpness': 0.0,
+        'background_sharpness': 0.0,
+        'dof_ratio': 1.0,
+    }
+    
+    if gray_array.size == 0:
+        return result
+    
+    h, w = gray_array.shape
+    megapixels = (h * w) / 1_000_000
+    # Scale factor increases with resolution to normalize variance
+    # For very high-res images (40+ MP), we need more aggressive normalization
+    scale_factor = max(megapixels, 0.1)  # Use megapixels directly, not sqrt
+    
+    # Multi-scale Laplacian
+    lap_fine, lap_medium, lap_coarse = _compute_multiscale_laplacian(gray_array)
+    
+    # Normalize variances by resolution
+    fine_var = float(lap_fine.var()) / scale_factor
+    medium_var = float(lap_medium.var()) / scale_factor
+    coarse_var = float(lap_coarse.var()) / scale_factor
+    
+    # Convert to 0-100 scale with appropriate scaling
+    # Empirically calibrated: medium_var of ~10-20 = sharp image (0-100 mapped)
+    # Using sqrt and scaling factor calibrated on real-world images
+    SHARPNESS_SCALE = 2.0  # Calibration factor
+    result['fine_detail'] = min(100.0, math.sqrt(max(0, fine_var)) * SHARPNESS_SCALE)
+    result['edge_definition'] = min(100.0, math.sqrt(max(0, medium_var)) * SHARPNESS_SCALE)
+    
+    # Blur type detection
+    blur_type, blur_confidence = _detect_blur_type(gray_array)
+    result['blur_type'] = blur_type
+    result['blur_confidence'] = blur_confidence
+    
+    # Content weight (high-texture regions)
+    content_weight = _compute_content_weight(gray_array)
+    
+    # Composition weight (rule of thirds + center)
+    composition_mask = _composition_weight_mask(h, w)
+    
+    # Subject regions: high content + compositional hotspots
+    subject_mask = (content_weight > 0.2) & (composition_mask > 0.3)
+    background_mask = ~subject_mask
+    
+    # Ensure we have enough pixels in each region
+    min_region_pixels = 100
+    
+    # Sharpness in subject vs background (using medium Laplacian as primary)
+    if subject_mask.sum() > min_region_pixels:
+        subject_sharpness = float(lap_medium[subject_mask].mean())
+    else:
+        subject_sharpness = float(lap_medium.mean())
+    
+    if background_mask.sum() > min_region_pixels:
+        background_sharpness = float(lap_medium[background_mask].mean())
+    else:
+        background_sharpness = subject_sharpness * 0.5  # Assume some DOF
+    
+    result['subject_sharpness'] = subject_sharpness
+    result['background_sharpness'] = background_sharpness
+    
+    # DOF ratio: how much sharper is subject than background
+    dof_ratio = subject_sharpness / (background_sharpness + 1e-8)
+    result['dof_ratio'] = float(dof_ratio)
+    
+    # Context-specific weighting for scale combination
+    # Macro: fine detail most important
+    # Landscape/Architecture: medium and coarse for overall sharpness
+    # Portraits/Wildlife: subject sharpness with DOF tolerance
+    
+    MACRO_CONTEXTS = {'macro_food', 'macro_nature'}
+    LANDSCAPE_CONTEXTS = {'landscape', 'architecture_realestate'}
+    PORTRAIT_CONTEXTS = {'portrait_neutral', 'portrait_highkey', 'wildlife_animal'}
+    
+    # Context-specific weighting for scale combination
+    # Note: coarse_var captures very low-frequency structure which isn't sharpness,
+    # so we use it very sparingly or not at all
+    if context in MACRO_CONTEXTS:
+        # Fine detail is crucial for macro - emphasize fine and medium
+        base_sharpness = 0.6 * fine_var + 0.4 * medium_var
+    elif context in LANDSCAPE_CONTEXTS:
+        # Medium scale matters most for landscapes (edges, details)
+        base_sharpness = 0.3 * fine_var + 0.7 * medium_var
+    else:
+        # Balanced for general use
+        base_sharpness = 0.4 * fine_var + 0.6 * medium_var
+    
+    # DOF bonus for portraits/wildlife: shallow DOF is intentional and good
+    sharpness_boost = 0.0
+    if context in PORTRAIT_CONTEXTS:
+        if dof_ratio > 2.0:
+            # Intentional shallow DOF - reward it
+            sharpness_boost = min(10.0, (dof_ratio - 2.0) * 3.0)
+    
+    # Motion blur penalty (unless sports/action where it may be intentional)
+    motion_penalty = 0.0
+    if blur_type == 'motion' and context != 'sports_action':
+        motion_penalty = blur_confidence * 15.0
+    elif blur_type == 'motion' and context == 'sports_action':
+        # Slight penalty even for sports - completely blurred isn't good
+        motion_penalty = blur_confidence * 5.0
+    
+    # Content-weighted sharpness: focus on regions with actual content
+    content_mask = content_weight > 0.15
+    if content_mask.sum() > min_region_pixels:
+        content_sharpness = float((lap_medium * content_weight)[content_mask].mean())
+        # Blend content-weighted and overall (normalize content_sharpness)
+        content_var = (content_sharpness ** 2) / scale_factor
+        weighted_var = 0.6 * base_sharpness + 0.4 * content_var
+    else:
+        weighted_var = base_sharpness
+    
+    # Final sharpness score - use same scale factor as fine/edge
+    sharpness = math.sqrt(max(0, weighted_var)) * SHARPNESS_SCALE + sharpness_boost - motion_penalty
+    sharpness = max(0.0, min(100.0, sharpness))
+    
+    result['sharpness'] = sharpness
+    
+    return result
+
+
 def _compute_perceptual_sharpness(laplacian_map: np.ndarray) -> float:
-    """Estimate perceptual sharpness with subject weighting and DOF tolerance."""
+    """Estimate perceptual sharpness with subject weighting and DOF tolerance.
+    
+    Legacy wrapper for backward compatibility. For new code, use
+    _compute_perceptual_sharpness_v2() which provides more detailed metrics.
+    """
 
     if laplacian_map.size == 0:
         return 0.0
@@ -2260,7 +2584,15 @@ def _classify_image_context_once(image_path: str, ollama_host_url: str, model: s
 
 
 def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, context: str = 'studio_photography') -> Dict:
-    """Analyze image for technical quality metrics with camera/ISO-agnostic noise estimation."""
+    """Analyze image for technical quality metrics with camera/ISO-agnostic noise estimation.
+    
+    Enhanced sharpness analysis includes:
+    - Multi-scale Laplacian (fine/medium/coarse detail)
+    - Content-weighted analysis (ignores flat regions)
+    - Motion blur vs soft focus detection
+    - DOF-aware scoring (doesn't penalize intentional bokeh)
+    - Context-specific weighting
+    """
     metrics = {
         'sharpness': 0.0,
         'brightness': 0.0,
@@ -2273,6 +2605,14 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
         'noise_score': 0.0,   # 0–100 severity
         'noise': 0.0,         # alias of noise_score for backward compatibility
         'status': 'success',  # 'success' or 'error' to indicate analysis status
+        # Enhanced sharpness metrics (v2)
+        'fine_detail': 0.0,         # High-frequency sharpness (fine textures)
+        'edge_definition': 0.0,     # Medium-frequency sharpness (edges)
+        'blur_type': 'unknown',     # 'sharp', 'motion', 'soft', 'unknown'
+        'blur_confidence': 0.0,     # Confidence in blur type detection
+        'subject_sharpness': 0.0,   # Sharpness in likely subject areas
+        'background_sharpness': 0.0, # Sharpness in background areas
+        'dof_ratio': 1.0,           # Subject/background sharpness ratio
     }
     
     # Get context profile
@@ -2348,12 +2688,24 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
             sharpness: Optional[float] = None
             sigma_noise: Optional[float] = None
             noise_score: Optional[float] = None
+            sharpness_result: Optional[Dict[str, Any]] = None
 
             if CV2_AVAILABLE and cv2 is not None:
                 try:
-                    laplacian_map = cv2.Laplacian(gray_array, cv2.CV_32F)
-                    sharpness = _compute_perceptual_sharpness(laplacian_map)
+                    # Use enhanced v2 sharpness analysis
+                    sharpness_result = _compute_perceptual_sharpness_v2(gray_array, context)
+                    sharpness = sharpness_result['sharpness']
+                    
+                    # Store additional sharpness metrics
+                    metrics['fine_detail'] = sharpness_result['fine_detail']
+                    metrics['edge_definition'] = sharpness_result['edge_definition']
+                    metrics['blur_type'] = sharpness_result['blur_type']
+                    metrics['blur_confidence'] = sharpness_result['blur_confidence']
+                    metrics['subject_sharpness'] = sharpness_result['subject_sharpness']
+                    metrics['background_sharpness'] = sharpness_result['background_sharpness']
+                    metrics['dof_ratio'] = sharpness_result['dof_ratio']
 
+                    # Noise estimation (unchanged)
                     h, w = gray_array.shape
                     target_long = 2048
                     scale = target_long / float(max(h, w))
@@ -2430,6 +2782,8 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
                     image_path,
                 )
                 sharpness, sigma_noise, noise_score = _compute_sharpness_noise_fallback(gray_array)
+                # v2 metrics not available in fallback
+                metrics['blur_type'] = 'unknown'
 
             metrics['sharpness'] = float(sharpness)
             metrics['noise_sigma'] = float(sigma_noise) if sigma_noise is not None else 0.0
@@ -3601,6 +3955,10 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
             'keywords', 'status', 'context', 'context_profile', 'sharpness', 'brightness', 'contrast',
             'histogram_clipping_highlights', 'histogram_clipping_shadows',
             'color_cast', 'color_cast_delta', 'noise_sigma', 'noise_score', 'technical_warnings', 'post_process_potential',
+            # Enhanced sharpness metrics (v2)
+            'fine_detail', 'edge_definition', 'blur_type', 'blur_confidence',
+            'subject_sharpness', 'background_sharpness', 'dof_ratio',
+            # Stock/resolution metrics
             'resolution_mp', 'dpi', 'stock_notes', 'stock_fixable',
             'stock_overall_score', 'stock_recommendation', 'stock_primary_category',
             'stock_commercial_viability', 'stock_technical_quality', 'stock_composition_clarity',
@@ -3640,6 +3998,15 @@ def save_results_to_csv(results: List[Tuple[str, Optional[Dict]]], output_path: 
                     'noise_score': technical_metrics.get('noise_score', ''),
                     'technical_warnings': warnings_str,
                     'post_process_potential': metadata.get('post_process_potential', ''),
+                    # Enhanced sharpness metrics (v2)
+                    'fine_detail': technical_metrics.get('fine_detail', ''),
+                    'edge_definition': technical_metrics.get('edge_definition', ''),
+                    'blur_type': technical_metrics.get('blur_type', ''),
+                    'blur_confidence': technical_metrics.get('blur_confidence', ''),
+                    'subject_sharpness': technical_metrics.get('subject_sharpness', ''),
+                    'background_sharpness': technical_metrics.get('background_sharpness', ''),
+                    'dof_ratio': technical_metrics.get('dof_ratio', ''),
+                    # Stock/resolution metrics
                     'resolution_mp': technical_metrics.get('megapixels', ''),
                     'dpi': technical_metrics.get('dpi_x', ''),
                     'stock_notes': '; '.join(technical_metrics.get('stock_notes', [])),
@@ -3738,13 +4105,21 @@ def load_results_from_csv(csv_path: str) -> List[Tuple[str, Optional[Dict]]]:
                 # Parse numeric technical metrics
                 for metric_key in ['sharpness', 'brightness', 'contrast', 
                                    'histogram_clipping_highlights', 'histogram_clipping_shadows',
-                                   'color_cast_delta', 'noise_score', 'noise_sigma', 'resolution_mp']:
+                                   'color_cast_delta', 'noise_score', 'noise_sigma', 'resolution_mp',
+                                   # Enhanced sharpness metrics (v2)
+                                   'fine_detail', 'edge_definition', 'blur_confidence',
+                                   'subject_sharpness', 'background_sharpness', 'dof_ratio']:
                     val_str = row.get(metric_key, '')
                     if val_str:
                         try:
                             technical_metrics[metric_key] = float(val_str)
                         except ValueError:
                             pass
+                
+                # Parse blur_type (string field)
+                blur_type = row.get('blur_type', '')
+                if blur_type:
+                    technical_metrics['blur_type'] = blur_type
                 
                 # Rename resolution_mp to megapixels for consistency
                 if 'resolution_mp' in technical_metrics:
