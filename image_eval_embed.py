@@ -1084,7 +1084,7 @@ def generate_stock_assessment(
 
     technical_context = build_stock_technical_context(technical_metrics, technical_warnings)
     prompt = STOCK_EVALUATION_PROMPT.format(technical_context=technical_context)
-    payload = {
+    base_payload = {
         "model": model,
         "stream": False,
         "images": [encoded_image],
@@ -1123,28 +1123,38 @@ def generate_stock_assessment(
         },
     }
 
-    def make_request():
-        response = requests.post(ollama_host_url, json=payload, timeout=180)
-        response.raise_for_status()
-        return response
+    def _attempt_stock(payload: Dict[str, Any], label: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        def make_request():
+            response = requests.post(ollama_host_url, json=payload, timeout=180)
+            response.raise_for_status()
+            return response
+        try:
+            response = retry_with_backoff(make_request)
+        except Exception as exc:
+            logger.error(f"Ollama stock evaluation failed ({label}) for {image_path}: {exc}")
+            return None, None
 
-    try:
-        response = retry_with_backoff(make_request)
-    except Exception as exc:
-        logger.error(f"Ollama stock evaluation failed for {image_path}: {exc}")
-        return None
+        data = response.json()
+        raw = data.get("response") or data.get("message") or data.get("text")
+        if not raw:
+            logger.error(f"Ollama returned no stock payload ({label}) for {image_path}")
+            return None, None
 
-    data = response.json()
-    raw_json = data.get("response") or data.get("message") or data.get("text")
-    if not raw_json:
-        logger.error(f"Ollama returned no stock payload for {image_path}")
-        return None
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError as exc:
+            logger.warning(f"Failed to parse stock JSON ({label}) for {image_path}: {exc}; raw={raw}")
+            return None, raw
+        return parsed, raw
 
-    try:
-        stock_obj = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
-    except json.JSONDecodeError as exc:
-        logger.error(f"Failed to parse stock JSON for {image_path}: {exc}")
-        return None
+    stock_obj, raw_json = _attempt_stock(base_payload, "primary")
+    if stock_obj is None:
+        fallback_payload = dict(base_payload)
+        fallback_payload.pop("format", None)
+        fallback_payload["prompt"] = base_payload["prompt"] + "\nRespond with JSON using the same keys."
+        stock_obj, raw_json = _attempt_stock(fallback_payload, "fallback")
+        if stock_obj is None:
+            return None
 
     result: Dict[str, Any] = {}
     field_map = {
@@ -1163,8 +1173,8 @@ def generate_stock_assessment(
         try:
             score = float(val)
         except (TypeError, ValueError):
-            logger.error(f"Failed to parse {field}='{val}' as float for {image_path}")
-            return None
+            logger.warning(f"Failed to parse {field}='{val}' as float for {image_path}; defaulting to 0")
+            score = 0.0
         result[out_key] = int(max(0, min(100, round(score))))
 
     # Enforce local recomputation of the overall score using measured technicals
@@ -4027,7 +4037,7 @@ def collect_images(folder_path: str, file_types: Optional[List[str]] = None, ski
 
 def _handle_cached_or_dry_run(image_path: str, cache_dir: Optional[str], model: str,
                               backup_dir: Optional[str], verify: bool,
-                              dry_run: bool) -> Optional[Tuple[str, Optional[Dict]]]:
+                              dry_run: bool, embed_metadata_enabled: bool) -> Optional[Tuple[str, Optional[Dict]]]:
     """Return immediate result for dry-run or cached entries."""
     if dry_run:
         logger.debug(f"Dry run - skipping processing for {image_path}")
@@ -4037,12 +4047,14 @@ def _handle_cached_or_dry_run(image_path: str, cache_dir: Optional[str], model: 
         cached_metadata = load_from_cache(image_path, model, cache_dir)
         if cached_metadata:
             logger.info(f"Using cached result for {image_path}")
-            try:
-                embed_metadata(image_path, cached_metadata, backup_dir, verify)
-                return (image_path, cached_metadata)
-            except Exception as e:
-                logger.error(f"Error embedding cached metadata for {image_path}: {e}")
-                return (image_path, None)
+            if embed_metadata_enabled:
+                try:
+                    embed_metadata(image_path, cached_metadata, backup_dir, verify)
+                    return (image_path, cached_metadata)
+                except Exception as e:
+                    logger.error(f"Error embedding cached metadata for {image_path}: {e}")
+                    return (image_path, None)
+            return (image_path, cached_metadata)
     return None
 
 
@@ -4062,7 +4074,8 @@ def process_images_with_pyiqa(
     skip_context_classification: bool,
     args,
     use_ollama_metadata: bool = False,
-    stock_eval: bool = False
+    stock_eval: bool = False,
+    embed_metadata_enabled: bool = False
 ) -> List[Tuple[str, Optional[Dict]]]:
     """Profile-aware PyIQA pipeline with context detection and rule weighting."""
     results: List[Tuple[str, Optional[Dict]]] = []
@@ -4073,7 +4086,8 @@ def process_images_with_pyiqa(
     with tqdm(total=len(image_paths), desc="Processing images", unit="img") as pbar:
         for image_path in image_paths:
             immediate = _handle_cached_or_dry_run(
-                image_path, cache_dir, cache_model_label, backup_dir, verify, dry_run=dry_run
+                image_path, cache_dir, cache_model_label, backup_dir, verify, dry_run=dry_run,
+                embed_metadata_enabled=embed_metadata_enabled
             )
             if immediate:
                 path, metadata = immediate
@@ -4194,15 +4208,17 @@ def process_images_with_pyiqa(
             t3 = time.time()
             timing_stats["metadata"] += t3 - t2
 
-            try:
-                embed_metadata(image_path, metadata, backup_dir, verify)
-            except Exception as exc:
-                logger.error(f"Failed to embed metadata for {image_path}: {exc}")
-                results.append((image_path, None))
-                pbar.update(1)
-                continue
+            if embed_metadata_enabled:
+                try:
+                    embed_metadata(image_path, metadata, backup_dir, verify)
+                except Exception as exc:
+                    logger.error(f"Failed to embed metadata for {image_path}: {exc}")
+                    results.append((image_path, None))
+                    pbar.update(1)
+                    continue
             t4 = time.time()
-            timing_stats["embed"] += t4 - t3
+            if embed_metadata_enabled:
+                timing_stats["embed"] += t4 - t3
             timing_stats["count"] += 1
 
             logger.info(f"Composite PyIQA score for {image_path}: {metadata.get('score')}")
@@ -4245,7 +4261,8 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, context_hos
                             pyiqa_cache_label: Optional[str] = None,
                             cli_args: Optional[argparse.Namespace] = None,
                             use_ollama_metadata: bool = False,
-                            stock_eval: bool = False) -> List[Tuple[str, Optional[Dict]]]:
+                            stock_eval: bool = False,
+                            embed_metadata_enabled: bool = False) -> List[Tuple[str, Optional[Dict]]]:
     """Process images end-to-end using the PyIQA composite pipeline."""
     if pyiqa_manager is None:
         raise ValueError("PyIQA manager must be initialized before processing images.")
@@ -4276,7 +4293,8 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, context_hos
         skip_context_classification=skip_context_classification,
         args=cli_args,
         use_ollama_metadata=use_ollama_metadata,
-        stock_eval=effective_stock_eval
+        stock_eval=effective_stock_eval,
+        embed_metadata_enabled=embed_metadata_enabled
     )
 
 
@@ -5343,6 +5361,9 @@ if __name__ == "__main__":
     process_parser.add_argument('--dry-run', action='store_true', help='Preview what would be processed without making changes')
     process_parser.add_argument('--backup-dir', type=str, default=None, help='Directory to store backups (default: same directory as originals)')
     process_parser.add_argument('--verify', action='store_true', help='Verify metadata was correctly embedded after writing')
+    process_parser.add_argument('--embed', dest='embed_metadata', action='store_true', help='Write scores/metadata back into image files')
+    process_parser.add_argument('--no-embed', dest='embed_metadata', action='store_false', help='Do not write metadata into images (default)')
+    process_parser.set_defaults(embed_metadata=False)
     process_parser.add_argument('--log-file', type=str, default=None, help='Path to log file (default: auto-generated)')
     process_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose debug output')
     process_parser.add_argument('--debug', action='store_true', help='Enable debug logging (includes PyIQA output)')
@@ -5619,6 +5640,7 @@ if __name__ == "__main__":
     print("PyIQA composite models: clipiqa+_vitL14_512, laion_aes, musiq-ava, musiq-paq2piq, maniqa, disagreement penalty")
     print(f"Workers: {args.workers}")
     print(f"Skip existing: {args.skip_existing}")
+    print(f"Embed metadata: {('enabled' if args.embed_metadata else 'disabled (CSV only)')}")
     if args.min_score:
         print(f"Minimum score filter: {args.min_score}")
     if args.dry_run:
@@ -5665,7 +5687,8 @@ if __name__ == "__main__":
         pyiqa_cache_label=pyiqa_cache_label,
         cli_args=args,
         use_ollama_metadata=args.ollama_metadata,
-        stock_eval=args.stock_eval
+        stock_eval=args.stock_eval,
+        embed_metadata_enabled=args.embed_metadata
     )
     elapsed_time = time.time() - start_time
     logger.info(f"Completed processing {len(results)} images in {elapsed_time:.2f} seconds")
