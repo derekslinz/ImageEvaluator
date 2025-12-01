@@ -501,25 +501,31 @@ def categorize_score(score: float) -> str:
     return "critical"
 
 
-def compute_profile_composite(profile_key: str, z_scores: Dict[str, float], diff_z: float) -> Tuple[float, float, Dict[str, Dict[str, float]]]:
-    """Return (base_score, composite_z, contributions) before rule penalties."""
+def compute_profile_composite(
+    profile_key: str, z_scores: Dict[str, float], diff_z: float
+) -> Tuple[float, float, float, Dict[str, Dict[str, float]], float]:
+    """Return (base_score, composite_z_clamped, composite_z_raw, contributions, diff_z_clamped) before rule penalties."""
     profile_cfg = PROFILE_CONFIG.get(profile_key, PROFILE_CONFIG["studio_photography"])
     weights = normalize_weights(profile_cfg.get("model_weights", {}))
     composite_z = 0.0
+    composite_z_raw = 0.0
+    diff_z_clamped = max(-3.0, min(3.0, diff_z))
     contributions: Dict[str, Dict[str, float]] = {}
     for metric_key, weight in weights.items():
         if weight <= 0:
             continue
-        metric_value = diff_z if metric_key == "pyiqa_diff_z" else z_scores.get(metric_key, 0.0)
+        metric_value = diff_z_clamped if metric_key == "pyiqa_diff_z" else z_scores.get(metric_key, 0.0)
         contribution = metric_value * weight
+        composite_z_raw += contribution
         composite_z += contribution
         contributions[metric_key] = {
             "weight": weight,
             "value": metric_value,
             "contribution": contribution,
         }
-    base_score = PROFILE_SCORE_CENTER + (composite_z * PROFILE_SCORE_STD_SCALE)
-    return base_score, composite_z, contributions
+    composite_z_clamped = max(-3.0, min(3.0, composite_z))
+    base_score = PROFILE_SCORE_CENTER + (composite_z_clamped * PROFILE_SCORE_STD_SCALE)
+    return base_score, composite_z_clamped, composite_z_raw, contributions, diff_z_clamped
 
 
 def apply_profile_rules(profile_key: str, technical_metrics: Dict[str, Any]) -> Tuple[float, List[str]]:
@@ -588,6 +594,103 @@ def apply_profile_rules(profile_key: str, technical_metrics: Dict[str, Any]) -> 
     return penalty, adjustments
 
 
+def compute_component_scores(
+    profile_key: str,
+    technical_metrics: Dict[str, Any],
+    fused_scores: Dict[str, float],
+    diff_z: float,
+    diff_z_clamped: float,
+    final_score: float,
+) -> Dict[str, float]:
+    """Derive composition/lighting/creativity subscores from fused metrics and technical cues."""
+
+    def clamp_score(val: float) -> float:
+        return max(0.0, min(100.0, val))
+
+    def weighted_avg(weights: List[Tuple[str, float]], fallback: float) -> float:
+        total = sum(w for k, w in weights if k in fused_scores)
+        if total <= 0:
+            return fallback
+        return sum(fused_scores[k] * w for k, w in weights if k in fused_scores) / total
+
+    # Composition: favor aesthetic models
+    composition = weighted_avg(
+        [
+            ("laion_aes_z", 0.45),
+            ("musiq_ava_z", 0.35),
+            ("musiq_paq2piq_z", 0.20),
+        ],
+        fallback=final_score,
+    )
+    composition = clamp_score(composition)
+
+    # Lighting: start high, penalize clipping/brightness/color/noise using profile rules
+    profile_cfg = PROFILE_CONFIG.get(profile_key, PROFILE_CONFIG["studio_photography"])
+    rules = profile_cfg.get("rules", {})
+    lighting = 85.0
+
+    highlights = float(technical_metrics.get("histogram_clipping_highlights", 0.0))
+    shadows = float(technical_metrics.get("histogram_clipping_shadows", 0.0))
+    clipping = max(highlights, shadows)
+    clip_rules = rules.get("clipping", {})
+    warn_pct = clip_rules.get("warn_pct")
+    hard_pct = clip_rules.get("hard_pct")
+    if hard_pct is not None and clipping > hard_pct:
+        lighting -= 25.0
+    elif warn_pct is not None and clipping > warn_pct:
+        lighting -= 12.0
+
+    brightness = technical_metrics.get("brightness")
+    bright_rules = rules.get("brightness", {})
+    min_ok = bright_rules.get("min_ok")
+    max_ok = bright_rules.get("max_ok")
+    mild = bright_rules.get("mild_penalty", 8.0)
+    strong = bright_rules.get("strong_penalty", max(mild, 12.0))
+    tolerance = 20.0
+    if isinstance(brightness, (int, float)):
+        if min_ok is not None and brightness < min_ok:
+            delta = min_ok - brightness
+            lighting -= strong if delta > tolerance else mild
+        elif max_ok is not None and brightness > max_ok:
+            delta = brightness - max_ok
+            lighting -= strong if delta > tolerance else mild
+
+    color_rules = rules.get("color_cast", {})
+    color_threshold = color_rules.get("threshold", COLOR_CAST_WARN)
+    color_penalty = color_rules.get("penalty", 8.0)
+    color_cast = technical_metrics.get("color_cast", "neutral")
+    color_delta = float(technical_metrics.get("color_cast_delta", 0.0))
+    if color_cast != "neutral" and color_delta >= color_threshold:
+        lighting -= color_penalty
+
+    noise_rules = rules.get("noise", {})
+    noise_score = float(technical_metrics.get("noise_score", 0.0))
+    if noise_score > noise_rules.get("high", 60.0):
+        lighting -= noise_rules.get("high_penalty", 18.0)
+    elif noise_score > noise_rules.get("warn", 30.0):
+        lighting -= noise_rules.get("warn_penalty", 8.0)
+
+    lighting = clamp_score(lighting)
+
+    # Creativity: aesthetic blend minus disagreement penalty
+    creativity_base = weighted_avg(
+        [
+            ("clipiqa_z", 0.5),
+            ("laion_aes_z", 0.3),
+            ("maniqa_z", 0.2),
+        ],
+        fallback=final_score,
+    )
+    disagreement_penalty = max(0.0, -diff_z_clamped) * 5.0
+    creativity = clamp_score(creativity_base - disagreement_penalty)
+
+    return {
+        "composition": composition,
+        "lighting": lighting,
+        "creativity": creativity,
+    }
+
+
 def build_profile_metadata(
     profile_key: str,
     context_label: str,
@@ -598,7 +701,9 @@ def build_profile_metadata(
     percentiles: Dict[str, Optional[float]],
     fused_scores: Dict[str, float],
     diff_z: float,
+    diff_z_clamped: float,
     composite_z: float,
+    composite_z_raw: float,
     base_score: float,
     final_score: float,
     rule_penalty: float,
@@ -634,10 +739,19 @@ def build_profile_metadata(
         f"Composite profile '{display_name}' score {rounded}/100 ({category}).",
         f"Base model blend before rules: {base_rounded}/100 (penalty {-rule_penalty:+.1f}).",
         f"Model breakdown: {metric_summary}",
-        f"Disagreement penalty (pyiqa_diff_z): {diff_z:+.2f}",
+        f"Disagreement penalty (pyiqa_diff_z): {diff_z:+.2f} (clamped {diff_z_clamped:+.2f})",
     ]
     if rule_notes:
         description_lines.append(f"Rule triggers: {', '.join(rule_notes)}")
+
+    component_scores = compute_component_scores(
+        profile_key=profile_key,
+        technical_metrics=technical_metrics,
+        fused_scores=fused_scores,
+        diff_z=diff_z,
+        diff_z_clamped=diff_z_clamped,
+        final_score=final_score,
+    )
 
     extended_metrics = dict(technical_metrics)
     extended_metrics.update({
@@ -647,21 +761,29 @@ def build_profile_metadata(
         "pyiqa_percentiles": percentiles,
         "pyiqa_fused_scores": fused_scores,
         "pyiqa_composite_z": composite_z,
+        "pyiqa_composite_z_raw": composite_z_raw,
         "pyiqa_composite_fused_score": z_to_fused_score(composite_z),
         "pyiqa_disagreement_z": diff_z,
+        "pyiqa_disagreement_z_clamped": diff_z_clamped,
         "pyiqa_contributions": contributions,
         "pyiqa_rule_penalty": rule_penalty,
         "pyiqa_rule_notes": rule_notes,
         "pyiqa_category": category,
+        "pyiqa_component_scores": component_scores,
     })
+
+    composition_score = component_scores["composition"]
+    lighting_score = component_scores["lighting"]
+    creativity_score = component_scores["creativity"]
 
     metadata = {
         'overall_score': str(rounded),
         'score': str(rounded),
-        'technical_score': str(base_rounded),
-        'composition_score': str(rounded),
-        'lighting_score': str(rounded),
-        'creativity_score': str(rounded),
+        'technical_score': str(rounded),  # post-rule technical score
+        'base_score': str(base_rounded),
+        'composition_score': str(int(round(composition_score))),
+        'lighting_score': str(int(round(lighting_score))),
+        'creativity_score': str(int(round(creativity_score))),
         'title': f"{display_name} IQA composite {rounded}/100",
         'description': " ".join(description_lines),
         'keywords': keywords,
@@ -2982,10 +3104,16 @@ def compute_post_process_potential(technical_metrics: Dict, context: str = "stud
     elif noise_score > noise_rules.get("warn", 30.0):
         base_score -= noise_penalty_mid
 
-    # Color cast contribution
+    # Color cast contribution (respect threshold)
     color_cast = technical_metrics.get('color_cast', 'neutral')
-    if color_cast != 'neutral':
-        color_penalty = rules.get("color_cast", {}).get("penalty", 5)
+    color_rules = rules.get("color_cast", {})
+    color_threshold = color_rules.get("threshold", COLOR_CAST_WARN)
+    color_penalty = color_rules.get("penalty", 5)
+    # If delta is missing, treat any non-neutral cast as penalizable to preserve legacy behavior.
+    color_delta = technical_metrics.get("color_cast_delta")
+    has_delta = isinstance(color_delta, (int, float))
+    delta_value = float(color_delta) if has_delta else 0.0
+    if color_cast != 'neutral' and (not has_delta or delta_value >= color_threshold):
         base_score -= color_penalty
 
     post_score = max(0, min(100, int(round(base_score))))
@@ -3817,7 +3945,7 @@ def process_images_with_pyiqa(
                 detail["percentile"] = percentiles.get(metric_key)
                 detail["fused_score"] = fused_scores.get(metric_key)
             diff_z = compute_disagreement_z(z_scores)
-            base_score, composite_z, contributions = compute_profile_composite(profile_key, z_scores, diff_z)
+            base_score, composite_z, composite_z_raw, contributions, diff_z_clamped = compute_profile_composite(profile_key, z_scores, diff_z)
             rule_penalty, rule_notes = apply_profile_rules(profile_key, technical_metrics)
             final_score = max(0.0, min(100.0, base_score - rule_penalty))
 
@@ -3831,7 +3959,9 @@ def process_images_with_pyiqa(
                 percentiles=percentiles,
                 fused_scores=fused_scores,
                 diff_z=diff_z,
+                diff_z_clamped=diff_z_clamped,
                 composite_z=composite_z,
+                composite_z_raw=composite_z_raw,
                 base_score=base_score,
                 final_score=final_score,
                 rule_penalty=rule_penalty,
