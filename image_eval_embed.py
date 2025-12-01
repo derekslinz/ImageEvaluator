@@ -2683,7 +2683,33 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
 
             # --- Sharpness via Laplacian variance (scale-normalized) ---
             img_gray = img_rgb.convert('L')
-            gray_array = np.array(img_gray)
+            gray_full = np.array(img_gray)
+
+            target_long_edge = 2048
+            gray_h, gray_w = gray_full.shape
+            gray_long_edge = max(gray_h, gray_w)
+            if gray_long_edge > target_long_edge:
+                resize_scale = target_long_edge / float(gray_long_edge)
+                if CV2_AVAILABLE and cv2 is not None:
+                    gray_resized = cv2.resize(
+                        gray_full,
+                        dsize=None,
+                        fx=resize_scale,
+                        fy=resize_scale,
+                        interpolation=cv2.INTER_AREA,
+                    )
+                else:
+                    new_size = (
+                        max(1, int(round(gray_w * resize_scale))),
+                        max(1, int(round(gray_h * resize_scale))),
+                    )
+                    gray_resized = np.array(
+                        Image.fromarray(gray_full).resize(new_size, resample=Image.BILINEAR)
+                    )
+            else:
+                gray_resized = gray_full
+
+            gray_array = gray_resized.astype(np.float32, copy=False)
 
             sharpness: Optional[float] = None
             sigma_noise: Optional[float] = None
@@ -2774,8 +2800,8 @@ def analyze_image_technical(image_path: str, iso_value: Optional[int] = None, co
                 or noise_score is None
                 or not math.isfinite(sharpness)
                 or not math.isfinite(noise_score)
-                or sharpness <= 0.0
-                or noise_score <= 0.0
+                or sharpness < 0.0
+                or noise_score < 0.0
             ):
                 logger.debug(
                     "Falling back to PIL/numpy sharpness/noise estimation for %s due to degenerate CV2 result",
