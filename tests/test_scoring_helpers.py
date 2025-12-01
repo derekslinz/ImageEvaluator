@@ -213,9 +213,9 @@ def test_analyze_image_technical_falls_back_on_degenerate_cv2(monkeypatch, tmp_p
 
 def test_count_technical_flags_identifies_critical_and_warn():
     """Test that count_technical_flags correctly counts critical vs warn flags."""
-    # No issues - clean image (sharpness above warn threshold of ~21)
+    # No issues - clean image (sharpness above warn threshold of ~30)
     clean = {
-        'sharpness': 35.0,  # Above warn threshold (~21)
+        'sharpness': 50.0,  # Above warn threshold (~30)
         'noise_score': 10.0,
         'histogram_clipping_highlights': 1.0,
         'histogram_clipping_shadows': 2.0,
@@ -225,9 +225,9 @@ def test_count_technical_flags_identifies_critical_and_warn():
     assert critical == 0
     assert warn == 0
     
-    # One critical sharpness issue (below ~13)
+    # One critical sharpness issue (below ~20.5)
     critical_sharpness = {
-        'sharpness': 10.0,  # Below critical threshold (~13)
+        'sharpness': 15.0,  # Below critical threshold (~20.5)
         'noise_score': 10.0,
         'histogram_clipping_highlights': 1.0,
         'histogram_clipping_shadows': 2.0,
@@ -237,9 +237,9 @@ def test_count_technical_flags_identifies_critical_and_warn():
     assert critical == 1
     assert warn == 0
     
-    # One warn-level issue (sharpness between warn ~21 and critical ~13)
+    # One warn-level issue (sharpness between warn ~30 and critical ~20.5)
     warn_sharpness = {
-        'sharpness': 17.0,  # Between warn (~21) and critical (~13)
+        'sharpness': 25.0,  # Between warn (~30) and critical (~20.5)
         'noise_score': 10.0,
         'histogram_clipping_highlights': 1.0,
         'histogram_clipping_shadows': 2.0,
@@ -254,7 +254,7 @@ def test_is_technically_warned_requires_critical_or_two_warns():
     """Test that is_technically_warned follows the 1 critical OR 2+ warns rule."""
     # Clean image - not warned (sharpness above warn threshold)
     clean = {
-        'sharpness': 35.0,  # Above warn threshold (~21)
+        'sharpness': 50.0,  # Above warn threshold (~30)
         'noise_score': 10.0,
         'histogram_clipping_highlights': 1.0,
         'histogram_clipping_shadows': 2.0,
@@ -264,7 +264,7 @@ def test_is_technically_warned_requires_critical_or_two_warns():
     
     # One warn only - not warned
     one_warn = {
-        'sharpness': 17.0,  # warn level (between 13-21)
+        'sharpness': 25.0,  # warn level (between 20.5-30)
         'noise_score': 10.0,
         'histogram_clipping_highlights': 1.0,
         'histogram_clipping_shadows': 2.0,
@@ -274,7 +274,7 @@ def test_is_technically_warned_requires_critical_or_two_warns():
     
     # One critical - warned
     one_critical = {
-        'sharpness': 10.0,  # critical level (below ~13)
+        'sharpness': 15.0,  # critical level (below ~20.5)
         'noise_score': 10.0,
         'histogram_clipping_highlights': 1.0,
         'histogram_clipping_shadows': 2.0,
@@ -284,8 +284,8 @@ def test_is_technically_warned_requires_critical_or_two_warns():
     
     # Two warns (different metrics) - warned
     two_warns = {
-        'sharpness': 17.0,  # warn level (sharpness)
-        'noise_score': 45.0,  # warn level (above ~41.6)
+        'sharpness': 25.0,  # warn level (sharpness)
+        'noise_score': 45.0,  # warn level (above ~33.3)
         'histogram_clipping_highlights': 1.0,
         'histogram_clipping_shadows': 2.0,
         'color_cast_delta': 5.0,

@@ -136,26 +136,27 @@ STOCK_MIN_DPI = 300
 STOCK_DPI_FIXABLE = 240
 
 # Technical metric baseline statistics (mean, std) for outlier detection
-# Thresholds are calculated as: mean ± 1.5*std
+# Thresholds are calculated as: mean ± multiplier*std
 # These can be recalibrated based on your image corpus
-# Based on empirical data from 9,200-image Lightroom library (Nov 2025)
+# Based on empirical data from 3,500-image reference set (Dec 2025)
 TECHNICAL_BASELINES = {
-    # Sharpness: lower is worse, flag if < mean - 1.5*std
-    # Perceptual sharpness metric typically ranges 20-50 for normal images
-    "sharpness": {"mean": 33.0, "std": 8.0},  # warn < 21.0, critical < 13.0
-    # Noise: higher is worse, flag if > mean + 1.5*std
-    "noise_score": {"mean": 16.62, "std": 16.65},  # warn > 41.6, critical > 54.1
-    # Highlight clipping %: higher is worse, flag if > mean + 1.5*std
-    "histogram_clipping_highlights": {"mean": 2.81, "std": 4.86},  # warn > 10.1, critical > 13.8
-    # Shadow clipping %: higher is worse, flag if > mean + 1.5*std
-    "histogram_clipping_shadows": {"mean": 8.22, "std": 9.32},  # warn > 22.2, critical > 29.2
+    # Sharpness: lower is worse, flag if < mean - multiplier*std
+    # Perceptual sharpness metric typically ranges 30-70 for normal images
+    "sharpness": {"mean": 49.0, "std": 19.0},  # warn < 20.5, critical < 1.5
+    # Noise: higher is worse, flag if > mean + multiplier*std
+    "noise_score": {"mean": 16.62, "std": 16.65},  # warn > 41.6, critical > 58.2
+    # Highlight clipping %: higher is worse, flag if > mean + multiplier*std
+    "histogram_clipping_highlights": {"mean": 2.81, "std": 4.86},  # warn > 10.1, critical > 15.0
+    # Shadow clipping %: higher is worse, flag if > mean + multiplier*std
+    "histogram_clipping_shadows": {"mean": 8.22, "std": 9.32},  # warn > 22.2, critical > 31.5
     # Color cast delta: higher is worse, calibrated to recent corpus (mean≈42, std≈32)
-    "color_cast_delta": {"mean": 42.0, "std": 32.0},  # warn ~74, critical ~90
+    "color_cast_delta": {"mean": 42.0, "std": 32.0},  # warn ~74, critical ~122
 }
 
 # Multiplier for outlier detection
-OUTLIER_SIGMA_MULTIPLIER_WARN = 1.5    # Mild outliers (warning)
-OUTLIER_SIGMA_MULTIPLIER_CRITICAL = 2.5  # Strong outliers (critical)
+OUTLIER_SIGMA_MULTIPLIER_WARN = 1.0    # Mild outliers (warning) - 1 std from mean
+OUTLIER_SIGMA_MULTIPLIER_CRITICAL = 2.0  # Strong outliers (critical) - 2 std from mean
+SHARPNESS_CRITICAL_SIGMA = 1.5  # Sharpness uses 1.5 std for critical threshold
 
 
 def get_technical_threshold(metric_name: str, direction: str = "high", severity: str = "warn") -> float:
@@ -165,7 +166,7 @@ def get_technical_threshold(metric_name: str, direction: str = "high", severity:
         metric_name: Name of the metric in TECHNICAL_BASELINES
         direction: "high" for metrics where higher is worse (noise, clipping)
                    "low" for metrics where lower is worse (sharpness)
-        severity: "warn" for mild outliers (1.5σ), "critical" for strong (2.5σ)
+        severity: "warn" for mild outliers (1σ), "critical" for strong (2σ)
     
     Returns:
         Threshold value (mean ± multiplier*std)
@@ -174,7 +175,11 @@ def get_technical_threshold(metric_name: str, direction: str = "high", severity:
     mean = baseline["mean"]
     std = baseline["std"]
     
-    multiplier = OUTLIER_SIGMA_MULTIPLIER_CRITICAL if severity == "critical" else OUTLIER_SIGMA_MULTIPLIER_WARN
+    # Use special sigma for sharpness critical threshold
+    if metric_name == "sharpness" and severity == "critical":
+        multiplier = SHARPNESS_CRITICAL_SIGMA
+    else:
+        multiplier = OUTLIER_SIGMA_MULTIPLIER_CRITICAL if severity == "critical" else OUTLIER_SIGMA_MULTIPLIER_WARN
     
     if direction == "low":
         return mean - (multiplier * std)
