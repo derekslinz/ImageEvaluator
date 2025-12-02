@@ -3618,6 +3618,7 @@ def verify_metadata(image_path: str, expected_metadata: Dict) -> bool:
         
         # For RAW/TIFF files, use exiftool to verify
         if file_ext in ['.dng', '.nef', '.tif', '.tiff']:
+      
             result = subprocess.run(
                 ['exiftool', '-UserComment', '-s3', image_path],
                 capture_output=True, text=True
