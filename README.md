@@ -51,6 +51,9 @@ python image_eval_embed.py
 # Process a specific folder
 python image_eval_embed.py process /path/to/images
 
+# Process a single image
+python image_eval_embed.py process --image /path/to/image.jpg
+
 # Generate Ollama-driven titles/descriptions/keywords
 python image_eval_embed.py process /path/to/images --ollama-metadata
 
@@ -108,6 +111,7 @@ ollama pull ingu627/Qwen2.5-VL-7B-Instruct-Q5_K_M
 ```
 --workers N               Parallel workers (default: 4)
 --csv PATH                Output CSV path
+--image PATH              Process a single image instead of scanning a folder
 --skip-existing           Skip images with metadata (default)
 --no-skip-existing        Reprocess all images
 --min-score N             Filter results by minimum score
