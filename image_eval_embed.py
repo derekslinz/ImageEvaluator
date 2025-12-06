@@ -4001,17 +4001,21 @@ def process_context_only(
     return results
 
 
+def _normalize_file_types(file_types: Optional[List[str]] = None) -> List[str]:
+    """Normalize file type filters to a list of extensions prefixed with a dot."""
+    if file_types is None:
+        return [
+            '.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG',
+            '.nef', '.NEF', '.tif', '.tiff', '.TIF', '.TIFF',
+            '.dng', '.DNG',
+        ]
+    return [ext if ext.startswith('.') else f'.{ext}' for ext in file_types]
+
+
 def collect_images(folder_path: str, file_types: Optional[List[str]] = None, skip_existing: bool = True) -> List[str]:
     """Collect all image paths to process."""
     image_paths = []
-    
-    # Default file types if not specified
-    if file_types is None:
-        file_types = ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG', '.nef', '.NEF', 
-                     '.tif', '.tiff', '.TIF', '.TIFF', '.dng', '.DNG']
-    else:
-        # Normalize extensions to include dot
-        file_types = [ext if ext.startswith('.') else f'.{ext}' for ext in file_types]
+    normalized_types = _normalize_file_types(file_types)
     
     for root, dirs, files in os.walk(folder_path):
         for filename in files:
@@ -4019,7 +4023,7 @@ def collect_images(folder_path: str, file_types: Optional[List[str]] = None, ski
             if '.original.' in filename:
                 continue
 
-            if any(filename.endswith(ext) for ext in file_types):
+            if any(filename.endswith(ext) for ext in normalized_types):
                 image_path = os.path.join(root, filename)
                 
                 # Check if UserComment exists (skip if flag is set)
@@ -4253,6 +4257,7 @@ def process_images_with_pyiqa(
 def process_images_in_folder(folder_path: str, ollama_host_url: str, context_host_url: Optional[str] = None,
                             model: str = DEFAULT_MODEL,
                             file_types: Optional[List[str]] = None, skip_existing: bool = True,
+                            single_image_path: Optional[str] = None,
                             dry_run: bool = False, min_score: Optional[int] = None,
                             backup_dir: Optional[str] = None, verify: bool = False,
                             cache_dir: Optional[str] = None,
@@ -4268,7 +4273,22 @@ def process_images_in_folder(folder_path: str, ollama_host_url: str, context_hos
     if pyiqa_manager is None:
         raise ValueError("PyIQA manager must be initialized before processing images.")
 
-    image_paths = collect_images(folder_path, file_types=file_types, skip_existing=skip_existing)
+    normalized_types = _normalize_file_types(file_types)
+
+    if single_image_path:
+        target_name = os.path.basename(single_image_path)
+        if normalized_types and not any(target_name.endswith(ext) for ext in normalized_types):
+            logger.warning(f"Single image {single_image_path} does not match the allowed file types filter.")
+            return []
+        if skip_existing and has_user_comment(single_image_path):
+            print(f"{Fore.YELLOW}Skipping {single_image_path} (existing metadata). Use --no-skip-existing to force reprocessing.{Style.RESET_ALL}")
+            return []
+        if not validate_image(single_image_path):
+            logger.warning(f"Skipping corrupted/invalid image: {single_image_path}")
+            return []
+        image_paths = [single_image_path]
+    else:
+        image_paths = collect_images(folder_path, file_types=normalized_types, skip_existing=skip_existing)
     if not image_paths:
         logger.warning("No images found to process")
         return []
@@ -5318,6 +5338,13 @@ if __name__ == "__main__":
         help='Path to the folder containing images (prompted if omitted; defaults to IMAGE_EVAL_DEFAULT_FOLDER when confirmed)'
     )
     process_parser.add_argument(
+        '--image', '--single-image',
+        dest='single_image',
+        type=str,
+        default=None,
+        help='Process a single image file instead of scanning a folder'
+    )
+    process_parser.add_argument(
         'ollama_host_url',
         type=str,
         nargs='?',
@@ -5518,7 +5545,12 @@ if __name__ == "__main__":
         folder_defaulted = False
         folder_prompted = False
         host_defaulted = False
-        if not args.folder_path:
+        single_image_path = getattr(args, 'single_image', None)
+        if single_image_path:
+            args.single_image = str(Path(single_image_path).resolve())
+            if not args.folder_path:
+                args.folder_path = str(Path(args.single_image).parent)
+        elif not args.folder_path:
             folder_prompted = True
             args.folder_path = prompt_for_image_folder(DEFAULT_IMAGE_FOLDER)
             folder_defaulted = DEFAULT_IMAGE_FOLDER and args.folder_path == DEFAULT_IMAGE_FOLDER
@@ -5563,24 +5595,33 @@ if __name__ == "__main__":
     pyiqa_manager: Optional[PyiqaManager] = None
     pyiqa_cache_label: Optional[str] = None
 
-    # Validate folder path
-    if not os.path.exists(args.folder_path):
-        logger.error(f"The folder path '{args.folder_path}' does not exist.")
-        sys.exit(1)
-    if not os.path.isdir(args.folder_path):
-        logger.error(f"The path '{args.folder_path}' is not a directory.")
-        sys.exit(1)
-    
-    # Check recursively for image files
-    has_images = False
-    for root, dirs, files in os.walk(args.folder_path):
-        if any(f.endswith(('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG','NEF','nef','TIF','tif','TIFF','tiff','DNG','dng')) for f in files):
-            has_images = True
-            break
-    
-    if not has_images:
-        logger.error(f"No image files found in the directory '{args.folder_path}' or its subdirectories.")
-        sys.exit(1)
+    # Validate folder/image path
+    single_image_path = getattr(args, 'single_image', None)
+    if single_image_path:
+        if not os.path.exists(single_image_path):
+            logger.error(f"The image path '{single_image_path}' does not exist.")
+            sys.exit(1)
+        if not os.path.isfile(single_image_path):
+            logger.error(f"The path '{single_image_path}' is not a file.")
+            sys.exit(1)
+    else:
+        if not os.path.exists(args.folder_path):
+            logger.error(f"The folder path '{args.folder_path}' does not exist.")
+            sys.exit(1)
+        if not os.path.isdir(args.folder_path):
+            logger.error(f"The path '{args.folder_path}' is not a directory.")
+            sys.exit(1)
+        
+        # Check recursively for image files
+        has_images = False
+        for root, dirs, files in os.walk(args.folder_path):
+            if any(f.endswith(('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG','NEF','nef','TIF','tif','TIFF','tiff','DNG','dng')) for f in files):
+                has_images = True
+                break
+        
+        if not has_images:
+            logger.error(f"No image files found in the directory '{args.folder_path}' or its subdirectories.")
+            sys.exit(1)
 
     if not PYIQA_AVAILABLE:
         logger.error("PyIQA backend is required but torch/pyiqa are missing.")
@@ -5610,6 +5651,8 @@ if __name__ == "__main__":
         file_types = [ext.strip() for ext in args.file_types.split(',')]
         print(f"Filtering for file types: {', '.join(file_types)}")
     print(f"\nProcessing images from: {Style.BRIGHT}{args.folder_path}{Style.RESET_ALL}")
+    if single_image_path:
+        print(f"Single image mode: {Style.BRIGHT}{single_image_path}{Style.RESET_ALL}")
     print(f"Ollama model: {args.model}")
     if args.context_host_url and args.context_host_url != args.ollama_host_url:
         print(f"Context classifier endpoint: {args.context_host_url}")
@@ -5668,7 +5711,8 @@ if __name__ == "__main__":
     logger.info(f"Processing configuration: workers={args.workers}, model={args.model}, cache={'enabled' if cache_dir else 'disabled'}")
     
     # Process images
-    logger.info(f"Starting processing of images in {args.folder_path}")
+    processing_target = single_image_path or args.folder_path
+    logger.info(f"Starting processing of images in {processing_target}")
     start_time = time.time()
     results = process_images_in_folder(
         args.folder_path,
@@ -5689,7 +5733,8 @@ if __name__ == "__main__":
         cli_args=args,
         use_ollama_metadata=args.ollama_metadata,
         stock_eval=args.stock_eval,
-        embed_metadata_enabled=args.embed_metadata
+        embed_metadata_enabled=args.embed_metadata,
+        single_image_path=single_image_path
     )
     elapsed_time = time.time() - start_time
     logger.info(f"Completed processing {len(results)} images in {elapsed_time:.2f} seconds")

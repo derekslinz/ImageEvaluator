@@ -1,4 +1,5 @@
 *.out
+*.log.*
 *.log
 *.csv
 .vscode
