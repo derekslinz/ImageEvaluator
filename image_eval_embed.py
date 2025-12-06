@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Suppress FutureWarning from timm (used by PyIQA)
 warnings.filterwarnings("ignore", message="Importing from timm.models.layers is deprecated")
+# Suppress noisy pkg_resources deprecation warnings from transitive deps (e.g., clip)
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API.*")
 
 import math
 from functools import lru_cache
@@ -505,13 +507,80 @@ def compute_metric_z_scores(metric_scores: Dict[str, float]) -> Tuple[Dict[str, 
     return z_scores, percentiles, fused_scores
 
 
-def compute_disagreement_z(z_scores: Dict[str, float]) -> float:
-    """Return negative spread across model z-scores (used as stability penalty/bonus)."""
+def compute_disagreement(
+    profile_key: str,
+    z_scores: Dict[str, float],
+    outlier_sigma: float = 1.25,
+) -> Dict[str, Any]:
+    """
+    Compute disagreement with context-aware penalty.
+    
+    Returns dict with:
+        - diff_for_score: value used in scoring (may be scaled or zeroed)
+        - diff_clamped: clamped version of diff_for_score
+        - raw_diff: unscaled disagreement (-spread)
+        - raw_clamped: clamped raw_diff
+        - spread: positive spread between max/min z
+        - outliers: list of metric keys that deviate from mean by > outlier_sigma
+        - mode: 'creative_no_penalty', 'conservative_mild', or 'standard'
+    """
     if not z_scores:
-        return 0.0
+        return {
+            "diff_for_score": 0.0,
+            "diff_clamped": 0.0,
+            "raw_diff": 0.0,
+            "raw_clamped": 0.0,
+            "spread": 0.0,
+            "outliers": [],
+            "mode": "standard",
+        }
     values = list(z_scores.values())
-    disagreement = max(values) - min(values)
-    return -disagreement
+    spread = max(values) - min(values)
+    raw_diff = -spread
+    raw_clamped = max(-3.0, min(3.0, raw_diff))
+
+    mean_val = float(np.mean(values))
+    outliers = sorted(
+        k for k, v in z_scores.items()
+        if abs(v - mean_val) > outlier_sigma
+    )
+
+    conservative = {
+        "stock_product",
+        "architecture",
+        "architecture_realestate",
+        "macro_food",
+        "food_commercial",
+    }
+    creative = {
+        "fineart_creative",
+        "abstract",
+        "artistic_macro",
+        "creative_portrait",
+    }
+
+    if profile_key in creative:
+        factor = 0.0
+        mode = "creative_no_penalty"
+    elif profile_key in conservative:
+        factor = 0.5
+        mode = "conservative_mild"
+    else:
+        factor = 1.0
+        mode = "standard"
+
+    diff_for_score = raw_diff * factor
+    diff_clamped = max(-3.0, min(3.0, diff_for_score))
+
+    return {
+        "diff_for_score": diff_for_score,
+        "diff_clamped": diff_clamped,
+        "raw_diff": raw_diff,
+        "raw_clamped": raw_clamped,
+        "spread": spread,
+        "outliers": outliers,
+        "mode": mode,
+    }
 
 
 def categorize_score(score: float) -> str:
@@ -566,12 +635,26 @@ def apply_profile_rules(profile_key: str, technical_metrics: Dict[str, Any]) -> 
     sharpness = technical_metrics.get("sharpness")
     sharpness_rules = rules.get("sharpness")
     if isinstance(sharpness, (int, float)) and sharpness_rules:
-        if sharpness < sharpness_rules.get("critical_threshold", -float("inf")):
-            penalty += sharpness_rules.get("critical_penalty", 0.0)
-            adjustments.append("sharpness_critical")
-        elif sharpness < sharpness_rules.get("soft_threshold", -float("inf")):
-            penalty += sharpness_rules.get("soft_penalty", 0.0)
-            adjustments.append("sharpness_soft")
+        ideal = sharpness_rules.get("ideal")
+        lower_ok = sharpness_rules.get("lower_ok")
+        max_penalty = sharpness_rules.get("max_penalty")
+        if ideal is not None and lower_ok is not None and max_penalty is not None:
+            if sharpness < ideal:
+                if sharpness <= lower_ok:
+                    penalty += max_penalty
+                    adjustments.append("sharpness_low_max")
+                else:
+                    frac = (ideal - sharpness) / max(ideal - lower_ok, 1e-6)
+                    grad_penalty = max_penalty * frac
+                    penalty += grad_penalty
+                    adjustments.append("sharpness_low")
+        else:
+            if sharpness < sharpness_rules.get("critical_threshold", -float("inf")):
+                penalty += sharpness_rules.get("critical_penalty", 0.0)
+                adjustments.append("sharpness_critical")
+            elif sharpness < sharpness_rules.get("soft_threshold", -float("inf")):
+                penalty += sharpness_rules.get("soft_penalty", 0.0)
+                adjustments.append("sharpness_soft")
 
     clipping = technical_metrics.get("histogram_clipping_highlights")
     clipping_rules = rules.get("clipping")
@@ -737,6 +820,7 @@ def build_profile_metadata(
     rule_penalty: float,
     rule_notes: List[str],
     contributions: Dict[str, Dict[str, float]],
+    diff_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble metadata payload for profiled PyIQA evaluation."""
     rounded = int(round(max(0.0, min(100.0, final_score))))
@@ -753,6 +837,13 @@ def build_profile_metadata(
             ordered_unique.append(kw)
     keywords = ",".join(ordered_unique)
 
+    diff_meta = diff_info or {}
+    diff_mode = diff_meta.get("mode", "standard")
+    raw_diff = diff_meta.get("raw_diff", diff_z)
+    raw_clamped = diff_meta.get("raw_clamped", diff_z_clamped)
+    spread = diff_meta.get("spread", abs(diff_z))
+    outliers = diff_meta.get("outliers", [])
+
     metric_summary_parts = []
     for metric, detail in metric_details.items():
         z_val = z_scores.get(metric, 0.0)
@@ -763,11 +854,18 @@ def build_profile_metadata(
         metric_summary_parts.append(summary)
     metric_summary = "; ".join(metric_summary_parts)
 
+    disagreement_line = (
+        f"Disagreement ({diff_mode}): raw {raw_diff:+.2f} (clamped {raw_clamped:+.2f}, spread {spread:.2f}); "
+        f"used {diff_z:+.2f} (clamped {diff_z_clamped:+.2f})."
+    )
+    if outliers:
+        disagreement_line += f" Outliers: {', '.join(outliers)}."
+
     description_lines = [
         f"Composite profile '{display_name}' score {rounded}/100 ({category}).",
         f"Base model blend before rules: {base_rounded}/100 (penalty {-rule_penalty:+.1f}).",
         f"Model breakdown: {metric_summary}",
-        f"Disagreement penalty (pyiqa_diff_z): {diff_z:+.2f} (clamped {diff_z_clamped:+.2f})",
+        disagreement_line,
     ]
     if rule_notes:
         description_lines.append(f"Rule triggers: {', '.join(rule_notes)}")
@@ -793,6 +891,11 @@ def build_profile_metadata(
         "pyiqa_composite_fused_score": z_to_fused_score(composite_z),
         "pyiqa_disagreement_z": diff_z,
         "pyiqa_disagreement_z_clamped": diff_z_clamped,
+        "pyiqa_disagreement_raw": raw_diff,
+        "pyiqa_disagreement_raw_clamped": raw_clamped,
+        "pyiqa_disagreement_spread": spread,
+        "pyiqa_disagreement_outliers": outliers,
+        "pyiqa_disagreement_mode": diff_mode,
         "pyiqa_contributions": contributions,
         "pyiqa_rule_penalty": rule_penalty,
         "pyiqa_rule_notes": rule_notes,
@@ -1218,6 +1321,14 @@ def resolve_metric_model_name(metric_key: str, args) -> Optional[str]:
         return "maniqa"
     if metric_key == "musiq_paq2piq_z":
         return "musiq-paq2piq"
+    if metric_key == "niqe_z":
+        return "niqe"
+    if metric_key == "brisque_z":
+        return "brisque"
+    if metric_key == "hyperiqa_z":
+        return "hyperiqa"
+    if metric_key == "nima_z":
+        return "nima"
     if metric_key == "pyiqa_diff_z":
         return None
     return None
@@ -2301,9 +2412,37 @@ def _compute_perceptual_sharpness_v2(
         weighted_var = 0.6 * base_sharpness + 0.4 * content_var
     else:
         weighted_var = base_sharpness
-    
-    # Final sharpness score - use same scale factor as fine/edge
-    sharpness = math.sqrt(max(0, weighted_var)) * SHARPNESS_SCALE + sharpness_boost - motion_penalty
+
+    focus_abs = np.abs(lap_medium)
+    edge_95 = float(np.percentile(focus_abs, 95.0))
+    edge_threshold = edge_95 * 0.5 if edge_95 > 0 else float(focus_abs.mean())
+    strength_norm = focus_abs / max(edge_95, focus_abs.mean() + 1e-6)
+    strength_norm = np.clip(strength_norm, 0.0, 2.0)
+
+    center_mask = _center_weight_mask(h, w)
+    subject_focus = float(np.sum(strength_norm * center_mask))
+
+    edge_mask = (focus_abs > max(edge_threshold, 1e-6)).astype(np.float32)
+    center_coverage = float(np.sum(edge_mask * center_mask))
+    coverage_score = min(1.0, center_coverage / 0.10)
+
+    subject_region = focus_abs * center_mask
+    subject_mean = float(subject_region.mean())
+    subject_p95 = float(np.percentile(subject_region, 95.0))
+    if subject_mean > 1e-6:
+        crispness = float(np.clip((subject_p95 / subject_mean) - 1.0, 0.0, 3.0))
+    else:
+        crispness = 0.0
+
+    base_component = max(0.0, min(100.0, math.sqrt(max(0, weighted_var)) * SHARPNESS_SCALE))
+    sharpness = (
+        0.5 * base_component
+        + 20.0 * min(subject_focus, 1.5) / 1.5
+        + 10.0 * coverage_score
+        + 10.0 * (crispness / 3.0)
+    )
+    sharpness += sharpness_boost
+    sharpness -= motion_penalty
     sharpness = max(0.0, min(100.0, sharpness))
     
     result['sharpness'] = sharpness
@@ -2339,13 +2478,23 @@ def _compute_perceptual_sharpness(laplacian_map: np.ndarray) -> float:
     subject_focus = float(np.sum(strength_norm * center_mask))
 
     edge_threshold = edge_95 * 0.5 if edge_95 > 0 else focus_abs.mean()
-    coverage_ratio = float(np.mean(focus_abs > max(edge_threshold, 1e-6)))
-    coverage_score = min(1.0, coverage_ratio / 0.2)
+    edge_mask = (focus_abs > max(edge_threshold, 1e-6)).astype(np.float32)
+    center_coverage = float(np.sum(edge_mask * center_mask))
+    coverage_score = min(1.0, center_coverage / 0.10)
+
+    subject_region = focus_abs * center_mask
+    subject_mean = float(subject_region.mean())
+    subject_p95 = float(np.percentile(subject_region, 95.0))
+    if subject_mean > 1e-6:
+        crispness = float(np.clip((subject_p95 / subject_mean) - 1.0, 0.0, 3.0))
+    else:
+        crispness = 0.0
 
     perceptual = (
-        0.6 * base_sharpness
-        + 25.0 * min(subject_focus, 1.5) / 1.5
-        + 15.0 * coverage_score
+        0.5 * base_sharpness
+        + 20.0 * min(subject_focus, 1.5) / 1.5
+        + 10.0 * coverage_score
+        + 10.0 * (crispness / 3.0)
     )
 
     return float(max(0.0, min(100.0, perceptual)))
@@ -4159,7 +4308,13 @@ def process_images_with_pyiqa(
                 detail["z"] = z_scores.get(metric_key, 0.0)
                 detail["percentile"] = percentiles.get(metric_key)
                 detail["fused_score"] = fused_scores.get(metric_key)
-            diff_z = compute_disagreement_z(z_scores)
+            diff_info = compute_disagreement(profile_key, z_scores)
+            diff_z = diff_info["diff_for_score"]
+            if diff_info["mode"] == "creative_no_penalty" and diff_info.get("spread", 0.0) > 1.0:
+                outlier_str = ", ".join(diff_info.get("outliers", [])) or "n/a"
+                technical_warnings.append(
+                    f"High model disagreement (spread {diff_info.get('spread', 0.0):.2f}); outliers: {outlier_str} (no penalty applied)"
+                )
             base_score, composite_z, composite_z_raw, contributions, diff_z_clamped = compute_profile_composite(profile_key, z_scores, diff_z)
             rule_penalty, rule_notes = apply_profile_rules(profile_key, technical_metrics)
             final_score = max(0.0, min(100.0, base_score - rule_penalty))
@@ -4182,6 +4337,7 @@ def process_images_with_pyiqa(
                 rule_penalty=rule_penalty,
                 rule_notes=rule_notes,
                 contributions=contributions,
+                diff_info=diff_info,
             )
 
             if use_ollama_metadata and metadata_host_url:
@@ -4890,6 +5046,19 @@ METRIC_THRESHOLDS: Dict[str, List[Tuple[float, str, str]]] = {
     ],
 }
 
+IQA_MODEL_NOTES: Dict[str, str] = {
+    "clipiqa_z": "CLIP aesthetic/quality; strong on subject framing and cleanliness",
+    "laion_aes_z": "LAION aesthetic scorer; favors overall appeal/composition",
+    "musiq_ava_z": "MUSIQ AVA aesthetic; human-judged photography quality",
+    "musiq_paq2piq_z": "MUSIQ PAQ-2-PIQ; technical/no-reference quality",
+    "maniqa_z": "MANIQA; robust to distortions and blur/noise",
+    "niqe_z": "NIQE; naturalness/artifact detector, good for overprocessing/banding",
+    "brisque_z": "BRISQUE; blind NR quality, catches compression artifacts",
+    "hyperiqa_z": "HYPERIQA; saliency-aware sharpness/quality for subjects",
+    "nima_z": "NIMA; aesthetic scoring complementary to MUSIQ/CLIP",
+    "pyiqa_diff_z": "Model disagreement; higher spread lowers stability",
+}
+
 
 def print_metric_stats(name: str, stat: Dict[str, Any], show_histogram: bool = True):
     """Print statistics and histogram for a single metric with threshold annotations."""
@@ -4907,8 +5076,11 @@ def print_metric_stats(name: str, stat: Dict[str, Any], show_histogram: bool = T
             symbol = "<" if direction == "below" else ">"
             parts.append(f"{label}{symbol}{thresh_val:.1f}")
         threshold_info = f"  [Thresholds: {', '.join(parts)}]"
+
+    note = IQA_MODEL_NOTES.get(name)
+    note_str = f" — {note}" if note else ""
     
-    print(f"\n  {name}:{threshold_info}")
+    print(f"\n  {name}:{threshold_info}{note_str}")
     print(f"    Count: {stat['count']}")
     print(f"    Mean: {stat['mean']:.2f}  Std: {stat['std']:.2f}")
     print(f"    Range: {stat['min']:.2f} - {stat['max']:.2f}")
@@ -5067,6 +5239,7 @@ def format_metric_stats_markdown(name: str, stat: Dict[str, Any], show_histogram
     
     lines = []
     thresholds = METRIC_THRESHOLDS.get(name, [])
+    note = IQA_MODEL_NOTES.get(name)
     
     # Header with thresholds
     threshold_info = ""
@@ -5077,7 +5250,10 @@ def format_metric_stats_markdown(name: str, stat: Dict[str, Any], show_histogram
             parts.append(f"`{label}{symbol}{thresh_val:.1f}`")
         threshold_info = f" — Thresholds: {', '.join(parts)}"
     
-    lines.append(f"\n#### {name}{threshold_info}")
+    header = f"\n#### {name}{threshold_info}"
+    if note:
+        header += f" — {note}"
+    lines.append(header)
     lines.append(f"- **Count:** {stat['count']}")
     lines.append(f"- **Mean:** {stat['mean']:.2f} | **Std:** {stat['std']:.2f}")
     lines.append(f"- **Range:** {stat['min']:.2f} – {stat['max']:.2f}")
@@ -5548,8 +5724,7 @@ if __name__ == "__main__":
         single_image_path = getattr(args, 'single_image', None)
         if single_image_path:
             args.single_image = str(Path(single_image_path).resolve())
-            if not args.folder_path:
-                args.folder_path = str(Path(args.single_image).parent)
+            args.folder_path = str(Path(args.single_image).parent)
         elif not args.folder_path:
             folder_prompted = True
             args.folder_path = prompt_for_image_folder(DEFAULT_IMAGE_FOLDER)
@@ -5681,7 +5856,7 @@ if __name__ == "__main__":
         if extras:
             cal_info = f"{cal_info} ({', '.join(extras)})"
     print(f"IQA calibration file: {cal_info}")
-    print("PyIQA composite models: clipiqa+_vitL14_512, laion_aes, musiq-ava, musiq-paq2piq, maniqa, disagreement penalty")
+    print("PyIQA composite models: clipiqa+_vitL14_512, laion_aes, musiq-ava, musiq-paq2piq, maniqa, niqe, brisque, hyperiqa, nima, disagreement penalty")
     print(f"Workers: {args.workers}")
     print(f"Skip existing: {args.skip_existing}")
     print(f"Embed metadata: {('enabled' if args.embed_metadata else 'disabled (CSV only)')}")

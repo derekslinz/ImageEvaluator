@@ -8,12 +8,16 @@ AI-powered image quality assessment with EXIF metadata embedding.
    Every image is resized to 1024 px and sent to `qwen3-vl:8b` (via Ollama or a remote endpoint) purely to decide which of the 10 photographic profiles best fits the scene (landscape, portrait_highkey, sports_action, etc.). This same model can optionally be reused later to rewrite titles/descriptions/keywords.
 
 2. **Profile-specific weighting**  
-   Each profile stores its own weight table covering five PyIQA models:
+   Each profile stores its own weight table covering nine PyIQA models:
    - `clipiqa+_vitL14_512`
    - `laion_aes`
    - `musiq-ava`
    - `musiq-paq2piq`
    - `maniqa` (any of the maniqa variants)
+   - `niqe`
+   - `brisque`
+   - `hyperiqa`
+   - `nima`
 
    In addition to the weighted models, we always compute a sixth signal (`pyiqa_diff_z`) that measures disagreement between models and acts as a stability penalty/bonus.
 
@@ -28,7 +32,7 @@ AI-powered image quality assessment with EXIF metadata embedding.
 ## Features
 
 - **Profile-aware PyIQA pipeline**: Automatic context detection feeds 10 tailored weighting/rule sets.
-- **Multi-model fusion**: clipiqa+_vitL14_512, laion_aes, musiq-ava, maniqa, musiq-paq2piq, plus a model disagreement metric.
+- **Multi-model fusion**: clipiqa+_vitL14_512, laion_aes, musiq-ava, maniqa, musiq-paq2piq, niqe, brisque, hyperiqa, nima, plus a model disagreement metric.
 - **Metadata & stock summaries**: Composite score, profile, warnings, and keywords written directly to EXIF, with optional Ollama rewrites plus stock suitability scoring (commercial viability, release risk, rejection risk).
 - **Technical analysis**: Sharpness, noise, clipping, and color-cast metrics drive rule penalties and CSV reporting.
 - **Batch processing**: Parallel execution with resumable CSV output and optional caching.

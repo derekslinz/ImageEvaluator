@@ -24,3 +24,6 @@ pandas>=1.5.0
 torch>=2.0.0
 pyiqa>=0.1.12
 timm>=0.9.0
+
+# Build tooling
+setuptools<81  # pkg_resources removal in 81+ breaks clip dependency chain

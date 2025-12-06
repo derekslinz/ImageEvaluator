@@ -121,10 +121,13 @@ PROFILE_CONFIG = {
         },
         "rules": {
             "sharpness": {
-                "soft_threshold": 60.0,
-                "critical_threshold": 30.0,
-                "soft_penalty": 10.0,
-                "critical_penalty": 28.0,
+                "soft_threshold": 25.0,
+                "critical_threshold": 15.0,
+                "soft_penalty": 6.0,
+                "critical_penalty": 15.0,
+                "ideal": 45.0,
+                "lower_ok": 30.0,
+                "max_penalty": 15.0,
             },
             "clipping": {
                 "warn_pct": 4.0,
@@ -653,6 +656,19 @@ PROFILE_CONFIG = {
     },
 }
 
+# Additional IQA model defaults applied to every profile unless overridden
+NEW_IQA_MODEL_DEFAULT_WEIGHTS = {
+    "niqe_z": 0.12,       # Naturalness / artifact detection
+    "brisque_z": 0.12,    # Blind reference quality / compression artifacts
+    "hyperiqa_z": 0.18,   # Saliency-aware NR IQA, good for subject sharpness
+    "nima_z": 0.14,       # Aesthetic scorer complementary to MUSIQ/CLIP
+}
+
+for _profile_key, _profile_val in PROFILE_CONFIG.items():
+    weights = _profile_val.setdefault("model_weights", {})
+    for model_key, default_weight in NEW_IQA_MODEL_DEFAULT_WEIGHTS.items():
+        weights.setdefault(model_key, default_weight)
+
 
 def get_profile(context: str) -> dict:
     """Get profile config with fallback to studio_photography."""
@@ -676,6 +692,10 @@ PYIQA_BASELINE_STATS = {
     "musiq_ava_z": {"mean": 56.75416666666667, "std": 4.285875947678478},
     "maniqa_z": {"mean": 49.132083333333334, "std": 8.258054895659281},
     "musiq_paq2piq_z": {"mean": 74.73625, "std": 3.1990914237483117},
+    "niqe_z": {"mean": 50.0, "std": 10.0},
+    "brisque_z": {"mean": 50.0, "std": 10.0},
+    "hyperiqa_z": {"mean": 50.0, "std": 10.0},
+    "nima_z": {"mean": 50.0, "std": 10.0},
 }
 
 # Scoring transformation parameters
@@ -699,4 +719,3 @@ def get_baseline_stats(metric_key: str) -> dict:
 def get_default_pyiqa_shift(model_name: str) -> float:
     """Get default score shift for a PyIQA model."""
     return DEFAULT_PYIQA_SHIFTS.get(model_name.lower(), 0.0)
-
